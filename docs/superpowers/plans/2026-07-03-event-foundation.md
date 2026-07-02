@@ -27,7 +27,7 @@
 ### Task 1: Root Runtime, Fail-Closed RID Configuration, and Test Harness
 
 **Files:**
-- Create: `.gitignore`
+- Modify: `.gitignore`
 - Create: `package.json`
 - Create: `config/allowed-rids.yaml`
 - Create: `src/config/load-allowed-rids.mjs`
@@ -731,7 +731,7 @@ git commit -m "feat: add indexed event ledger"
 **Interfaces:**
 - Produces: `CdpClient` with `send(method, params)`, `onEvent(listener)`, and `close()`.
 - Produces: `createMxFrameRouter({ onFrame, socketUrlPattern }) -> (event) => void`.
-- Router emits only `Network.webSocketFrameReceived` text payloads for sockets whose URL matches `/business-api/5/socket.io/`.
+- Router emits inbound `Network.webSocketFrameReceived` text payloads when the socket URL matches `/business-api/5/socket.io/`, or when an already-established socket has no replayed creation event but the payload has the strict `42/msg,...["room_msg",...]` signature.
 
 - [ ] **Step 1: Write router tests**
 
@@ -748,8 +748,12 @@ test("routes only inbound MX socket text frames", () => {
   route({ method: "Network.webSocketCreated", params: { requestId: "b", url: "wss://example.com/socket" } });
   route({ method: "Network.webSocketFrameSent", params: { requestId: "a", response: { opcode: 1, payloadData: "outbound" } } });
   route({ method: "Network.webSocketFrameReceived", params: { requestId: "b", response: { opcode: 1, payloadData: "other" }, timestamp: 1 } });
+  route({ method: "Network.webSocketFrameReceived", params: { requestId: "preexisting", response: { opcode: 1, payloadData: '42/msg,["room_msg","payload"]' }, timestamp: 1 } });
   route({ method: "Network.webSocketFrameReceived", params: { requestId: "a", response: { opcode: 1, payloadData: "42/msg,[]" }, timestamp: 2 } });
-  assert.deepEqual(frames, [{ payloadData: "42/msg,[]", receivedAt: 2_000 }]);
+  assert.deepEqual(frames, [
+    { payloadData: '42/msg,["room_msg","payload"]', receivedAt: 2_000 },
+    { payloadData: "42/msg,[]", receivedAt: 2_000 },
+  ]);
 });
 ```
 
@@ -779,10 +783,13 @@ export function createMxFrameRouter({
       return;
     }
     if (event.method !== "Network.webSocketFrameReceived") return;
-    if (!matchingRequestIds.has(event.params.requestId)) return;
     if (event.params.response.opcode !== 1) return;
+    const payloadData = event.params.response.payloadData;
+    const strictRoomSignature =
+      payloadData.startsWith("42/msg,") && payloadData.includes('["room_msg",');
+    if (!matchingRequestIds.has(event.params.requestId) && !strictRoomSignature) return;
     onFrame({
-      payloadData: event.params.response.payloadData,
+      payloadData,
       receivedAt: now(),
     });
   };
@@ -905,7 +912,7 @@ git commit -m "feat: capture inbound frames through Chrome DevTools"
 
 **Interfaces:**
 - Consumes: `classifyFrame`, `EventStore`, `CdpClient`, RID configuration.
-- Produces: `Collector.acceptFrame({ payloadData, receivedAt }) -> classification status`.
+- Produces: `Collector.acceptFrame({ payloadData, receivedAt }) -> Promise<classification status>`.
 - Produces: long-running `scripts/run-collector.mjs --cdp http://127.0.0.1:9222`.
 
 - [ ] **Step 1: Write the integration test with an in-memory frame source**
@@ -932,11 +939,11 @@ test("collector persists only one unique allowlisted event", async () => {
   const store = openEventStore(filename);
   const collector = new Collector({ allowedRids: new Set([20025]), store });
   const accepted = frame(20025, "allowed-marker");
-  assert.equal(collector.acceptFrame({ payloadData: accepted, receivedAt: Date.parse("2026-07-03T01:00:00Z") }), "accepted");
-  assert.equal(collector.acceptFrame({ payloadData: frame(23200, "rejected-marker"), receivedAt: Date.parse("2026-07-03T01:01:00Z") }), "rejected");
-  assert.equal(collector.acceptFrame({ payloadData: accepted, receivedAt: Date.parse("2026-07-03T01:02:00Z") }), "duplicate");
-  assert.equal(collector.acceptFrame({ payloadData: "42/msg,[\"room_msg\",\"broken\"]", receivedAt: Date.parse("2026-07-03T01:03:00Z") }), "failed");
-  assert.equal(collector.acceptFrame({ payloadData: "2", receivedAt: Date.parse("2026-07-03T01:04:00Z") }), "ignored");
+  assert.equal(await collector.acceptFrame({ payloadData: accepted, receivedAt: Date.parse("2026-07-03T01:00:00Z") }), "accepted");
+  assert.equal(await collector.acceptFrame({ payloadData: frame(23200, "rejected-marker"), receivedAt: Date.parse("2026-07-03T01:01:00Z") }), "rejected");
+  assert.equal(await collector.acceptFrame({ payloadData: accepted, receivedAt: Date.parse("2026-07-03T01:02:00Z") }), "duplicate");
+  assert.equal(await collector.acceptFrame({ payloadData: "42/msg,[\"room_msg\",\"broken\"]", receivedAt: Date.parse("2026-07-03T01:03:00Z") }), "failed");
+  assert.equal(await collector.acceptFrame({ payloadData: "2", receivedAt: Date.parse("2026-07-03T01:04:00Z") }), "ignored");
   assert.equal(store.listEventsByRid(20025).length, 1);
   assert.equal(store.database.prepare("SELECT count(*) AS n FROM events").get().n, 1);
   store.close();
@@ -971,7 +978,7 @@ export class Collector {
     this.runId = randomUUID();
   }
 
-  acceptFrame({ payloadData, receivedAt = this.now() }) {
+  async acceptFrame({ payloadData, receivedAt = this.now() }) {
     if (!payloadData.startsWith("42/msg,") || !payloadData.includes('["room_msg",')) {
       this.store.incrementCounter("ignored", receivedAt);
       return "ignored";
@@ -985,7 +992,7 @@ export class Collector {
     const status = inserted ? "accepted" : "duplicate";
     this.store.incrementCounter(status, receivedAt);
     if (inserted) {
-      void Promise.resolve(this.onAccepted(result.event)).catch(() => {
+      await Promise.resolve(this.onAccepted(result.event)).catch(() => {
         this.store.incrementCounter("media_failed", this.now());
       });
     }
@@ -1033,6 +1040,7 @@ const collector = new Collector({
 });
 let stopping = false;
 let client = null;
+const pending = new Set();
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
     stopping = true;
@@ -1047,7 +1055,12 @@ try {
     try {
       const targetUrl = await findMxTarget(cdpBase);
       client = new CdpClient(targetUrl);
-      const route = createMxFrameRouter({ onFrame: (frame) => collector.acceptFrame(frame) });
+      const route = createMxFrameRouter({
+        onFrame: (frame) => {
+          const task = collector.acceptFrame(frame).finally(() => pending.delete(task));
+          pending.add(task);
+        },
+      });
       client.onEvent(route);
       await client.send("Network.enable");
       attempt = 0;
@@ -1059,6 +1072,7 @@ try {
   }
 } finally {
   client?.close();
+  await Promise.allSettled(pending);
   store.close();
 }
 ```
