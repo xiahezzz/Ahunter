@@ -1,0 +1,12 @@
+{
+  "name": "mx-websocket-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "decode": "node ./decode-room-msg.mjs"
+  },
+  "dependencies": {
+    "crypto-js": "4.2.0",
+    "lz-string": "1.5.0"
+  }
+}
