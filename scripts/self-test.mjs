@@ -1,19 +1,16 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { buildSelfTestReport } from "../src/self-test/build-report.mjs";
 
 const startedAt = new Date().toISOString();
 const result = spawnSync(process.execPath, ["--test", "tests/**/*.test.mjs"], {
   encoding: "utf8",
 });
-const report = {
-  schemaVersion: 1,
+const report = buildSelfTestReport({
   startedAt,
   finishedAt: new Date().toISOString(),
-  ok: result.status === 0,
-  exitCode: result.status,
-  stdout: result.stdout,
-  stderr: result.stderr,
-};
+  result,
+});
 await mkdir("reports/self-test", { recursive: true });
 await writeFile("reports/self-test/latest.json", `${JSON.stringify(report, null, 2)}\n`);
 await writeFile(
