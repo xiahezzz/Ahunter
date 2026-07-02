@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 
 const startedAt = new Date().toISOString();
-const result = spawnSync(process.execPath, ["--test"], {
+const result = spawnSync(process.execPath, ["--test", "tests/**/*.test.mjs"], {
   encoding: "utf8",
 });
 const report = {
