@@ -7,6 +7,9 @@ export class CdpClient {
     this.pending = new Map();
     this.listeners = new Set();
     this.didClose = false;
+    this.closed = new Promise((resolve) => {
+      this.socket.addEventListener("close", resolve, { once: true });
+    });
 
     this.ready = new Promise((resolve, reject) => {
       this.socket.addEventListener("open", resolve, { once: true });

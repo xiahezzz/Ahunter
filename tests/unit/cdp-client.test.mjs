@@ -92,3 +92,12 @@ test("rejects CDP error responses with their message", async () => {
   await assert.rejects(pending, /Unknown method/);
   client.close();
 });
+
+test("exposes a promise that settles when the socket closes", async () => {
+  const { client, socket } = createClient();
+  socket.open();
+
+  assert.equal(client.closed instanceof Promise, true);
+  socket.close();
+  await client.closed;
+});
