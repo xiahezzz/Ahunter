@@ -35,6 +35,16 @@ export function openEventStore(filename) {
     UPDATE events SET raw_payload = NULL
     WHERE raw_payload IS NOT NULL AND raw_payload_expires_at <= ?
   `);
+  const truncateWal = database.prepare("PRAGMA wal_checkpoint(TRUNCATE)");
+
+  function checkpointAndRequireTruncate() {
+    const result = truncateWal.get();
+    if (result.busy !== 0) {
+      throw new Error(
+        `WAL checkpoint is busy (busy=${result.busy}, log=${result.log}, checkpointed=${result.checkpointed})`,
+      );
+    }
+  }
 
   return {
     database,
@@ -71,11 +81,9 @@ export function openEventStore(filename) {
     },
     purgeExpiredPayloads(now) {
       const changes = purge.run(now).changes;
-      if (changes > 0) {
-        database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-        database.exec("VACUUM");
-        database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-      }
+      checkpointAndRequireTruncate();
+      database.exec("VACUUM");
+      checkpointAndRequireTruncate();
       return changes;
     },
     listEventsByRid(rid) {

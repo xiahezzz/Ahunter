@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { openEventStore } from "../../src/events/event-store.mjs";
@@ -97,7 +98,45 @@ test("uses owner-only file permissions and securely removes purged payload bytes
   store.insertEvent({ ...event, eventId: "secret-event", rawPayload: marker }, "run-secret");
 
   assert.equal(store.purgeExpiredPayloads(Date.parse("2026-08-02T00:00:00Z")), 1);
-  for (const suffix of ["", "-wal"]) {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    let bytes;
+    try {
+      bytes = await readFile(`${filename}${suffix}`);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+    assert.equal(bytes.includes(Buffer.from(marker)), false, `marker remained in ${path.basename(filename)}${suffix}`);
+  }
+});
+
+test("reports a busy checkpoint and securely finishes purge on retry", async (t) => {
+  const filename = await temporaryDatabase();
+  const marker = `busy-reader-secret-frame-${Date.now()}-${process.pid}`;
+  const store = openEventStore(filename);
+  const reader = new DatabaseSync(filename);
+  let readerOpen = true;
+  t.after(() => {
+    if (readerOpen) reader.close();
+    store.close();
+  });
+
+  store.insertEvent({ ...event, eventId: "busy-secret-event", rawPayload: marker }, "run-busy");
+  reader.exec("BEGIN");
+  assert.equal(reader.prepare("SELECT raw_payload FROM events").get().raw_payload, marker);
+
+  assert.throws(
+    () => store.purgeExpiredPayloads(Date.parse("2026-08-02T00:00:00Z")),
+    /WAL checkpoint is busy/,
+  );
+  assert.equal(store.listEventsByRid(20025)[0].rawPayload, null);
+
+  reader.exec("ROLLBACK");
+  reader.close();
+  readerOpen = false;
+
+  assert.equal(store.purgeExpiredPayloads(Date.parse("2026-08-02T00:00:00Z")), 0);
+  for (const suffix of ["", "-wal", "-shm"]) {
     let bytes;
     try {
       bytes = await readFile(`${filename}${suffix}`);
