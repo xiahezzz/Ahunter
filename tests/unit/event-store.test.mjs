@@ -87,6 +87,28 @@ test("increments counters in hourly buckets", async (t) => {
   assert.equal(counter.count, 2);
 });
 
+test("rejects media whose RID does not match its parent event", async (t) => {
+  const store = openEventStore(":memory:");
+  t.after(() => store.close());
+  assert.equal(store.insertEvent(event, "run-media-rid"), true);
+
+  assert.throws(
+    () =>
+      store.insertMedia({
+        eventId: event.eventId,
+        rid: 23200,
+        sourceUrl: "https://example.com/image.jpg",
+        urlHash: "c".repeat(64),
+        contentHash: "d".repeat(64),
+        contentType: "image/jpeg",
+        localPath: "/private/media/image.jpg",
+        downloadedAt: receivedAt,
+      }),
+    /RID does not match parent event/,
+  );
+  assert.equal(store.database.prepare("SELECT count(*) AS count FROM media").get().count, 0);
+});
+
 test("uses owner-only file permissions and securely removes purged payload bytes", async (t) => {
   const filename = await temporaryDatabase();
   const marker = `unique-secret-frame-${Date.now()}-${process.pid}`;

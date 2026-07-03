@@ -22,6 +22,17 @@ export function openEventStore(filename) {
       decoded_text, parsed_content_json, content_hash, ingest_run_id
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const insertMediaStatement = database.prepare(`
+    INSERT OR IGNORE INTO media(
+      event_id, rid, source_url, url_hash, content_hash, content_type, local_path, downloaded_at
+    )
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?
+    FROM events
+    WHERE event_id = ? AND rid = ?
+  `);
+  const mediaParentMatches = database.prepare(
+    "SELECT 1 FROM events WHERE event_id = ? AND rid = ?",
+  );
   const increment = database.prepare(`
     INSERT INTO ingest_counters(bucket_start, kind, count) VALUES (?, ?, 1)
     ON CONFLICT(bucket_start, kind) DO UPDATE SET count = count + 1
@@ -74,6 +85,25 @@ export function openEventStore(filename) {
         database.exec("ROLLBACK");
         throw error;
       }
+    },
+    insertMedia(media) {
+      const result = insertMediaStatement.run(
+        media.eventId,
+        media.rid,
+        media.sourceUrl,
+        media.urlHash,
+        media.contentHash,
+        media.contentType,
+        media.localPath,
+        media.downloadedAt,
+        media.eventId,
+        media.rid,
+      );
+      if (result.changes === 1) return true;
+      if (!mediaParentMatches.get(media.eventId, media.rid)) {
+        throw new Error("Media RID does not match parent event");
+      }
+      return false;
     },
     incrementCounter(kind, at) {
       const bucketStart = Math.floor(at / 3_600_000) * 3_600_000;
