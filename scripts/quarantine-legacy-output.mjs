@@ -10,7 +10,8 @@ const destination = path.resolve(
 
 try {
   await access(source);
-} catch {
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
   console.log("No legacy output to quarantine");
   process.exit(0);
 }

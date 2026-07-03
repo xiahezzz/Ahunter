@@ -100,7 +100,12 @@ if (fs.existsSync(outputPath)) {
   if (!Array.isArray(existing.messages)) {
     throw new Error(`Existing output has an invalid schema: ${outputPath}`);
   }
-  existingMessages = existing.messages;
+  existingMessages = existing.messages.filter(
+    ({ value }) =>
+      Number.isSafeInteger(value?.rid)
+      && value.rid > 0
+      && allowedRids.has(value.rid),
+  );
 }
 
 const successfulMessages = messages
