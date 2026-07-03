@@ -7,8 +7,13 @@ import {
   decodeRoomFrame,
   extractContent,
 } from "../../src/ingestion/room-codec.mjs";
+import { loadAllowedRids } from "../../src/config/load-allowed-rids.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
+const configPath = path.resolve(
+  option("--config") || path.join(scriptDirectory, "../../config/allowed-rids.yaml"),
+);
+const allowedRids = loadAllowedRids(configPath);
 const defaultOutputPath = path.resolve(
   scriptDirectory,
   "../../data/mx-websocket/decoded-room-messages.json",
@@ -21,7 +26,7 @@ function option(name) {
 
 function usage() {
   console.error(
-    "Usage: node decode-room-msg.mjs --input <raw.json> [--date YYYY-MM-DD] [--output decoded.json]",
+    "Usage: node decode-room-msg.mjs --input <raw.json> [--date YYYY-MM-DD] [--output decoded.json] [--config allowed-rids.yaml]",
   );
 }
 
@@ -62,6 +67,9 @@ const messages = items.map((item, index) => {
     if (!frame) throw new Error("Input item has no string frame or payload");
     const frameDate = itemDateString(item, dateString);
     const value = decodeRoomFrame(frame, frameDate);
+    if (!Number.isSafeInteger(value.rid) || !allowedRids.has(value.rid)) {
+      return { index, ok: false, rejected: true, error: "rid_not_allowed" };
+    }
     return {
       index,
       ok: true,
