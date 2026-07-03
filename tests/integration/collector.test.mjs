@@ -145,6 +145,26 @@ test("findMxTarget rejects a non-OK target-list response", async () => {
   );
 });
 
+test("findMxTarget normalizes a trailing slash in the CDP base URL", async () => {
+  const requested = [];
+  await findMxTarget("http://127.0.0.1:9222/", async (url) => {
+    requested.push(url);
+    return {
+      ok: true,
+      async json() {
+        return [
+          {
+            url: "https://mx.2026.naaifu.cn/",
+            webSocketDebuggerUrl: "ws://right",
+          },
+        ];
+      },
+    };
+  });
+
+  assert.deepEqual(requested, ["http://127.0.0.1:9222/json/list"]);
+});
+
 test("findMxTarget rejects a target list without the MX page", async () => {
   await assert.rejects(
     findMxTarget("http://127.0.0.1:9222", async () => ({

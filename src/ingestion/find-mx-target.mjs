@@ -1,7 +1,7 @@
 const MX_ORIGIN = "https://mx.2026.naaifu.cn";
 
 export async function findMxTarget(baseUrl, fetchImpl = fetch) {
-  const response = await fetchImpl(`${baseUrl}/json/list`);
+  const response = await fetchImpl(new URL("/json/list", baseUrl).href);
   if (!response.ok) {
     throw new Error(`CDP target list failed: ${response.status}`);
   }

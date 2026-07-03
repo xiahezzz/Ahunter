@@ -21,10 +21,18 @@ export async function runCollectorLoop({
   log = (message) => process.stderr.write(`${message}\n`),
 }) {
   const pending = new Set();
-  let client = null;
+  let activeClient = null;
   let attempt = 0;
-  const closeClient = () => client?.close();
-  signal.addEventListener("abort", closeClient);
+  const closeActiveClient = () => {
+    if (!activeClient || activeClient.closeRequested) return;
+    activeClient.closeRequested = true;
+    try {
+      activeClient.client.close();
+    } catch (error) {
+      log(`Collector client close failed (${errorName(error)})`);
+    }
+  };
+  signal.addEventListener("abort", closeActiveClient);
 
   try {
     while (!signal.aborted) {
@@ -32,7 +40,8 @@ export async function runCollectorLoop({
         const targetUrl = await findTarget(cdpBase);
         if (signal.aborted) break;
 
-        client = createClient(targetUrl);
+        const client = createClient(targetUrl);
+        activeClient = { client, closeRequested: false };
         const route = createRouter({
           onFrame: (frame) => {
             const task = Promise.resolve()
@@ -53,8 +62,8 @@ export async function runCollectorLoop({
           log(`Collector connection failed (${errorName(error)})`);
         }
       } finally {
-        client?.close();
-        client = null;
+        closeActiveClient();
+        activeClient = null;
       }
 
       if (!signal.aborted) {
@@ -66,8 +75,8 @@ export async function runCollectorLoop({
       }
     }
   } finally {
-    signal.removeEventListener("abort", closeClient);
-    client?.close();
+    signal.removeEventListener("abort", closeActiveClient);
+    closeActiveClient();
     await Promise.allSettled(pending);
   }
 }
