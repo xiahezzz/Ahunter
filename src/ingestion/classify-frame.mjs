@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import { decodeRoomFrame, extractContent } from "./room-codec.mjs";
+import {
+  decodeRoomFrame,
+  extractContent,
+  parseNestedMessage,
+} from "./room-codec.mjs";
 
 function localDateString(timestamp) {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -25,15 +29,19 @@ export function classifyFrame({ frame, receivedAt, allowedRids }) {
       return { status: "rejected", reason: "rid_not_allowed" };
     }
 
-    const content = extractContent(value.msg);
+    const identityParsed = parseNestedMessage(value.msg);
+    const identityContentHash = hash(JSON.stringify(identityParsed));
+    const content = extractContent(identityParsed);
     const contentHash = hash(JSON.stringify(content.parsed));
     const sourceIdentity =
-      value.id ?? value.oid ?? `${value.createtime ?? receivedAt}:${contentHash}`;
+      value.id ??
+      value.oid ??
+      `${value.createtime ?? receivedAt}:${identityContentHash}`;
     return {
       status: "accepted",
       event: {
         eventId: hash(`${value.rid}:${sourceIdentity}`),
-        schemaVersion: 1,
+        schemaVersion: 2,
         rid: value.rid,
         sourceMessageId: value.id == null ? null : String(value.id),
         oid: value.oid == null ? null : String(value.oid),
