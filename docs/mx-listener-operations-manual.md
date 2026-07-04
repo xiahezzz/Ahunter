@@ -252,6 +252,29 @@ pgrep -fl 'scripts/run-collector.mjs'
 
 Proceed only if this command produces no output. If it prints a process, return to that collector terminal, stop it with `Ctrl-C`, wait for the shell prompt, and repeat the check. Do not force-stop the collector.
 
+### Record the pre-migration aggregate baseline
+
+With the collector stopped, run this read-only aggregate query and save its four numeric results with the migration record:
+
+```bash
+sqlite3 -header -column data/state/events.sqlite \
+"SELECT
+   (SELECT count(*) FROM events) AS events,
+   (SELECT count(*) FROM media) AS media,
+   (SELECT count(*) FROM media_jobs) AS media_jobs,
+   (SELECT count(*)
+      FROM media AS m
+      LEFT JOIN events AS e ON e.event_id = m.event_id
+     WHERE e.event_id IS NULL)
+   +
+   (SELECT count(*)
+      FROM media_jobs AS j
+      LEFT JOIN events AS e ON e.event_id = j.event_id
+     WHERE e.event_id IS NULL) AS orphans;"
+```
+
+`orphans` must be `0`. Do not run the migration if it is nonzero. The `events`, `media`, and `media_jobs` counts are the exact pre-migration baseline to compare with the migration report.
+
 ### Run the migration
 
 With the collector stopped, run:
@@ -272,12 +295,24 @@ Run this read-only aggregate query:
 ```bash
 sqlite3 -header -column data/state/events.sqlite \
 "SELECT
-   sum(decoded_text LIKE '%免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！%') AS decoded_matches,
-   sum(parsed_content_json LIKE '%免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！%') AS parsed_matches
- FROM events;"
+  coalesce((
+    SELECT count(*)
+    FROM events AS e
+    JOIN json_tree(e.parsed_content_json, '$.parsed') AS node
+    WHERE node.type = 'text'
+      AND trim(node.atom, char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) = '免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！'
+      AND (node.parent IS NULL OR typeof(node.key) = 'integer' OR node.key = 'msg')
+  ), 0) AS parsed_removable_matches,
+  coalesce((
+    SELECT count(*)
+    FROM events AS e
+    JOIN json_each(e.parsed_content_json, '$.texts') AS text
+    WHERE text.type = 'text'
+      AND trim(text.atom, char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) = '免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！'
+  ), 0) AS extracted_text_matches;"
 ```
 
-Both `decoded_matches` and `parsed_matches` must be zero.
+Both `parsed_removable_matches` and `extracted_text_matches` must be numeric zero. This query counts only exact trimmed values in removable locations: the `parsed` root, `parsed` array elements, `msg` properties, and entries in `texts`. It intentionally preserves longer strings that quote the disclaimer and exact values in non-message properties such as `attribution`.
 
 ### Verify event-image associations
 

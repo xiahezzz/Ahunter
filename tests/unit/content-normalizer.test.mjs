@@ -43,6 +43,28 @@ test("removes disclaimer text objects without removing images or unrelated prope
   );
 });
 
+test("drops an exact disclaimer msg while preserving sibling text-object properties", () => {
+  assert.deepEqual(
+    normalizeMxContent({ type: "text", msg: MX_DISCLAIMER, extra: "keep" }),
+    { type: "text", extra: "keep" },
+  );
+});
+
+test("does not mutate its input", () => {
+  const input = {
+    type: "container",
+    items: [
+      { type: "text", msg: MX_DISCLAIMER, extra: "keep" },
+      { type: "pic", url: "https://example.com/a.png" },
+    ],
+  };
+  const before = structuredClone(input);
+
+  normalizeMxContent(input);
+
+  assert.deepEqual(input, before);
+});
+
 test("normalizes a root-only disclaimer to null", () => {
   assert.equal(normalizeMxContent(MX_DISCLAIMER), null);
 });

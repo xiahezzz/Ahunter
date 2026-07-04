@@ -362,12 +362,24 @@ Document exact-disclaimer verification:
 ```bash
 sqlite3 -header -column data/state/events.sqlite \
 "SELECT
-   sum(decoded_text LIKE '%免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！%') AS decoded_matches,
-   sum(parsed_content_json LIKE '%免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！%') AS parsed_matches
- FROM events;"
+  coalesce((
+    SELECT count(*)
+    FROM events AS e
+    JOIN json_tree(e.parsed_content_json, '$.parsed') AS node
+    WHERE node.type = 'text'
+      AND trim(node.atom, char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) = '免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！'
+      AND (node.parent IS NULL OR typeof(node.key) = 'integer' OR node.key = 'msg')
+  ), 0) AS parsed_removable_matches,
+  coalesce((
+    SELECT count(*)
+    FROM events AS e
+    JOIN json_each(e.parsed_content_json, '$.texts') AS text
+    WHERE text.type = 'text'
+      AND trim(text.atom, char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) = '免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！'
+  ), 0) AS extracted_text_matches;"
 ```
 
-Expected: both zero.
+Expected: both `parsed_removable_matches` and `extracted_text_matches` are numeric zero.
 
 Document association:
 
@@ -386,7 +398,7 @@ State that empty text plus a nonempty local path is valid for image-only events.
 - [ ] **Step 3: Update index, validate, and commit**
 
 ```bash
-rg -n 'migrate-disclaimer-content|decoded_matches|parsed_matches|LEFT JOIN media|orphansAfter' \
+rg -n 'migrate-disclaimer-content|parsed_removable_matches|extracted_text_matches|LEFT JOIN media|orphansAfter' \
   docs/mx-listener-operations-manual.md
 git diff --check
 git add docs/mx-listener-operations-manual.md
@@ -441,9 +453,9 @@ Confirm no runtime data, local media, or RID configuration is staged or committe
 Run this only after the reviewed feature branch is merged into `master`, so restarted collection uses the new cleaning behavior.
 
 1. Ask the user to stop the collector with `Ctrl-C` and verify `pgrep -fl 'scripts/run-collector.mjs'` has no output. Never kill it from the implementation workflow.
-2. Record aggregate event, media, media-job, and orphan counts using the query documented in the operations manual.
+2. Record the `events`, `media`, `media_jobs`, and `orphans` results from the exact query under **Record the pre-migration aggregate baseline** in the operations manual; require `orphans = 0`.
 3. Run `/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/migrate-disclaimer-content.mjs` from the merged repository root.
 4. Require equal before/after counts, zero orphans, and aggregate-only output.
-5. Run the disclaimer and event-image association queries from Task 4; require zero disclaimer matches and intact local paths.
+5. Run the disclaimer and event-image association queries from Task 4; require `parsed_removable_matches = 0`, `extracted_text_matches = 0`, and intact local paths.
 6. Run the migration again and require `updated: 0`.
 7. Restart the collector only after every verification succeeds.

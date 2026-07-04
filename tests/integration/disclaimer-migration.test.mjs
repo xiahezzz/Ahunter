@@ -90,6 +90,11 @@ test("migrates historical disclaimer content without changing event or media ide
     downloadedAt: receivedAt,
   });
 
+  const mediaQuery = "SELECT * FROM media ORDER BY event_id, url_hash";
+  const mediaJobsQuery = "SELECT * FROM media_jobs ORDER BY event_id, url_hash";
+  const mediaBefore = store.database.prepare(mediaQuery).all();
+  const mediaJobsBefore = store.database.prepare(mediaJobsQuery).all();
+
   const identityQuery = `
     SELECT event_id, rid, source_message_id, oid, received_at, source_created_at,
            raw_payload_hash, raw_payload, raw_payload_expires_at
@@ -106,6 +111,8 @@ test("migrates historical disclaimer content without changing event or media ide
   assert.equal(report.mediaJobsBefore, report.mediaJobsAfter);
   assert.equal(report.orphansAfter, 0);
   assert.deepEqual(store.database.prepare(identityQuery).all(), identityBefore);
+  assert.deepEqual(store.database.prepare(mediaQuery).all(), mediaBefore);
+  assert.deepEqual(store.database.prepare(mediaJobsQuery).all(), mediaJobsBefore);
 
   const rows = store.database
     .prepare(`
