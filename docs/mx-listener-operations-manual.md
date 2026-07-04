@@ -78,6 +78,16 @@ Do not copy or share debugger URLs; they are only success evidence in the local 
 
 Proceed only when the summary reports exactly `114` passing tests and no failures.
 
+### 2.6 Quarantine legacy output once
+
+Before the first-ever collector start, run this one-time preservation step:
+
+```bash
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/quarantine-legacy-output.mjs
+```
+
+A safe result reports either `No legacy output to quarantine` or the quarantine destination. This command preserves any legacy output by moving it aside; it does not decode or import that output. Do not repeat it as part of daily startup.
+
 ## 3. Daily startup checklist
 
 Repeat these steps after a restart or whenever beginning a collection session:
@@ -237,13 +247,13 @@ This creates a timestamped database copy without changing the live database. Dow
 
 ### `authorization_required`
 
-CDP is reachable, but it exposes no authorized MX page target. Run:
+CDP is reachable, but it exposes no inspectable page target on the MX origin `https://mx.2026.naaifu.cn`. Run:
 
 ```bash
 curl --noproxy '*' -sS http://127.0.0.1:9333/json/list
 ```
 
-Confirm that the list contains the exact URL `https://mx.2026.naaifu.cn/`. In the dedicated Chrome profile, open that URL and log in, then leave the page open. Restart the collector after the target appears in `/json/list`.
+Confirm that the list contains the exact root URL `https://mx.2026.naaifu.cn/`. In the dedicated Chrome profile, open that recommended page and log in, then leave the page open. Restart the collector after the target appears in `/json/list`.
 
 ### The collector stays quiet
 
@@ -255,19 +265,21 @@ An empty allowlist intentionally records nothing. Add only a positive integer RI
 
 ### Permission denied or root-owned files after `sudo`
 
-Stop the collector and inspect ownership:
+This is exceptional recovery for files created by prior `sudo` use, not a routine startup step. First stop the collector with `Ctrl-C`, wait for it to exit, and inspect both storage paths when present:
 
 ```bash
-ls -l data/state
+ls -ld data/state
+if [ -e data/media ]; then ls -ld data/media; fi
 ```
 
-Do not restart until `data/state/events.sqlite` and related SQLite files are writable by the normal account. Correct ownership only as an exceptional administrative repair. After confirming that the affected files should belong to the current user and the Mac's normal `staff` group, run:
+Do not restart until the database files under `data/state` and any downloaded files under `data/media` are writable by the normal account. After confirming that the affected files should belong to the current user and the Mac's normal `staff` group, run:
 
 ```bash
 sudo chown -R "$USER":staff data/state
+if [ -e data/media ]; then sudo chown -R "$USER":staff data/media; fi
 ```
 
-Then inspect again with `ls -l data/state` and resume all routine operation as the normal user without `sudo`. If the expected owner or group is uncertain, stop and ask the Mac administrator instead of guessing.
+Then repeat the inspection commands for both paths and resume all routine operation as the normal user without `sudo`. If the expected owner or group is uncertain, stop and ask the Mac administrator instead of guessing.
 
 ### Collection disconnects when the display turns off
 
@@ -283,6 +295,7 @@ The lifecycle sections above are authoritative; this index only points back to t
 
 | Operation | Command or section |
 | --- | --- |
+| One-time legacy quarantine | `/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/quarantine-legacy-output.mjs` — section 2.6 |
 | Start Chrome | `open -na "Google Chrome" --args --remote-debugging-port=9333 --user-data-dir="$HOME/.chrome-mx-debug-profile"` — section 3 |
 | Check CDP | `curl --noproxy '*' -sS http://127.0.0.1:9333/json/version` and `/json/list` — section 3 |
 | Self-test | `/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs` — section 3 |
