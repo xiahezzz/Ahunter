@@ -92,7 +92,7 @@ test("migrates historical disclaimer content without changing event or media ide
 
   const identityQuery = `
     SELECT event_id, rid, source_message_id, oid, received_at, source_created_at,
-           raw_payload_hash, raw_payload
+           raw_payload_hash, raw_payload, raw_payload_expires_at
     FROM events
     ORDER BY event_id
   `;
