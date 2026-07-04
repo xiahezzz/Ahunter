@@ -4,6 +4,7 @@ import {
   decodeRoomFrame,
   extractContent,
 } from "../../src/ingestion/room-codec.mjs";
+import { MX_DISCLAIMER } from "../../src/ingestion/content-normalizer.mjs";
 import { encodeRoomPayload } from "../helpers/encode-room-payload.mjs";
 
 test("decodes an encrypted Socket.IO room_msg frame", () => {
@@ -23,6 +24,23 @@ test("extracts nested text and image URLs", () => {
     texts: ["公告摘要"],
     imageUrls: ["https://pic.guhai888.cn/example.jpg"],
   });
+});
+
+test("removes the MX disclaimer while preserving image evidence", () => {
+  const message = JSON.stringify([
+    { type: "pic", url: "https://example.com/evidence.png" },
+    { type: "text", msg: MX_DISCLAIMER },
+  ]);
+  assert.deepEqual(extractContent(message), {
+    parsed: [{ type: "pic", url: "https://example.com/evidence.png" }],
+    texts: [],
+    imageUrls: ["https://example.com/evidence.png"],
+  });
+});
+
+test("preserves longer text that quotes the MX disclaimer", () => {
+  const quoted = `正文引用：${MX_DISCLAIMER}`;
+  assert.deepEqual(extractContent(quoted).texts, [quoted]);
 });
 
 test("rejects a frame with the wrong event name", () => {

@@ -1,5 +1,6 @@
 import CryptoJS from "crypto-js";
 import LZString from "lz-string";
+import { normalizeMxContent } from "./content-normalizer.mjs";
 
 function payloadFromFrame(frame) {
   if (!frame.startsWith("42/msg,")) return frame;
@@ -36,7 +37,7 @@ function decodePayload(payload, dateString) {
   return JSON.parse(plaintext);
 }
 
-function parseNestedMessage(message) {
+export function parseNestedMessage(message) {
   if (typeof message !== "string") return message;
   const trimmed = message.trim();
   if (!trimmed.startsWith("[") && !trimmed.startsWith("{")) return message;
@@ -49,7 +50,7 @@ function parseNestedMessage(message) {
 }
 
 function extractContent(message) {
-  const parsed = parseNestedMessage(message);
+  const parsed = normalizeMxContent(parseNestedMessage(message));
   const texts = [];
   const imageUrls = [];
 
