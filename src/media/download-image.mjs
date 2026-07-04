@@ -12,8 +12,25 @@ const EXTENSIONS = new Map([
   ["image/gif", "gif"],
   ["image/avif", "avif"],
 ]);
+const BEIJING_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+
+function beijingEventDate(eventReceivedAt) {
+  if (!Number.isFinite(eventReceivedAt)) {
+    throw new TypeError("eventReceivedAt must be a finite Unix timestamp in milliseconds");
+  }
+  const date = new Date(eventReceivedAt);
+  if (Number.isNaN(date.getTime())) {
+    throw new TypeError("eventReceivedAt must be a valid Unix timestamp in milliseconds");
+  }
+  return BEIJING_DATE_FORMATTER.format(date);
+}
 
 function isNonGlobalIpv4(hostname) {
   const octets = hostname.split(".").map(Number);
@@ -182,9 +199,10 @@ function detectedImageType(bytes) {
 }
 
 export async function downloadImage({
-  url, mediaRoot, fetchImpl = fetch, connectTimeoutMs = 10_000,
+  url, mediaRoot, eventReceivedAt, fetchImpl = fetch, connectTimeoutMs = 10_000,
   bodyTimeoutMs = 30_000, signal,
 }) {
+  const eventDate = beijingEventDate(eventReceivedAt);
   const source = validatedUrl(url, "Image URL");
   const { response, finalUrl } = await fetchImage(source, fetchImpl, { connectTimeoutMs, signal });
   if (!response.ok) throw new Error(`Image request failed: ${response.status}`);
@@ -231,7 +249,7 @@ export async function downloadImage({
   }
   const extension = EXTENSIONS.get(detectedType);
   const contentHash = sha256(bytes);
-  const directory = path.join(mediaRoot, contentHash.slice(0, 2));
+  const directory = path.join(mediaRoot, eventDate);
   const localPath = path.join(directory, `${contentHash}.${extension}`);
   const temporary = `${localPath}.${randomUUID()}.tmp`;
   await mkdir(directory, { recursive: true, mode: 0o700 });
