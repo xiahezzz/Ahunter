@@ -42,6 +42,29 @@ CREATE TABLE IF NOT EXISTS media (
 CREATE INDEX IF NOT EXISTS media_rid_idx ON media(rid);
 CREATE INDEX IF NOT EXISTS media_content_hash_idx ON media(content_hash);
 
+CREATE TABLE IF NOT EXISTS media_jobs (
+  event_id TEXT NOT NULL REFERENCES events(event_id),
+  rid INTEGER NOT NULL,
+  source_url TEXT NOT NULL,
+  url_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'failed', 'completed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL,
+  error_code TEXT,
+  PRIMARY KEY(event_id, url_hash)
+);
+
+CREATE INDEX IF NOT EXISTS media_jobs_rid_idx ON media_jobs(rid);
+CREATE INDEX IF NOT EXISTS media_jobs_due_idx ON media_jobs(status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS decode_failures (
+  payload_hash TEXT NOT NULL,
+  error_class TEXT NOT NULL,
+  bucket_start INTEGER NOT NULL,
+  count INTEGER NOT NULL,
+  PRIMARY KEY(payload_hash, error_class, bucket_start)
+);
+
 CREATE TABLE IF NOT EXISTS ingest_counters (
   bucket_start INTEGER NOT NULL,
   kind TEXT NOT NULL,

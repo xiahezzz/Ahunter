@@ -1,5 +1,13 @@
 const MX_ORIGIN = "https://mx.2026.naaifu.cn";
 
+export class AuthorizationRequiredError extends Error {
+  constructor() {
+    super("authorization_required");
+    this.name = "AuthorizationRequiredError";
+    this.code = "authorization_required";
+  }
+}
+
 export async function findMxTarget(baseUrl, fetchImpl = fetch) {
   const response = await fetchImpl(new URL("/json/list", baseUrl).href);
   if (!response.ok) {
@@ -16,7 +24,7 @@ export async function findMxTarget(baseUrl, fetchImpl = fetch) {
     }
   });
   if (!target) {
-    throw new Error("MX Chrome target is not open or not logged in");
+    throw new AuthorizationRequiredError();
   }
   return target.webSocketDebuggerUrl;
 }

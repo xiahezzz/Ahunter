@@ -173,6 +173,6 @@ test("findMxTarget rejects a target list without the MX page", async () => {
         return [{ url: "https://example.com/", webSocketDebuggerUrl: "ws://other" }];
       },
     })),
-    /MX Chrome target is not open or not logged in/,
+    /authorization_required/,
   );
 });

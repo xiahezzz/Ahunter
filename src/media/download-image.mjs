@@ -15,15 +15,21 @@ const EXTENSIONS = new Map([
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 
-function isPrivateIpv4(hostname) {
-  const [a, b] = hostname.split(".").map(Number);
-  return (
-    a === 10 ||
-    a === 127 ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 169 && b === 254)
-  );
+function isNonGlobalIpv4(hostname) {
+  const octets = hostname.split(".").map(Number);
+  const value = octets.reduce((total, octet) => (total * 256) + octet, 0) >>> 0;
+  const inCidr = (address, bits) => {
+    const base = address.split(".").map(Number).reduce((total, octet) => (total * 256) + octet, 0) >>> 0;
+    const size = 2 ** (32 - bits);
+    return Math.floor(value / size) === Math.floor(base / size);
+  };
+  return [
+    ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+    ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24],
+    ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16],
+    ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24],
+    ["224.0.0.0", 4], ["240.0.0.0", 4],
+  ].some(([address, bits]) => inCidr(address, bits));
 }
 
 function ipv6Words(hostname) {
@@ -38,7 +44,7 @@ function ipv6Words(hostname) {
   );
 }
 
-function isPrivateIpv6(hostname) {
+function isNonGlobalIpv6(hostname) {
   const words = ipv6Words(hostname);
   if (!words || words.some(Number.isNaN)) return true;
   const loopback =
@@ -51,9 +57,12 @@ function isPrivateIpv6(hostname) {
     const mapped =
       `${words[6] >> 8}.${words[6] & 0xff}.` +
       `${words[7] >> 8}.${words[7] & 0xff}`;
-    return isPrivateIpv4(mapped);
+    return isNonGlobalIpv4(mapped);
   }
-  return loopback || uniqueLocal || linkLocal;
+  const unspecified = words.every((word) => word === 0);
+  const multicast = (words[0] & 0xff00) === 0xff00;
+  const documentation = words[0] === 0x2001 && words[1] === 0x0db8;
+  return unspecified || loopback || uniqueLocal || linkLocal || multicast || documentation;
 }
 
 function validatedUrl(value, context) {
@@ -76,16 +85,37 @@ function validatedUrl(value, context) {
   if (version !== 6) url.hostname = hostname;
   const localName = hostname === "localhost" || hostname.endsWith(".localhost");
   const localAddress =
-    (version === 4 && isPrivateIpv4(hostname)) ||
-    (version === 6 && isPrivateIpv6(hostname));
+    (version === 4 && isNonGlobalIpv4(hostname)) ||
+    (version === 6 && isNonGlobalIpv6(hostname));
   if (localName || localAddress) throw new Error(`${context} host is not allowed`);
   return url;
 }
 
-async function fetchImage(source, fetchImpl) {
+function timeoutSignal(milliseconds, parent, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`${label} timeout`)), milliseconds);
+  timer.unref?.();
+  const abort = () => controller.abort(parent.reason ?? new Error("shutdown aborted"));
+  parent?.addEventListener("abort", abort, { once: true });
+  return { signal: controller.signal, close() { clearTimeout(timer); parent?.removeEventListener("abort", abort); } };
+}
+
+function readWithAbort(reader, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    reader.read().then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+async function fetchImage(source, fetchImpl, { connectTimeoutMs, signal }) {
   let current = source;
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
-    const response = await fetchImpl(current, { redirect: "manual" });
+    const timeout = timeoutSignal(connectTimeoutMs, signal, "connect");
+    let response;
+    try { response = await fetchImpl(current, { redirect: "manual", signal: timeout.signal }); }
+    finally { timeout.close(); }
     if (response.status >= 300 && response.status < 400) {
       await response.body?.cancel().catch(() => {});
       const location = response.headers.get("location");
@@ -141,9 +171,12 @@ function detectedImageType(bytes) {
   return null;
 }
 
-export async function downloadImage({ url, mediaRoot, fetchImpl = fetch }) {
+export async function downloadImage({
+  url, mediaRoot, fetchImpl = fetch, connectTimeoutMs = 10_000,
+  bodyTimeoutMs = 30_000, signal,
+}) {
   const source = validatedUrl(url, "Image URL");
-  const { response, finalUrl } = await fetchImage(source, fetchImpl);
+  const { response, finalUrl } = await fetchImage(source, fetchImpl, { connectTimeoutMs, signal });
   if (!response.ok) throw new Error(`Image request failed: ${response.status}`);
   validatedUrl(finalUrl, "Image redirect URL");
 
@@ -161,17 +194,23 @@ export async function downloadImage({ url, mediaRoot, fetchImpl = fetch }) {
   if (!response.body) throw new Error("Image response has no body");
 
   const reader = response.body.getReader();
+  const bodyTimeout = timeoutSignal(bodyTimeoutMs, signal, "body-read");
   const chunks = [];
   let size = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > LIMIT) {
-      await reader.cancel().catch(() => {});
-      throw new Error("Image exceeds 10 MiB");
+  try {
+    for (;;) {
+      const { done, value } = await readWithAbort(reader, bodyTimeout.signal);
+      if (done) break;
+      size += value.byteLength;
+      if (size > LIMIT) {
+        await reader.cancel().catch(() => {});
+        throw new Error("Image exceeds 10 MiB");
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+  } finally {
+    if (bodyTimeout.signal.aborted) await reader.cancel(bodyTimeout.signal.reason).catch(() => {});
+    bodyTimeout.close();
   }
 
   const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));

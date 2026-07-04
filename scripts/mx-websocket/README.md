@@ -39,6 +39,8 @@ Start the passive collector without navigating or reloading the page:
 
 Stop the collector with `Ctrl-C`. After a failure, keep it stopped, resolve configuration or have the user restore the authorized login, and rerun the offline self-test before restarting.
 
+Operational behavior: expired raw payloads are purged at startup and every 24 hours. Persisted media jobs retry independently after restart with bounded exponential backoff and completed jobs are never downloaded again. Shutdown allows a finite 30-second drain before aborting remaining work. An available CDP target list without the exact MX page exits terminally as `authorization_required`; transport failures still retry. The RID allowlist supports atomic live reload, and an invalid or unreadable replacement fails closed to an empty set.
+
 ## Legacy diagnostic tooling (disabled by default)
 
 The page-injection workflow below is legacy diagnostic tooling, not a Phase 1 operating path. It is disabled by default, is never used by `scripts/run-collector.mjs` or `scripts/smoke-test.mjs`, and may be used only when the user explicitly requests that specific diagnostic action. Do not use it for routine startup, reconnect, login recovery, collector recovery, or smoke testing. It must not be used as a workaround for a failed collector or expired authorization.
@@ -48,7 +50,7 @@ Even when explicitly requested, use Chrome DevTools only, do not use Computer Us
 ### 旧版诊断依赖
 
 ```bash
-npm install
+npm --prefix scripts/mx-websocket install
 ```
 
 ### 用户明确请求时的旧版页面注入诊断
@@ -88,7 +90,7 @@ window.__mxWsMonitor.stop();
 ### 离线解码旧版诊断帧
 
 ```bash
-npm run decode -- \
+npm --prefix scripts/mx-websocket run decode -- \
   --input raw-frames.json \
   --date 2026-07-02
 ```

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -30,6 +31,11 @@ export function openEventStore(filename) {
     FROM events
     WHERE event_id = ? AND rid = ?
   `);
+  const insertMediaJob = database.prepare(`
+    INSERT OR IGNORE INTO media_jobs(
+      event_id, rid, source_url, url_hash, status, attempts, next_attempt_at, error_code
+    ) VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL)
+  `);
   const mediaParentMatches = database.prepare(
     "SELECT 1 FROM events WHERE event_id = ? AND rid = ?",
   );
@@ -47,13 +53,19 @@ export function openEventStore(filename) {
     WHERE raw_payload IS NOT NULL AND raw_payload_expires_at <= ?
   `);
   const truncateWal = database.prepare("PRAGMA wal_checkpoint(TRUNCATE)");
+  const recordDecodeFailure = database.prepare(`
+    INSERT INTO decode_failures(payload_hash, error_class, bucket_start, count)
+    VALUES (?, ?, ?, 1)
+    ON CONFLICT(payload_hash, error_class, bucket_start)
+    DO UPDATE SET count = count + 1
+  `);
 
   function checkpointAndRequireTruncate() {
     const result = truncateWal.get();
     if (result.busy !== 0) {
-      throw new Error(
-        `WAL checkpoint is busy (busy=${result.busy}, log=${result.log}, checkpointed=${result.checkpointed})`,
-      );
+      const error = new Error("WAL checkpoint is busy");
+      error.code = "checkpoint_busy";
+      throw error;
     }
   }
 
@@ -79,6 +91,12 @@ export function openEventStore(filename) {
           event.contentHash,
           ingestRunId,
         );
+        if (result.changes === 1) {
+          for (const sourceUrl of event.parsedContent.imageUrls) {
+            const urlHash = createHash("sha256").update(sourceUrl).digest("hex");
+            insertMediaJob.run(event.eventId, event.rid, sourceUrl, urlHash, event.receivedAt);
+          }
+        }
         database.exec("COMMIT");
         return result.changes === 1;
       } catch (error) {
@@ -108,6 +126,10 @@ export function openEventStore(filename) {
     incrementCounter(kind, at) {
       const bucketStart = Math.floor(at / 3_600_000) * 3_600_000;
       increment.run(bucketStart, kind);
+    },
+    recordDecodeFailure(payloadHash, errorClass, at) {
+      const bucketStart = Math.floor(at / 3_600_000) * 3_600_000;
+      recordDecodeFailure.run(payloadHash, errorClass, bucketStart);
     },
     purgeExpiredPayloads(now) {
       const changes = purge.run(now).changes;

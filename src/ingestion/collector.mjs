@@ -19,17 +19,20 @@ export class Collector {
     const result = classifyFrame({
       frame: payloadData,
       receivedAt,
-      allowedRids: this.allowedRids,
+      allowedRids: typeof this.allowedRids === "function" ? this.allowedRids() : this.allowedRids,
     });
     if (result.status !== "accepted") {
       this.store.incrementCounter(result.status, receivedAt);
+      if (result.status === "failed") {
+        this.store.recordDecodeFailure?.(result.payloadHash, result.errorClass, receivedAt);
+      }
       return result.status;
     }
 
     const inserted = this.store.insertEvent(result.event, this.runId);
     const status = inserted ? "accepted" : "duplicate";
     this.store.incrementCounter(status, receivedAt);
-    if (inserted) {
+    if (inserted || status === "duplicate") {
       await Promise.resolve()
         .then(() => this.onAccepted(result.event))
         .catch(() => {

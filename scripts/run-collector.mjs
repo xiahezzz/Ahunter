@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { loadAllowedRids } from "../src/config/load-allowed-rids.mjs";
+import { watchAllowedRids } from "../src/config/watch-allowed-rids.mjs";
 import { openEventStore } from "../src/events/event-store.mjs";
 import { Collector } from "../src/ingestion/collector.mjs";
 import { runCollectorLoop } from "../src/ingestion/collector-runner.mjs";
-import { processEventMedia } from "../src/media/process-event-media.mjs";
+import { drainMediaJobs } from "../src/media/process-event-media.mjs";
+import { startRetentionMaintenance } from "../src/events/retention-maintenance.mjs";
 
 function option(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -11,15 +12,33 @@ function option(name, fallback) {
 }
 
 const cdpBase = option("--cdp", "http://127.0.0.1:9222");
-const allowedRids = loadAllowedRids("config/allowed-rids.yaml");
 const store = openEventStore("data/state/events.sqlite");
-const collector = new Collector({
-  allowedRids,
-  store,
-  onAccepted: (event) =>
-    processEventMedia({ event, store, mediaRoot: "data/media" }),
+const ridConfig = watchAllowedRids("config/allowed-rids.yaml", {
+  onError: (reason) => store.incrementCounter(reason, Date.now()),
 });
 const abortController = new AbortController();
+let mediaDrain;
+function drainPersistedMedia() {
+  if (!mediaDrain) {
+    mediaDrain = drainMediaJobs({
+      store, mediaRoot: "data/media", signal: abortController.signal,
+    }).finally(() => { mediaDrain = undefined; });
+  }
+  return mediaDrain;
+}
+const collector = new Collector({
+  allowedRids: () => ridConfig.current,
+  store,
+  onAccepted: () => drainPersistedMedia(),
+});
+collector.recordOverflow = (reason) => store.incrementCounter(reason, Date.now());
+const stopMaintenance = startRetentionMaintenance({
+  store,
+  onReason: (reason) => store.incrementCounter(reason, Date.now()),
+});
+await drainMediaJobs({ store, mediaRoot: "data/media", signal: abortController.signal });
+const mediaRetryTimer = setInterval(() => void drainPersistedMedia(), 60_000);
+mediaRetryTimer.unref?.();
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, () => abortController.abort());
@@ -32,5 +51,8 @@ try {
     signal: abortController.signal,
   });
 } finally {
+  clearInterval(mediaRetryTimer);
+  stopMaintenance();
+  ridConfig.close();
   store.close();
 }

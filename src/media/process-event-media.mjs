@@ -7,16 +7,51 @@ export async function processEventMedia({
   fetchImpl = fetch,
   now = () => Date.now(),
 }) {
-  const results = [];
-  for (const url of event.parsedContent.imageUrls) {
-    const media = await downloadImage({ url, mediaRoot, fetchImpl });
-    store.insertMedia({
-      eventId: event.eventId,
-      rid: event.rid,
-      downloadedAt: now(),
-      ...media,
-    });
-    results.push(media);
-  }
-  return results;
+  return drainMediaJobs({ store, mediaRoot, fetchImpl, now, eventId: event.eventId });
+}
+
+export async function drainMediaJobs({
+  store,
+  mediaRoot,
+  fetchImpl = fetch,
+  now = () => Date.now(),
+  eventId,
+  maxAttempts = 5,
+  maxConcurrent = 3,
+  signal,
+}) {
+  const params = [now(), maxAttempts];
+  let sql = `SELECT event_id, rid, source_url, url_hash, attempts
+    FROM media_jobs
+    WHERE status IN ('pending', 'failed') AND next_attempt_at <= ? AND attempts < ?`;
+  if (eventId) { sql += " AND event_id = ?"; params.push(eventId); }
+  sql += " ORDER BY next_attempt_at, event_id, url_hash";
+  const jobs = store.database.prepare(sql).all(...params);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(maxConcurrent, jobs.length) }, async () => {
+    for (;;) {
+      const job = jobs[cursor++];
+      if (!job || signal?.aborted) return;
+      const attemptedAt = now();
+      try {
+        const media = await downloadImage({ url: job.source_url, mediaRoot, fetchImpl, signal });
+        store.insertMedia({
+          eventId: job.event_id, rid: job.rid, downloadedAt: attemptedAt, ...media,
+        });
+        store.database.prepare(`UPDATE media_jobs
+          SET status = 'completed', attempts = attempts + 1, error_code = NULL
+          WHERE event_id = ? AND url_hash = ?`).run(job.event_id, job.url_hash);
+      } catch {
+        const attempts = job.attempts + 1;
+        const backoff = Math.min(60_000 * (2 ** Math.max(0, attempts - 1)), 3_600_000);
+        store.database.prepare(`UPDATE media_jobs
+          SET status = 'failed', attempts = ?, next_attempt_at = ?, error_code = 'download_failed'
+          WHERE event_id = ? AND url_hash = ?`).run(
+          attempts, attemptedAt + backoff, job.event_id, job.url_hash,
+        );
+      }
+    }
+  });
+  await Promise.all(workers);
+  return jobs.length;
 }
