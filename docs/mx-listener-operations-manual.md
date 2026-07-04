@@ -15,6 +15,12 @@ This manual is the routine operating procedure for the authorized, passive MX li
 | RID configuration | `config/allowed-rids.yaml` |
 | MX page | `https://mx.2026.naaifu.cn/` |
 
+New downloads are grouped by the parent event's Beijing calendar date as
+`data/media/YYYY-MM-DD/<content-hash>.<extension>`. Older rows may still point
+to legacy hash-prefix directories. During this incremental transition, use
+`media.local_path` as the authoritative location; do not move legacy files by
+hand.
+
 - Do not use `sudo` to start Chrome, run tests, start the collector, inspect data, or make backups. It can create root-owned files that the normal user cannot update.
 - Keep the dedicated Chrome application and the logged-in MX page open for the entire collection session. Do not use that dedicated window for unrelated browsing.
 - A command that stays in the foreground can be stopped with `Ctrl-C`. Use `Ctrl-C` for the collector's normal shutdown; do not force-stop it.
