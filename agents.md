@@ -13,7 +13,7 @@ Phase 1 is a passive, read-only MX event collector. It records only user-authori
 - Use Chrome DevTools only. Never use Computer Use for this workflow.
 - If authorization or login expires, stop collection and ask the user to log in. Never enter, request, record, or expose credentials, cookies, tokens, Socket.IO session IDs, or Chrome debugging identifiers.
 - Do not generate reports or downstream artifacts after any data-quality failure.
-- Never navigate, reload, click, type into, or otherwise operate the MX page. The collector passively connects through Chrome DevTools.
+- Routine Phase 1 collection, smoke testing, reconnect, and recovery must never navigate, reload, click, type into, inject into, or otherwise operate the MX page. The collector passively connects through Chrome DevTools `Network` events. The disabled legacy page-injection diagnostic may be used only when the user explicitly requests that specific diagnostic action; never use it for routine recovery or as part of collector/smoke operation.
 - Never perform real trading or submit orders.
 
 ## RID configuration

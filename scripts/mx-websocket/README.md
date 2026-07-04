@@ -1,14 +1,13 @@
-# MX WebSocket tools
+# Event foundation collector and legacy MX diagnostics
 
-用于在已授权、已登录的 MX 网页端会话中被动记录入站 WebSocket 帧，并离线解码 `room_msg`。
+Phase 1 的唯一常规启动路径是 `scripts/run-collector.mjs`。它通过只读 Chrome DevTools `Network` 事件被动收集入站帧，不导航、刷新、注入脚本或操作页面。
 
 ## 文件
 
-- `monitor-init.js`：页面刷新前注入的只读 WebSocket 监听器。
-- `decode-room-msg.mjs`：解码原始 `room_msg` 帧或其加密载荷。
-- `package.json`：解码依赖与运行命令。
-
-监听器不会记录出站帧，也不会主动发送 Socket.IO 事件。
+- `scripts/run-collector.mjs`：Phase 1 唯一常规收集器。
+- `scripts/self-test.mjs`：离线测试和状态报告。
+- `scripts/smoke-test.mjs`：用户已启用调试 Chrome 时的只读在线检查。
+- `monitor-init.js`、`decode-room-msg.mjs`：默认禁用的旧版诊断工具；不属于收集器或 smoke test。
 
 ## Event foundation operations
 
@@ -40,15 +39,21 @@ Start the passive collector without navigating or reloading the page:
 
 Stop the collector with `Ctrl-C`. After a failure, keep it stopped, resolve configuration or have the user restore the authorized login, and rerun the offline self-test before restarting.
 
-## 安装依赖
+## Legacy diagnostic tooling (disabled by default)
+
+The page-injection workflow below is legacy diagnostic tooling, not a Phase 1 operating path. It is disabled by default, is never used by `scripts/run-collector.mjs` or `scripts/smoke-test.mjs`, and may be used only when the user explicitly requests that specific diagnostic action. Do not use it for routine startup, reconnect, login recovery, collector recovery, or smoke testing. It must not be used as a workaround for a failed collector or expired authorization.
+
+Even when explicitly requested, use Chrome DevTools only, do not use Computer Use, do not record outgoing frames, and do not send Socket.IO business events. Stop and ask the user to restore authorization if login has expired.
+
+### 旧版诊断依赖
 
 ```bash
 npm install
 ```
 
-## 开启监听
+### 用户明确请求时的旧版页面注入诊断
 
-将 `monitor-init.js` 的完整内容作为 Chrome DevTools MCP `navigate_page` 的 `initScript`，并执行一次页面刷新。监听状态和缓存可在页面上下文中读取：
+Only after the user explicitly requests this legacy diagnostic, the complete `monitor-init.js` may be supplied as the Chrome DevTools MCP `navigate_page` `initScript` during one page reload. The injected listener records inbound frames only and sends no Socket.IO events. Its state and cache can be inspected in the page context:
 
 ```js
 window.__mxWsMonitor.isActive();
@@ -64,7 +69,7 @@ window.__mxWsMonitor.stop();
 
 页面刷新或关闭也会清除监听器。
 
-## 导出原始帧
+### 导出旧版诊断帧
 
 导出结果应保存为 JSON 数组。数组元素可以是：
 
@@ -80,7 +85,7 @@ window.__mxWsMonitor.stop();
 
 请勿把 Cookie、登录令牌或 Socket.IO 会话 ID 写入导出文件。
 
-## 解码
+### 离线解码旧版诊断帧
 
 ```bash
 npm run decode -- \
@@ -105,7 +110,7 @@ a_hunter/data/mx-websocket/decoded-room-messages.json
 - 独立的文本片段列表；
 - 从 `type: "pic"`、`type: "image"`、`type: "img"` 和明文 URL 中提取的图片地址。
 
-## 已确认的解码链
+### 已确认的旧版解码链
 
 1. `LZString.decompress(payload)`；
 2. 对 `YYYY-MM-DD` 计算 MD5；
