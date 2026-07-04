@@ -10,6 +10,36 @@
 
 监听器不会记录出站帧，也不会主动发送 Socket.IO 事件。
 
+## Event foundation operations
+
+Only the user may authorize RIDs in `config/allowed-rids.yaml`; an empty list is the safe, intentionally inactive default. Never infer or add a RID from observed traffic. Use Chrome DevTools only, never Computer Use, and stop to ask the user to log in if authorization expires. Do not store credentials or generate reports after a data-quality failure. Phase 1 is passive collection only and never performs real trading.
+
+From the repository root, run the offline self-test before every start and after every code change:
+
+```bash
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+```
+
+Run the live smoke check only when the user has already enabled Chrome debugging:
+
+```bash
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/smoke-test.mjs
+```
+
+Before the first collector start, preserve legacy decoded output once:
+
+```bash
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/quarantine-legacy-output.mjs
+```
+
+Start the passive collector without navigating or reloading the page:
+
+```bash
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/run-collector.mjs --cdp http://127.0.0.1:9222
+```
+
+Stop the collector with `Ctrl-C`. After a failure, keep it stopped, resolve configuration or have the user restore the authorized login, and rerun the offline self-test before restarting.
+
 ## 安装依赖
 
 ```bash
