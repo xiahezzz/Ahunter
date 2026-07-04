@@ -397,16 +397,15 @@ Expected: all required concepts appear and no whitespace errors exist.
 
 ---
 
-### Task 5: Verify and migrate the authorized local database
+### Task 5: Run full branch verification
 
 **Files:**
-- Runtime only: `data/state/events.sqlite`
-- Do not commit: runtime data, local media, or `config/allowed-rids.yaml`
-- Commit: `docs/superpowers/plans/2026-07-04-disclaimer-cleaning.md`
+- Modify: `docs/superpowers/plans/2026-07-04-disclaimer-cleaning.md`
+- Do not access or modify: production runtime data, local media, or `config/allowed-rids.yaml`
 
 **Interfaces:**
-- Consumes: completed Tasks 1–4 and a stopped collector.
-- Produces: cleaned local normalized fields and final invariant evidence.
+- Consumes: completed Tasks 1–4.
+- Produces: final branch test evidence and a reviewed migration command ready for post-merge operation.
 
 - [ ] **Step 1: Run full verification**
 
@@ -417,46 +416,34 @@ Expected: all required concepts appear and no whitespace errors exist.
 
 Expected: every test passes in both runs. Record the new total rather than assuming 114.
 
-- [ ] **Step 2: Require a stopped collector**
+- [ ] **Step 2: Validate the migration CLI on an isolated fixture**
 
 ```bash
-pgrep -fl 'scripts/run-collector.mjs'
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node --test \
+  tests/integration/disclaimer-migration.test.mjs
 ```
 
-Expected: no output. If active, stop and ask the user to press `Ctrl-C`; do not kill it or migrate production data.
+Expected: all migration tests pass, including rollback, idempotency, event/media association, and unchanged image bytes.
 
-- [ ] **Step 3: Record aggregate pre-migration invariants**
-
-```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT
- (SELECT count(*) FROM events) AS events,
- (SELECT count(*) FROM media) AS media,
- (SELECT count(*) FROM media_jobs) AS media_jobs,
- (SELECT count(*) FROM media AS m LEFT JOIN events AS e ON e.event_id=m.event_id WHERE e.event_id IS NULL)
- +
- (SELECT count(*) FROM media_jobs AS j LEFT JOIN events AS e ON e.event_id=j.event_id WHERE e.event_id IS NULL)
- AS orphans;"
-```
-
-Expected: zero orphans. Record all counts without printing message content.
-
-- [ ] **Step 4: Run and verify production migration**
-
-```bash
-/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node \
-  scripts/migrate-disclaimer-content.mjs
-```
-
-Expected: exit 0, equal before/after counts, and zero orphans. Run the Task 4 queries; both disclaimer counts must be zero and every media row must retain its parent event and path. Run migration again; expected `updated: 0`.
-
-- [ ] **Step 5: Check state and commit only the plan**
+- [ ] **Step 3: Check branch state and commit the sequencing correction**
 
 ```bash
 git diff --check
 git status --short
 git add docs/superpowers/plans/2026-07-04-disclaimer-cleaning.md
-git commit -m "docs: add MX disclaimer cleaning plan"
+git commit -m "docs: sequence MX migration after merge"
 ```
 
-Confirm runtime data and the user's RID configuration remain uncommitted.
+Confirm no runtime data, local media, or RID configuration is staged or committed.
+
+## Post-merge production migration
+
+Run this only after the reviewed feature branch is merged into `master`, so restarted collection uses the new cleaning behavior.
+
+1. Ask the user to stop the collector with `Ctrl-C` and verify `pgrep -fl 'scripts/run-collector.mjs'` has no output. Never kill it from the implementation workflow.
+2. Record aggregate event, media, media-job, and orphan counts using the query documented in the operations manual.
+3. Run `/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/migrate-disclaimer-content.mjs` from the merged repository root.
+4. Require equal before/after counts, zero orphans, and aggregate-only output.
+5. Run the disclaimer and event-image association queries from Task 4; require zero disclaimer matches and intact local paths.
+6. Run the migration again and require `updated: 0`.
+7. Restart the collector only after every verification succeeds.
