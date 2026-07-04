@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,6 +8,17 @@ import test from "node:test";
 import { downloadImage } from "../../src/media/download-image.mjs";
 
 const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const gif = new TextEncoder().encode("GIF89a");
+const webp = new Uint8Array([
+  0x52, 0x49, 0x46, 0x46, 0x04, 0x00, 0x00, 0x00,
+  0x57, 0x45, 0x42, 0x50,
+]);
+const avif = new Uint8Array([
+  0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70,
+  0x61, 0x76, 0x69, 0x66, 0x00, 0x00, 0x00, 0x00,
+  0x61, 0x76, 0x69, 0x66, 0x6d, 0x69, 0x66, 0x31,
+]);
 
 function response(bytes, type = "image/jpeg", url = "") {
   const value = new Response(bytes, {
@@ -40,6 +51,10 @@ test("rejects credentials and local address literals before fetching", async (t)
     "https://user:secret@example.com/a.jpg",
     "https://localhost/a.jpg",
     "https://assets.localhost/a.jpg",
+    "https://localhost./a.jpg",
+    "https://sub.localhost./a.jpg",
+    "https://LOCALHOST.../a.jpg",
+    "https://Sub.LoCaLhOsT../a.jpg",
     "https://127.0.0.1/a.jpg",
     "https://10.2.3.4/a.jpg",
     "https://172.16.4.5/a.jpg",
@@ -68,6 +83,69 @@ test("rejects credentials and local address literals before fetching", async (t)
       assert.equal(fetched, false);
     });
   }
+});
+
+test("cancels a redirect body before fetching its target", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "a-hunter-media-"));
+  const actions = [];
+  const redirectBody = new ReadableStream({
+    cancel() {
+      actions.push("cancel");
+    },
+  });
+
+  const result = await downloadImage({
+    url: "https://example.com/a.jpg",
+    mediaRoot: root,
+    fetchImpl: async () => {
+      actions.push("fetch");
+      if (actions.filter((action) => action === "fetch").length === 1) {
+        return new Response(redirectBody, {
+          status: 302,
+          headers: { location: "https://cdn.example.com/a.jpg" },
+        });
+      }
+      return response(jpeg);
+    },
+  });
+
+  assert.deepEqual(actions, ["fetch", "cancel", "fetch"]);
+  assert.equal(result.contentType, "image/jpeg");
+});
+
+test("detects supported image types from bytes and derives their extensions", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "a-hunter-media-"));
+  const cases = [
+    ["image/jpeg", "jpg", jpeg],
+    ["image/png", "png", png],
+    ["image/gif", "gif", gif],
+    ["image/webp", "webp", webp],
+    ["image/avif", "avif", avif],
+  ];
+
+  for (const [type, extension, bytes] of cases) {
+    await t.test(type, async () => {
+      const result = await downloadImage({
+        url: `https://example.com/image.${extension === "jpg" ? "png" : "jpg"}`,
+        mediaRoot: root,
+        fetchImpl: async () => response(bytes, type),
+      });
+      assert.equal(result.contentType, type);
+      assert.equal(path.extname(result.localPath), `.${extension}`);
+    });
+  }
+});
+
+test("rejects a supported MIME header that contradicts the image bytes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "a-hunter-media-"));
+  await assert.rejects(
+    downloadImage({
+      url: "https://example.com/mislabeled.png",
+      mediaRoot: root,
+      fetchImpl: async () => response(jpeg, "image/png"),
+    }),
+    /does not match image bytes/,
+  );
 });
 
 test("revalidates the final redirect URL", async () => {
@@ -99,6 +177,40 @@ test("deduplicates identical image bytes and uses owner-only permissions", async
   assert.equal(first.localPath, second.localPath);
   assert.equal((await stat(path.dirname(first.localPath))).mode & 0o777, 0o700);
   assert.equal((await stat(first.localPath)).mode & 0o777, 0o600);
+});
+
+test("deduplicates by detected bytes independently of source filename", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "a-hunter-media-"));
+  const first = await downloadImage({
+    url: "https://example.com/a.gif",
+    mediaRoot: root,
+    fetchImpl: async () => response(png, "image/png; charset=binary"),
+  });
+  const second = await downloadImage({
+    url: "https://example.com/b.jpg",
+    mediaRoot: root,
+    fetchImpl: async () => response(png, "IMAGE/PNG"),
+  });
+
+  assert.equal(first.localPath, second.localPath);
+  assert.equal(path.extname(first.localPath), ".png");
+});
+
+test("tightens permissions when reusing an existing media directory", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "a-hunter-media-"));
+  const hash = createHash("sha256").update(jpeg).digest("hex");
+  const directory = path.join(root, hash.slice(0, 2));
+  await mkdir(directory, { mode: 0o700 });
+  await chmod(directory, 0o755);
+  assert.equal((await stat(directory)).mode & 0o777, 0o755);
+
+  await downloadImage({
+    url: "https://example.com/existing-directory.jpg",
+    mediaRoot: root,
+    fetchImpl: async () => response(jpeg),
+  });
+
+  assert.equal((await stat(directory)).mode & 0o777, 0o700);
 });
 
 test("tightens permissions when reusing an existing content-addressed file", async () => {

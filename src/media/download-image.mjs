@@ -68,9 +68,13 @@ function validatedUrl(value, context) {
     throw new Error(`${context} credentials are not allowed`);
   }
 
-  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const localName = hostname === "localhost" || hostname.endsWith(".localhost");
+  const hostname = url.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "");
   const version = isIP(hostname);
+  if (version !== 6) url.hostname = hostname;
+  const localName = hostname === "localhost" || hostname.endsWith(".localhost");
   const localAddress =
     (version === 4 && isPrivateIpv4(hostname)) ||
     (version === 6 && isPrivateIpv6(hostname));
@@ -83,6 +87,7 @@ async function fetchImage(source, fetchImpl) {
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
     const response = await fetchImpl(current, { redirect: "manual" });
     if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => {});
       const location = response.headers.get("location");
       if (!location) throw new Error("Image redirect is missing a location");
       if (redirects === MAX_REDIRECTS) throw new Error("Image has too many redirects");
@@ -101,6 +106,41 @@ async function fetchImage(source, fetchImpl) {
   throw new Error("Image has too many redirects");
 }
 
+function detectedImageType(bytes) {
+  if (
+    bytes.length >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff
+  ) return "image/jpeg";
+  if (
+    bytes.length >= 8 &&
+    bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) return "image/png";
+  if (
+    bytes.length >= 6 &&
+    (bytes.subarray(0, 6).equals(Buffer.from("GIF87a")) ||
+      bytes.subarray(0, 6).equals(Buffer.from("GIF89a")))
+  ) return "image/gif";
+  if (
+    bytes.length >= 12 &&
+    bytes.subarray(0, 4).equals(Buffer.from("RIFF")) &&
+    bytes.subarray(8, 12).equals(Buffer.from("WEBP"))
+  ) return "image/webp";
+  if (bytes.length >= 16 && bytes.subarray(4, 8).equals(Buffer.from("ftyp"))) {
+    const boxSize = bytes.readUInt32BE(0);
+    if (boxSize < 16) return null;
+    const boxEnd = Math.min(boxSize, bytes.length);
+    const majorBrand = bytes.subarray(8, 12).toString("ascii");
+    if (majorBrand === "avif" || majorBrand === "avis") return "image/avif";
+    for (let offset = 16; offset + 4 <= boxEnd; offset += 4) {
+      const brand = bytes.subarray(offset, offset + 4).toString("ascii");
+      if (brand === "avif" || brand === "avis") return "image/avif";
+    }
+  }
+  return null;
+}
+
 export async function downloadImage({ url, mediaRoot, fetchImpl = fetch }) {
   const source = validatedUrl(url, "Image URL");
   const { response, finalUrl } = await fetchImage(source, fetchImpl);
@@ -112,8 +152,9 @@ export async function downloadImage({ url, mediaRoot, fetchImpl = fetch }) {
     ?.split(";")[0]
     .trim()
     .toLowerCase();
-  const extension = EXTENSIONS.get(contentType);
-  if (!extension) throw new Error(`Unsupported image content type: ${contentType || "missing"}`);
+  if (!EXTENSIONS.has(contentType)) {
+    throw new Error(`Unsupported image content type: ${contentType || "missing"}`);
+  }
 
   const declared = Number(response.headers.get("content-length") || 0);
   if (declared > LIMIT) throw new Error("Image exceeds 10 MiB");
@@ -134,11 +175,18 @@ export async function downloadImage({ url, mediaRoot, fetchImpl = fetch }) {
   }
 
   const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+  const detectedType = detectedImageType(bytes);
+  if (!detectedType) throw new Error("Unsupported image bytes");
+  if (detectedType !== contentType) {
+    throw new Error("Image content type does not match image bytes");
+  }
+  const extension = EXTENSIONS.get(detectedType);
   const contentHash = sha256(bytes);
   const directory = path.join(mediaRoot, contentHash.slice(0, 2));
   const localPath = path.join(directory, `${contentHash}.${extension}`);
   const temporary = `${localPath}.${randomUUID()}.tmp`;
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
   await writeFile(temporary, bytes, { flag: "wx", mode: 0o600 });
   try {
     await link(temporary, localPath);
@@ -153,7 +201,7 @@ export async function downloadImage({ url, mediaRoot, fetchImpl = fetch }) {
     sourceUrl: source.href,
     urlHash: sha256(source.href),
     contentHash,
-    contentType,
+    contentType: detectedType,
     localPath,
   };
 }
