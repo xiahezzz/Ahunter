@@ -152,25 +152,25 @@ test("all non-global literal addresses are rejected but global literals proceed"
   ];
   for (const host of blocked) await t.test(host, async () => {
     let fetched = false;
-    await assert.rejects(downloadImage({ url: `https://${host}/a.jpg`, mediaRoot: os.tmpdir(), fetchImpl: async () => { fetched = true; } }), /not allowed/);
+    await assert.rejects(downloadImage({ url: `https://${host}/a.jpg`, mediaRoot: os.tmpdir(), eventReceivedAt: at, fetchImpl: async () => { fetched = true; } }), /not allowed/);
     assert.equal(fetched, false);
   });
   let fetched = false;
-  await assert.rejects(downloadImage({ url: "https://8.8.8.8/a.jpg", mediaRoot: os.tmpdir(), fetchImpl: async () => { fetched = true; throw new Error("stop"); } }), /stop/);
+  await assert.rejects(downloadImage({ url: "https://8.8.8.8/a.jpg", mediaRoot: os.tmpdir(), eventReceivedAt: at, fetchImpl: async () => { fetched = true; throw new Error("stop"); } }), /stop/);
   assert.equal(fetched, true);
   for (const host of [
     "192.0.0.9", "192.0.0.10", "192.0.1.1", "198.51.1.1",
     "[64:ff9b::808:808]", "[2001:3::1]", "[2001:4:112::1]", "[2606:4700:4700::1111]",
   ]) {
     fetched = false;
-    await assert.rejects(downloadImage({ url: `https://${host}/a.jpg`, mediaRoot: os.tmpdir(), fetchImpl: async () => { fetched = true; throw new Error("stop"); } }), /stop/);
+    await assert.rejects(downloadImage({ url: `https://${host}/a.jpg`, mediaRoot: os.tmpdir(), eventReceivedAt: at, fetchImpl: async () => { fetched = true; throw new Error("stop"); } }), /stop/);
     assert.equal(fetched, true);
   }
 });
 
 test("download aborts a never-resolving fetch on connect timeout", async () => {
   await assert.rejects(downloadImage({
-    url: "https://example.com/a.jpg", mediaRoot: os.tmpdir(), connectTimeoutMs: 10,
+    url: "https://example.com/a.jpg", mediaRoot: os.tmpdir(), eventReceivedAt: at, connectTimeoutMs: 10,
     fetchImpl: async (_url, { signal }) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
   }), /timeout/i);
 });
@@ -178,7 +178,7 @@ test("download aborts a never-resolving fetch on connect timeout", async () => {
 test("download aborts a never-resolving body read", async () => {
   const body = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array([0xff, 0xd8, 0xff])); }, pull() { return new Promise(() => {}); } });
   await assert.rejects(downloadImage({
-    url: "https://example.com/a.jpg", mediaRoot: os.tmpdir(), bodyTimeoutMs: 10,
+    url: "https://example.com/a.jpg", mediaRoot: os.tmpdir(), eventReceivedAt: at, bodyTimeoutMs: 10,
     fetchImpl: async () => new Response(body, { headers: { "content-type": "image/jpeg" } }),
   }), /body-read timeout/i);
 });

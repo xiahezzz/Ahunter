@@ -26,11 +26,14 @@ export async function drainMediaJobs({
   for (;;) {
     if (signal?.aborted) break;
     const params = [now(), maxAttempts];
-    let sql = `SELECT event_id, rid, source_url, url_hash, attempts
-      FROM media_jobs
-      WHERE status IN ('pending', 'failed') AND next_attempt_at <= ? AND attempts < ?`;
-    if (eventId) { sql += " AND event_id = ?"; params.push(eventId); }
-    sql += " ORDER BY next_attempt_at, event_id, url_hash LIMIT ?";
+    let sql = `SELECT jobs.event_id, jobs.rid, jobs.source_url, jobs.url_hash, jobs.attempts,
+                      events.received_at AS event_received_at
+      FROM media_jobs AS jobs
+      INNER JOIN events AS events ON events.event_id = jobs.event_id
+      WHERE jobs.status IN ('pending', 'failed')
+        AND jobs.next_attempt_at <= ? AND jobs.attempts < ?`;
+    if (eventId) { sql += " AND jobs.event_id = ?"; params.push(eventId); }
+    sql += " ORDER BY jobs.next_attempt_at, jobs.event_id, jobs.url_hash LIMIT ?";
     params.push(limit);
     const jobs = store.database.prepare(sql).all(...params);
     if (jobs.length === 0) break;
@@ -41,7 +44,13 @@ export async function drainMediaJobs({
         if (!job || signal?.aborted) return;
         const attemptedAt = now();
         try {
-          const media = await downloadImage({ url: job.source_url, mediaRoot, fetchImpl, signal });
+          const media = await downloadImage({
+            url: job.source_url,
+            mediaRoot,
+            eventReceivedAt: job.event_received_at,
+            fetchImpl,
+            signal,
+          });
           store.completeMediaJob({
             eventId: job.event_id, rid: job.rid, downloadedAt: attemptedAt, ...media,
           });

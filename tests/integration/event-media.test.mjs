@@ -76,6 +76,8 @@ test("downloads media only for newly inserted allowlisted events", async (t) => 
   const row = store.database.prepare("SELECT source_url, local_path FROM media").get();
   assert.equal(row.source_url, "https://images.example.com/accepted-marker.jpg");
   assert.equal(row.local_path.startsWith(mediaRoot), true);
+  assert.equal(path.basename(path.dirname(row.local_path)), "2026-07-03");
+  assert.equal(path.basename(row.local_path).endsWith(".jpg"), true);
   assert.equal(
     store.database
       .prepare("PRAGMA index_list(media)")
