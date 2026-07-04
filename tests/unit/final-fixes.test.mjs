@@ -235,20 +235,23 @@ test("available target list without MX target is terminal authorization_required
   assert.deepEqual(logs, ["authorization_required"]);
 });
 
-test("collector queue is bounded and shutdown aborts after finite drain", async () => {
+test("shutdown starts every queued frame before abort and awaits settlement", async () => {
   const controller = new AbortController();
   let listener;
-  const counters = [];
   const attempted = [];
   let unsettled = 0;
   let closeClient;
+  let closeCalls = 0;
+  let unregisterCalls = 0;
   const client = {
     closed: new Promise((resolve) => { closeClient = resolve; }),
-    onEvent(fn) { listener = fn; return () => {}; }, async send() {}, close() { closeClient(); },
+    onEvent(fn) { listener = fn; return () => { unregisterCalls += 1; }; },
+    async send() {},
+    close() { closeCalls += 1; },
   };
   const collector = {
     acceptFrame(frame, { signal }) {
-      attempted.push(frame.payloadData);
+      attempted.push({ payloadData: frame.payloadData, aborted: signal.aborted });
       unsettled += 1;
       if (signal.aborted) { unsettled -= 1; return Promise.resolve(); }
       return new Promise((resolve) => signal.addEventListener("abort", () => {
@@ -256,18 +259,29 @@ test("collector queue is bounded and shutdown aborts after finite drain", async 
         resolve();
       }, { once: true }));
     },
-    recordOverflow: (reason) => counters.push(reason),
   };
   const running = runCollectorLoop({ cdpBase: "x", collector, signal: controller.signal,
     findTarget: async () => "ws://x", createClient: () => client, createRouter: ({ onFrame }) => onFrame,
-    maxConcurrentFrames: 1, maxQueuedFrames: 1, drainTimeoutMs: 5, delay: async () => {} });
+    maxConcurrentFrames: 1, maxQueuedFrames: 2, drainTimeoutMs: 5, delay: async () => {} });
   await new Promise((resolve) => setImmediate(resolve));
-  for (let index = 0; index < 4; index += 1) listener({ payloadData: String(index) });
+  listener({ payloadData: "0" });
+  await new Promise((resolve) => setImmediate(resolve));
+  listener({ payloadData: "1" });
+  listener({ payloadData: "2" });
+  assert.deepEqual(attempted, [{ payloadData: "0", aborted: false }]);
+  assert.equal(unsettled, 1);
   controller.abort();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(attempted, [
+    { payloadData: "0", aborted: false },
+    { payloadData: "1", aborted: false },
+    { payloadData: "2", aborted: false },
+  ]);
+  closeClient();
   await running;
-  assert.deepEqual(counters, ["frame_queue_overflow", "frame_queue_overflow"]);
-  assert.deepEqual(attempted, ["0", "1"]);
   assert.equal(unsettled, 0);
+  assert.equal(closeCalls, 1);
+  assert.equal(unregisterCalls, 1);
 });
 
 test("live smoke is Network-only and docs use repository-root commands", async () => {

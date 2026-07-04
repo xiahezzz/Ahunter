@@ -11,6 +11,7 @@ export class Collector {
   }
 
   async acceptFrame({ payloadData, receivedAt = this.now() }, { signal } = {}) {
+    if (signal?.aborted) return "aborted";
     if (!payloadData.startsWith('42/msg,["room_msg",')) {
       this.store.incrementCounter("ignored", receivedAt);
       return "ignored";
@@ -21,6 +22,7 @@ export class Collector {
       receivedAt,
       allowedRids: typeof this.allowedRids === "function" ? this.allowedRids() : this.allowedRids,
     });
+    if (signal?.aborted) return "aborted";
     if (result.status !== "accepted") {
       this.store.incrementCounter(result.status, receivedAt);
       if (result.status === "failed") {
@@ -36,7 +38,7 @@ export class Collector {
       await Promise.resolve()
         .then(() => this.onAccepted(result.event, { signal }))
         .catch(() => {
-          this.store.incrementCounter("media_failed", this.now());
+          if (!signal?.aborted) this.store.incrementCounter("media_failed", this.now());
         });
     }
     return status;

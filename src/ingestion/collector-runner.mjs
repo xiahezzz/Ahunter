@@ -29,6 +29,8 @@ export async function runCollectorLoop({
   const queued = [];
   let activeClient = null;
   let attempt = 0;
+  let shutdownStarted = false;
+  let shutdownTimer;
   const idleWaiters = new Set();
   const waitForIdle = () => {
     if (pending.size === 0 && queued.length === 0) return Promise.resolve();
@@ -48,8 +50,6 @@ export async function runCollectorLoop({
       log(`Collector client close failed (${errorName(error)})`);
     }
   };
-  signal.addEventListener("abort", closeActiveClient);
-
   const startFrame = (frame) => {
     const task = Promise.resolve()
       .then(() => collector.acceptFrame(frame, { signal: workController.signal }))
@@ -70,6 +70,19 @@ export async function runCollectorLoop({
     else collector.recordOverflow?.("frame_queue_overflow");
   };
 
+  const beginShutdown = () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    closeActiveClient();
+    while (queued.length) startFrame(queued.shift());
+    shutdownTimer = setTimeout(() => {
+      if (!workController.signal.aborted) {
+        workController.abort(new Error("Collector shutdown deadline exceeded"));
+      }
+    }, drainTimeoutMs);
+  };
+  signal.addEventListener("abort", beginShutdown);
+
   try {
     while (!signal.aborted) {
       let unregister;
@@ -83,7 +96,19 @@ export async function runCollectorLoop({
         unregister = client.onEvent(route);
         await client.send("Network.enable");
         attempt = 0;
-        await client.closed;
+        if (!signal.aborted) {
+          let stopWaiting;
+          const stopped = new Promise((resolve) => {
+            stopWaiting = resolve;
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", resolve, { once: true });
+          });
+          try {
+            await Promise.race([client.closed, stopped]);
+          } finally {
+            signal.removeEventListener("abort", stopWaiting);
+          }
+        }
       } catch (error) {
         if (error instanceof AuthorizationRequiredError || error?.code === "authorization_required") {
           log("authorization_required");
@@ -107,24 +132,9 @@ export async function runCollectorLoop({
       }
     }
   } finally {
-    signal.removeEventListener("abort", closeActiveClient);
-    closeActiveClient();
-    if (pending.size || queued.length) {
-      const deadline = new AbortController();
-      let timedOut = false;
-      try {
-        await Promise.race([
-          waitForIdle(),
-          timerDelay(drainTimeoutMs, undefined, { signal: deadline.signal })
-            .then(() => { timedOut = true; }),
-        ]);
-      } finally {
-        deadline.abort();
-      }
-      if (timedOut && !workController.signal.aborted) {
-        workController.abort(new Error("Collector shutdown deadline exceeded"));
-      }
-      await waitForIdle();
-    }
+    signal.removeEventListener("abort", beginShutdown);
+    beginShutdown();
+    await waitForIdle();
+    clearTimeout(shutdownTimer);
   }
 }

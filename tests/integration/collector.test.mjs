@@ -113,6 +113,34 @@ test("collector awaits accepted hooks and records hook failures", async () => {
   store.close();
 });
 
+test("collector aborts before classification persistence and after classification", async () => {
+  const store = openEventStore(":memory:");
+  const alreadyAborted = new AbortController();
+  alreadyAborted.abort(new Error("shutdown"));
+  const collector = new Collector({ allowedRids: new Set([20025]), store });
+  assert.equal(await collector.acceptFrame(
+    { payloadData: frame(20025, "before-marker") },
+    { signal: alreadyAborted.signal },
+  ), "aborted");
+
+  const duringClassification = new AbortController();
+  const abortingCollector = new Collector({
+    allowedRids: () => {
+      duringClassification.abort(new Error("shutdown"));
+      return new Set([20025]);
+    },
+    store,
+  });
+  assert.equal(await abortingCollector.acceptFrame(
+    { payloadData: frame(20025, "after-marker") },
+    { signal: duringClassification.signal },
+  ), "aborted");
+  assert.equal(store.database.prepare("SELECT count(*) AS count FROM events").get().count, 0);
+  assert.equal(store.database.prepare("SELECT count(*) AS count FROM ingest_counters").get().count, 0);
+  assert.equal(store.database.prepare("SELECT count(*) AS count FROM decode_failures").get().count, 0);
+  store.close();
+});
+
 test("findMxTarget returns the debugger URL for the exact MX origin", async () => {
   const requested = [];
   const result = await findMxTarget("http://127.0.0.1:9222", async (url) => {
