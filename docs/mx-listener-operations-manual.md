@@ -265,12 +265,13 @@ An empty allowlist intentionally records nothing. Add only a positive integer RI
 
 ### Permission denied or root-owned files after `sudo`
 
-This is exceptional recovery for files created by prior `sudo` use, not a routine startup step. First stop the collector with `Ctrl-C`, wait for it to exit, and inspect both storage paths when present:
+This is exceptional recovery for files created by prior `sudo` use, not a routine startup step. First stop the collector with `Ctrl-C`, wait for it to exit, and recursively list root-owned entries under both storage paths when present:
 
 ```bash
-ls -ld data/state
-if [ -e data/media ]; then ls -ld data/media; fi
+find data/state data/media -user root -ls 2>/dev/null
 ```
+
+No output means no root-owned entry was found. The error redirect keeps an optional, not-yet-created `data/media` directory from producing an error message.
 
 Do not restart until the database files under `data/state` and any downloaded files under `data/media` are writable by the normal account. After confirming that the affected files should belong to the current user and the Mac's normal `staff` group, run:
 
@@ -279,7 +280,7 @@ sudo chown -R "$USER":staff data/state
 if [ -e data/media ]; then sudo chown -R "$USER":staff data/media; fi
 ```
 
-Then repeat the inspection commands for both paths and resume all routine operation as the normal user without `sudo`. If the expected owner or group is uncertain, stop and ask the Mac administrator instead of guessing.
+Then repeat the recursive `find` command. Resume all routine operation as the normal user without `sudo` only when it reports no root-owned entries. If the expected owner or group is uncertain, stop and ask the Mac administrator instead of guessing.
 
 ### Collection disconnects when the display turns off
 
