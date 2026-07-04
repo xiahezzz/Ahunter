@@ -236,7 +236,68 @@ cp -p data/state/events.sqlite \
 
 This creates a timestamped database copy without changing the live database. Downloaded files are stored separately under `data/media/`; include that directory in the machine's normal backup if those files must also be retained.
 
-## 6. Troubleshooting by symptom
+## 6. One-time disclaimer-content migration
+
+Run this procedure only after the updated collector and migration script have been installed. The migration rewrites normalized event text and JSON while preserving event, media, and media-job counts and associations.
+
+### Stop the collector and confirm that it is stopped
+
+In the collector terminal, press `Ctrl-C` once. Wait until the command has exited and the shell prompt has returned. Do not run the migration while the collector is running.
+
+From the project root, verify that no collector process remains:
+
+```bash
+pgrep -fl 'scripts/run-collector.mjs'
+```
+
+Proceed only if this command produces no output. If it prints a process, return to that collector terminal, stop it with `Ctrl-C`, wait for the shell prompt, and repeat the check. Do not force-stop the collector.
+
+### Run the migration
+
+With the collector stopped, run:
+
+```bash
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node \
+  scripts/migrate-disclaimer-content.mjs
+```
+
+The migration report contains aggregate counts only. Success requires `eventsBefore` to equal `eventsAfter`, `mediaBefore` to equal `mediaAfter`, `mediaJobsBefore` to equal `mediaJobsAfter`, and `orphansAfter: 0`. Do not restart the collector if any of these checks fails.
+
+Run the same migration command a second time. A successful repeated run reports `updated: 0`, showing that there was nothing left to change.
+
+### Verify the exact disclaimer is absent
+
+Run this read-only aggregate query:
+
+```bash
+sqlite3 -header -column data/state/events.sqlite \
+"SELECT
+   sum(decoded_text LIKE '%免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！%') AS decoded_matches,
+   sum(parsed_content_json LIKE '%免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！%') AS parsed_matches
+ FROM events;"
+```
+
+Both `decoded_matches` and `parsed_matches` must be zero.
+
+### Verify event-image associations
+
+Run this read-only local query:
+
+```bash
+sqlite3 -header -column data/state/events.sqlite \
+"SELECT e.event_id, e.rid,
+        datetime(e.received_at / 1000, 'unixepoch', 'localtime') AS received_time,
+        e.decoded_text, m.content_type, m.local_path
+ FROM events AS e
+ LEFT JOIN media AS m ON m.event_id = e.event_id AND m.rid = e.rid
+ ORDER BY e.received_at DESC, m.local_path;"
+```
+
+Review the results locally to confirm that downloaded media remains associated with its event and RID and has a nonempty `local_path`. An empty `decoded_text` together with a nonempty `local_path` is valid for an image-only event; it is not evidence of a failed migration.
+
+Restart the collector only after the migration report, repeated-run check, exact-disclaimer query, and event-image association review all succeed.
+
+## 7. Troubleshooting by symptom
 
 ### `Collector connection failed (Error)` repeats
 
@@ -290,7 +351,7 @@ Keep the laptop lid open, connect power, and start the collector with the docume
 
 If port 9333 is already used by an unrelated process, inspect it with `lsof -nP -iTCP:9333 -sTCP:LISTEN`. Select one unused port. Use that same value in `--remote-debugging-port`, both `/json/version` and `/json/list` curl URLs, and the collector's `--cdp` URL for the entire session. Do not mix port values. Return to 9333 when the conflict is resolved so the fixed daily commands apply again.
 
-## 7. Compact command index
+## 8. Compact command index
 
 The lifecycle sections above are authoritative; this index only points back to those same commands.
 
@@ -305,3 +366,4 @@ The lifecycle sections above are authoritative; this index only points back to t
 | View counters | Ingestion-counter query — section 4 |
 | View media | Downloaded-media and media-job queries — section 4 |
 | Stop | Press `Ctrl-C` once and allow the 30-second drain window — section 5 |
+| Migrate disclaimer content | Stop-check, migration, repeated-run, and verification procedure — section 6 |
