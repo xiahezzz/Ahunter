@@ -12,16 +12,28 @@ function option(name, fallback) {
 }
 
 const cdpBase = option("--cdp", "http://127.0.0.1:9222");
+const abortController = new AbortController();
+const workController = new AbortController();
+let shutdownDeadline;
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    if (abortController.signal.aborted) return;
+    abortController.abort();
+    shutdownDeadline = setTimeout(() => {
+      workController.abort(new Error("Collector shutdown deadline exceeded"));
+    }, 30_000);
+    shutdownDeadline.unref?.();
+  });
+}
 const store = openEventStore("data/state/events.sqlite");
 const ridConfig = watchAllowedRids("config/allowed-rids.yaml", {
   onError: (reason) => store.incrementCounter(reason, Date.now()),
 });
-const abortController = new AbortController();
 let mediaDrain;
-function drainPersistedMedia() {
+function drainPersistedMedia(signal = workController.signal) {
   if (!mediaDrain) {
     mediaDrain = drainMediaJobs({
-      store, mediaRoot: "data/media", signal: abortController.signal,
+      store, mediaRoot: "data/media", signal,
     }).finally(() => { mediaDrain = undefined; });
   }
   return mediaDrain;
@@ -29,30 +41,35 @@ function drainPersistedMedia() {
 const collector = new Collector({
   allowedRids: () => ridConfig.current,
   store,
-  onAccepted: () => drainPersistedMedia(),
+  onAccepted: (_event, { signal }) => drainPersistedMedia(signal),
 });
 collector.recordOverflow = (reason) => store.incrementCounter(reason, Date.now());
-const stopMaintenance = startRetentionMaintenance({
-  store,
-  onReason: (reason) => store.incrementCounter(reason, Date.now()),
-});
-await drainMediaJobs({ store, mediaRoot: "data/media", signal: abortController.signal });
-const mediaRetryTimer = setInterval(() => void drainPersistedMedia(), 60_000);
-mediaRetryTimer.unref?.();
-
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.once(signal, () => abortController.abort());
-}
-
+let stopMaintenance = () => {};
+let mediaRetryTimer;
 try {
+  stopMaintenance = startRetentionMaintenance({
+    store,
+    onReason: (reason) => store.incrementCounter(reason, Date.now()),
+  });
+  await drainMediaJobs({ store, mediaRoot: "data/media", signal: workController.signal });
+  if (!abortController.signal.aborted) {
+    mediaRetryTimer = setInterval(() => void drainPersistedMedia(), 60_000);
+    mediaRetryTimer.unref?.();
+  }
   await runCollectorLoop({
     cdpBase,
     collector,
     signal: abortController.signal,
+    workController,
   });
 } finally {
+  clearTimeout(shutdownDeadline);
   clearInterval(mediaRetryTimer);
   stopMaintenance();
-  ridConfig.close();
-  store.close();
+  if (mediaDrain) await Promise.allSettled([mediaDrain]);
+  try {
+    ridConfig.close();
+  } finally {
+    store.close();
+  }
 }

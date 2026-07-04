@@ -144,7 +144,12 @@ test("decode failures persist only bucketed hash, class, and count", async () =>
 });
 
 test("all non-global literal addresses are rejected but global literals proceed", async (t) => {
-  const blocked = ["0.1.2.3", "100.64.0.1", "192.0.2.1", "198.18.0.1", "224.0.0.1", "240.0.0.1", "[::]", "[ff02::1]", "[2001:db8::1]", "[::ffff:100.64.0.1]"];
+  const blocked = [
+    "0.1.2.3", "100.64.0.1", "192.0.0.8", "192.0.2.1", "192.88.99.1",
+    "198.18.0.1", "224.0.0.1", "240.0.0.1", "[::]", "[ff02::1]",
+    "[64:ff9b:1::1]", "[100::1]", "[2001:2::1]", "[2001:db8::1]",
+    "[3fff::1]", "[5f00::1]", "[::ffff:100.64.0.1]", "[::ffff:8.8.8.8]",
+  ];
   for (const host of blocked) await t.test(host, async () => {
     let fetched = false;
     await assert.rejects(downloadImage({ url: `https://${host}/a.jpg`, mediaRoot: os.tmpdir(), fetchImpl: async () => { fetched = true; } }), /not allowed/);
@@ -153,7 +158,10 @@ test("all non-global literal addresses are rejected but global literals proceed"
   let fetched = false;
   await assert.rejects(downloadImage({ url: "https://8.8.8.8/a.jpg", mediaRoot: os.tmpdir(), fetchImpl: async () => { fetched = true; throw new Error("stop"); } }), /stop/);
   assert.equal(fetched, true);
-  for (const host of ["192.0.1.1", "198.51.1.1"]) {
+  for (const host of [
+    "192.0.0.9", "192.0.0.10", "192.0.1.1", "198.51.1.1",
+    "[64:ff9b::808:808]", "[2001:3::1]", "[2001:4:112::1]", "[2606:4700:4700::1111]",
+  ]) {
     fetched = false;
     await assert.rejects(downloadImage({ url: `https://${host}/a.jpg`, mediaRoot: os.tmpdir(), fetchImpl: async () => { fetched = true; throw new Error("stop"); } }), /stop/);
     assert.equal(fetched, true);
@@ -190,6 +198,34 @@ test("media drain bounds download concurrency", async () => {
   store.close();
 });
 
+test("media drain repeats bounded batches until no due jobs remain", async () => {
+  const store = openEventStore(":memory:");
+  const first = { ...event, parsedContent: { ...event.parsedContent, imageUrls: ["https://example.com/first.jpg"] } };
+  const later = { ...event, eventId: "event-later", sourceMessageId: "8", parsedContent: { ...event.parsedContent, imageUrls: ["https://example.com/later.jpg"] } };
+  store.insertEvent(first, "run");
+  const urls = [];
+  await drainMediaJobs({ store, mediaRoot: os.tmpdir(), batchSize: 1, fetchImpl: async (url) => {
+    urls.push(String(url));
+    if (urls.length === 1) store.insertEvent(later, "run");
+    return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { "content-type": "image/jpeg" } });
+  } });
+  assert.deepEqual(urls, ["https://example.com/first.jpg", "https://example.com/later.jpg"]);
+  store.close();
+});
+
+test("media insertion rolls back when job completion fails", async () => {
+  const store = openEventStore(":memory:");
+  const single = { ...event, parsedContent: { ...event.parsedContent, imageUrls: ["https://example.com/atomic.jpg"] } };
+  store.insertEvent(single, "run");
+  store.database.exec(`CREATE TRIGGER reject_media_completion BEFORE UPDATE ON media_jobs
+    WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'completion rejected'); END`);
+  await drainMediaJobs({ store, mediaRoot: os.tmpdir(), fetchImpl: async () =>
+    new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { "content-type": "image/jpeg" } }) });
+  assert.equal(store.database.prepare("SELECT count(*) AS count FROM media").get().count, 0);
+  assert.equal(store.database.prepare("SELECT status FROM media_jobs").get().status, "failed");
+  store.close();
+});
+
 test("available target list without MX target is terminal authorization_required", async () => {
   await assert.rejects(findMxTarget("http://cdp", async () => ({ ok: true, async json() { return []; } })), AuthorizationRequiredError);
   const controller = new AbortController();
@@ -202,24 +238,45 @@ test("available target list without MX target is terminal authorization_required
 test("collector queue is bounded and shutdown aborts after finite drain", async () => {
   const controller = new AbortController();
   let listener;
-  let release;
-  const blocked = new Promise((resolve) => { release = resolve; });
   const counters = [];
-  const client = { closed: blocked, onEvent(fn) { listener = fn; return () => {}; }, async send() {}, close() { release(); } };
-  const running = runCollectorLoop({ cdpBase: "x", collector: { acceptFrame: () => blocked, recordOverflow: (reason) => counters.push(reason) }, signal: controller.signal,
+  const attempted = [];
+  let unsettled = 0;
+  let closeClient;
+  const client = {
+    closed: new Promise((resolve) => { closeClient = resolve; }),
+    onEvent(fn) { listener = fn; return () => {}; }, async send() {}, close() { closeClient(); },
+  };
+  const collector = {
+    acceptFrame(frame, { signal }) {
+      attempted.push(frame.payloadData);
+      unsettled += 1;
+      if (signal.aborted) { unsettled -= 1; return Promise.resolve(); }
+      return new Promise((resolve) => signal.addEventListener("abort", () => {
+        unsettled -= 1;
+        resolve();
+      }, { once: true }));
+    },
+    recordOverflow: (reason) => counters.push(reason),
+  };
+  const running = runCollectorLoop({ cdpBase: "x", collector, signal: controller.signal,
     findTarget: async () => "ws://x", createClient: () => client, createRouter: ({ onFrame }) => onFrame,
     maxConcurrentFrames: 1, maxQueuedFrames: 1, drainTimeoutMs: 5, delay: async () => {} });
   await new Promise((resolve) => setImmediate(resolve));
-  for (let index = 0; index < 4; index += 1) listener({ method: "Network.webSocketFrameReceived", params: { response: { opcode: 1, payloadData: "x" } } });
+  for (let index = 0; index < 4; index += 1) listener({ payloadData: String(index) });
   controller.abort();
   await running;
   assert.deepEqual(counters, ["frame_queue_overflow", "frame_queue_overflow"]);
+  assert.deepEqual(attempted, ["0", "1"]);
+  assert.equal(unsettled, 0);
 });
 
 test("live smoke is Network-only and docs use repository-root commands", async () => {
   const smoke = await readFile(new URL("../../scripts/smoke-test.mjs", import.meta.url), "utf8");
   assert.match(smoke, /new CdpClient/);
   assert.match(smoke, /send\("Network\.enable"\)/);
+  assert.match(smoke, /findMxTarget[^;]+signal/s);
+  assert.match(smoke, /openTimeoutMs/);
+  assert.match(smoke, /commandTimeoutMs/);
   assert.match(smoke, /listener-ready/);
   assert.match(smoke, /websocket-activity/);
   assert.doesNotMatch(smoke, /Runtime\.|Page\.|navigate|reload/i);
@@ -230,4 +287,5 @@ test("live smoke is Network-only and docs use repository-root commands", async (
   const runner = await readFile(new URL("../../scripts/run-collector.mjs", import.meta.url), "utf8");
   assert.match(runner, /await drainMediaJobs/);
   assert.match(runner, /setInterval\([^\n]*drainPersistedMedia/);
+  assert.match(runner, /try\s*{\s*stopMaintenance = startRetentionMaintenance/s);
 });

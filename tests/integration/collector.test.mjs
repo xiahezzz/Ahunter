@@ -176,3 +176,12 @@ test("findMxTarget rejects a target list without the MX page", async () => {
     /authorization_required/,
   );
 });
+
+test("findMxTarget forwards abort to a half-open target-list request", async () => {
+  const controller = new AbortController();
+  const pending = findMxTarget("http://127.0.0.1:9222", async (_url, { signal }) =>
+    new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+  { signal: controller.signal });
+  controller.abort(new Error("target discovery timeout"));
+  await assert.rejects(pending, /target discovery timeout/);
+});

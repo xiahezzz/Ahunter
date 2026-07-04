@@ -39,6 +39,9 @@ export function openEventStore(filename) {
   const mediaParentMatches = database.prepare(
     "SELECT 1 FROM events WHERE event_id = ? AND rid = ?",
   );
+  const completeMediaJobStatement = database.prepare(`UPDATE media_jobs
+    SET status = 'completed', attempts = attempts + 1, error_code = NULL
+    WHERE event_id = ? AND url_hash = ?`);
   const increment = database.prepare(`
     INSERT INTO ingest_counters(bucket_start, kind, count) VALUES (?, ?, 1)
     ON CONFLICT(bucket_start, kind) DO UPDATE SET count = count + 1
@@ -67,6 +70,26 @@ export function openEventStore(filename) {
       error.code = "checkpoint_busy";
       throw error;
     }
+  }
+
+  function insertMediaRecord(media) {
+    const result = insertMediaStatement.run(
+      media.eventId,
+      media.rid,
+      media.sourceUrl,
+      media.urlHash,
+      media.contentHash,
+      media.contentType,
+      media.localPath,
+      media.downloadedAt,
+      media.eventId,
+      media.rid,
+    );
+    if (result.changes === 1) return true;
+    if (!mediaParentMatches.get(media.eventId, media.rid)) {
+      throw new Error("Media RID does not match parent event");
+    }
+    return false;
   }
 
   return {
@@ -105,23 +128,20 @@ export function openEventStore(filename) {
       }
     },
     insertMedia(media) {
-      const result = insertMediaStatement.run(
-        media.eventId,
-        media.rid,
-        media.sourceUrl,
-        media.urlHash,
-        media.contentHash,
-        media.contentType,
-        media.localPath,
-        media.downloadedAt,
-        media.eventId,
-        media.rid,
-      );
-      if (result.changes === 1) return true;
-      if (!mediaParentMatches.get(media.eventId, media.rid)) {
-        throw new Error("Media RID does not match parent event");
+      return insertMediaRecord(media);
+    },
+    completeMediaJob(media) {
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const inserted = insertMediaRecord(media);
+        const completed = completeMediaJobStatement.run(media.eventId, media.urlHash);
+        if (completed.changes !== 1) throw new Error("Media job does not exist");
+        database.exec("COMMIT");
+        return inserted;
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
       }
-      return false;
     },
     incrementCounter(kind, at) {
       const bucketStart = Math.floor(at / 3_600_000) * 3_600_000;

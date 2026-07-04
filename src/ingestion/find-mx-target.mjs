@@ -8,8 +8,8 @@ export class AuthorizationRequiredError extends Error {
   }
 }
 
-export async function findMxTarget(baseUrl, fetchImpl = fetch) {
-  const response = await fetchImpl(new URL("/json/list", baseUrl).href);
+export async function findMxTarget(baseUrl, fetchImpl = fetch, { signal } = {}) {
+  const response = await fetchImpl(new URL("/json/list", baseUrl).href, { signal });
   if (!response.ok) {
     throw new Error(`CDP target list failed: ${response.status}`);
   }

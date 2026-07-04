@@ -10,7 +10,7 @@ export class Collector {
     this.runId = randomUUID();
   }
 
-  async acceptFrame({ payloadData, receivedAt = this.now() }) {
+  async acceptFrame({ payloadData, receivedAt = this.now() }, { signal } = {}) {
     if (!payloadData.startsWith('42/msg,["room_msg",')) {
       this.store.incrementCounter("ignored", receivedAt);
       return "ignored";
@@ -34,7 +34,7 @@ export class Collector {
     this.store.incrementCounter(status, receivedAt);
     if (inserted || status === "duplicate") {
       await Promise.resolve()
-        .then(() => this.onAccepted(result.event))
+        .then(() => this.onAccepted(result.event, { signal }))
         .catch(() => {
           this.store.incrementCounter("media_failed", this.now());
         });

@@ -4,12 +4,14 @@ import { CdpClient } from "../../src/ingestion/cdp-client.mjs";
 
 class FakeSocket extends EventTarget {
   sent = [];
+  closeCalls = 0;
 
   send(value) {
     this.sent.push(value);
   }
 
   close() {
+    this.closeCalls += 1;
     this.dispatchEvent(new Event("close"));
   }
 
@@ -23,6 +25,31 @@ class FakeSocket extends EventTarget {
     );
   }
 }
+
+test("times out a half-open WebSocket and closes it once", async () => {
+  const socket = new FakeSocket();
+  const client = new CdpClient("ws://test", {
+    webSocketFactory: () => socket,
+    openTimeoutMs: 5,
+  });
+  await assert.rejects(client.send("Network.enable"), /open timeout/i);
+  client.close();
+  assert.equal(socket.closeCalls, 1);
+});
+
+test("times out a CDP command that never responds", async () => {
+  const socket = new FakeSocket();
+  const client = new CdpClient("ws://test", {
+    webSocketFactory: () => socket,
+    commandTimeoutMs: 5,
+  });
+  socket.open();
+  await assert.rejects(client.send("Network.enable"), /command timeout/i);
+  assert.equal(client.pending.size, 0);
+  client.close();
+  client.close();
+  assert.equal(socket.closeCalls, 1);
+});
 
 function createClient() {
   const socket = new FakeSocket();

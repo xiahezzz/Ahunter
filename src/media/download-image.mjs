@@ -23,6 +23,7 @@ function isNonGlobalIpv4(hostname) {
     const size = 2 ** (32 - bits);
     return Math.floor(value / size) === Math.floor(base / size);
   };
+  if (hostname === "192.0.0.9" || hostname === "192.0.0.10") return false;
   return [
     ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
     ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24],
@@ -47,22 +48,31 @@ function ipv6Words(hostname) {
 function isNonGlobalIpv6(hostname) {
   const words = ipv6Words(hostname);
   if (!words || words.some(Number.isNaN)) return true;
-  const loopback =
-    words.slice(0, 7).every((word) => word === 0) && words[7] === 1;
-  const uniqueLocal = (words[0] & 0xfe00) === 0xfc00;
-  const linkLocal = (words[0] & 0xffc0) === 0xfe80;
+  const value = words.reduce((total, word) => (total << 16n) | BigInt(word), 0n);
+  const inCidr = (address, bits) => {
+    const base = ipv6Words(address)
+      .reduce((total, word) => (total << 16n) | BigInt(word), 0n);
+    return (value >> BigInt(128 - bits)) === (base >> BigInt(128 - bits));
+  };
   const ipv4Mapped =
     words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff;
-  if (ipv4Mapped) {
-    const mapped =
-      `${words[6] >> 8}.${words[6] & 0xff}.` +
-      `${words[7] >> 8}.${words[7] & 0xff}`;
-    return isNonGlobalIpv4(mapped);
+  if (ipv4Mapped) return true;
+
+  const globalIetfExceptions = [
+    ["2001:1::1", 128], ["2001:1::2", 128], ["2001:1::3", 128],
+    ["2001:3::", 32], ["2001:4:112::", 48], ["2001:20::", 28],
+    ["2001:30::", 28],
+  ];
+  if (globalIetfExceptions.some(([address, bits]) => inCidr(address, bits))) {
+    return false;
   }
-  const unspecified = words.every((word) => word === 0);
-  const multicast = (words[0] & 0xff00) === 0xff00;
-  const documentation = words[0] === 0x2001 && words[1] === 0x0db8;
-  return unspecified || loopback || uniqueLocal || linkLocal || multicast || documentation;
+
+  return [
+    ["::", 128], ["::1", 128], ["64:ff9b:1::", 48], ["100::", 64],
+    ["100:0:0:1::", 64], ["2001::", 23], ["2001:db8::", 32],
+    ["2002::", 16], ["3fff::", 20], ["5f00::", 16], ["fc00::", 7],
+    ["fe80::", 10], ["ff00::", 8],
+  ].some(([address, bits]) => inCidr(address, bits));
 }
 
 function validatedUrl(value, context) {

@@ -5,6 +5,14 @@ import { CdpClient } from "../src/ingestion/cdp-client.mjs";
 import { findMxTarget } from "../src/ingestion/find-mx-target.mjs";
 
 const checks = [];
+const DISCOVERY_TIMEOUT_MS = 5_000;
+const OPEN_TIMEOUT_MS = 5_000;
+const COMMAND_TIMEOUT_MS = 5_000;
+function timeoutSignal(milliseconds, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`${label} timeout`)), milliseconds);
+  return { signal: controller.signal, close: () => clearTimeout(timer) };
+}
 async function check(name, action) {
   try {
     const details = await action();
@@ -21,10 +29,18 @@ await check("node", () => {
 });
 await check("rid-config", () => ({ active: loadAllowedRids("config/allowed-rids.yaml").size > 0 }));
 await check("cdp-network-listener", async () => {
-  const target = await findMxTarget("http://127.0.0.1:9222");
-  const client = new CdpClient(target);
+  const discovery = timeoutSignal(DISCOVERY_TIMEOUT_MS, "CDP target discovery");
+  let target;
+  try {
+    target = await findMxTarget("http://127.0.0.1:9222", fetch, { signal: discovery.signal });
+  } finally {
+    discovery.close();
+  }
+  const client = new CdpClient(target, {
+    openTimeoutMs: OPEN_TIMEOUT_MS,
+    commandTimeoutMs: COMMAND_TIMEOUT_MS,
+  });
   let activity = false;
-  let closeRequested = false;
   let unregister;
   try {
     unregister = client.onEvent((event) => {
@@ -36,7 +52,7 @@ await check("cdp-network-listener", async () => {
     checks.push({ name: "websocket-activity", ok: true, observed: activity });
   } finally {
     unregister?.();
-    if (!closeRequested) { closeRequested = true; client.close(); }
+    client.close();
   }
   return { listenerReady: true, activityObserved: activity };
 });
