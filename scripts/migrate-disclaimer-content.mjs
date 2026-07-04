@@ -10,9 +10,9 @@ function usageError(message) {
 function parseDatabasePath(args) {
   let databasePath = "data/state/events.sqlite";
   for (let index = 0; index < args.length; index += 1) {
-    if (args[index] !== "--database") throw usageError(`Unexpected argument: ${args[index]}`);
+    if (args[index] !== "--database") throw usageError("Unexpected argument");
     const value = args[index + 1];
-    if (value === undefined || value.startsWith("--")) {
+    if (!value || value.startsWith("--")) {
       throw usageError("--database requires a value");
     }
     databasePath = value;

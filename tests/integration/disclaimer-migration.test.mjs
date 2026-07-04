@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -50,9 +50,15 @@ async function fixture() {
 }
 
 test("migrates historical disclaimer content without changing event or media identity", async (t) => {
-  const { filename, imagePath } = await fixture();
+  const { directory, filename, imagePath } = await fixture();
   const store = openEventStore(filename);
-  t.after(() => store.close());
+  t.after(async () => {
+    try {
+      store.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
   const bodyParsed = [
     { type: "text", msg: "正文" },
@@ -66,7 +72,10 @@ test("migrates historical disclaimer content without changing event or media ide
   const imageEvent = event("image-event", imageParsed);
   imageEvent.parsedContent.imageUrls = [imageUrl];
 
-  assert.equal(store.insertEvent(event("body-event", bodyParsed), "migration-run"), true);
+  const bodyEvent = event("body-event", bodyParsed);
+  bodyEvent.oid = "body-oid";
+  imageEvent.oid = "image-oid";
+  assert.equal(store.insertEvent(bodyEvent, "migration-run"), true);
   assert.equal(store.insertEvent(imageEvent, "migration-run"), true);
   const urlHash = hash(imageUrl);
   const imageHashBefore = hash(await readFile(imagePath));
@@ -81,10 +90,13 @@ test("migrates historical disclaimer content without changing event or media ide
     downloadedAt: receivedAt,
   });
 
-  const idsBefore = store.database
-    .prepare("SELECT event_id FROM events ORDER BY event_id")
-    .all()
-    .map(({ event_id: eventId }) => eventId);
+  const identityQuery = `
+    SELECT event_id, rid, source_message_id, oid, received_at, source_created_at,
+           raw_payload_hash, raw_payload
+    FROM events
+    ORDER BY event_id
+  `;
+  const identityBefore = store.database.prepare(identityQuery).all();
   const report = migrateDisclaimerContent(store.database);
 
   assert.equal(report.scanned, 2);
@@ -93,24 +105,26 @@ test("migrates historical disclaimer content without changing event or media ide
   assert.equal(report.mediaBefore, report.mediaAfter);
   assert.equal(report.mediaJobsBefore, report.mediaJobsAfter);
   assert.equal(report.orphansAfter, 0);
-  assert.deepEqual(
-    store.database
-      .prepare("SELECT event_id FROM events ORDER BY event_id")
-      .all()
-      .map(({ event_id: eventId }) => eventId),
-    idsBefore,
-  );
+  assert.deepEqual(store.database.prepare(identityQuery).all(), identityBefore);
 
   const rows = store.database
-    .prepare("SELECT event_id, schema_version, decoded_text, parsed_content_json FROM events ORDER BY event_id")
+    .prepare(`
+      SELECT event_id, schema_version, decoded_text, parsed_content_json, content_hash
+      FROM events
+      ORDER BY event_id
+    `)
     .all();
   assert.deepEqual(rows.map(({ schema_version: version }) => version), [2, 2]);
   for (const row of rows) {
     assert.equal(row.decoded_text.includes(MX_DISCLAIMER), false);
     assert.equal(row.parsed_content_json.includes(MX_DISCLAIMER), false);
   }
-  assert.equal(rows.find(({ event_id: id }) => id === "body-event").decoded_text, "正文");
-  assert.equal(rows.find(({ event_id: id }) => id === "image-event").decoded_text, "");
+  const bodyRow = rows.find(({ event_id: id }) => id === "body-event");
+  const imageRow = rows.find(({ event_id: id }) => id === "image-event");
+  assert.equal(bodyRow.decoded_text, "正文");
+  assert.equal(bodyRow.content_hash, hash(JSON.stringify([{ type: "text", msg: "正文" }])));
+  assert.equal(imageRow.decoded_text, "");
+  assert.equal(imageRow.content_hash, hash(JSON.stringify([{ type: "pic", url: imageUrl }])));
 
   const media = store.database
     .prepare(`
@@ -127,9 +141,15 @@ test("migrates historical disclaimer content without changing event or media ide
 });
 
 test("rolls back all event updates when a later historical row is corrupt", async (t) => {
-  const { filename } = await fixture();
+  const { directory, filename } = await fixture();
   const store = openEventStore(filename);
-  t.after(() => store.close());
+  t.after(async () => {
+    try {
+      store.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   const originalParsed = [{ type: "text", msg: "原文" }, { type: "text", msg: MX_DISCLAIMER }];
   const original = event("a-first", originalParsed);
 
@@ -146,14 +166,22 @@ test("rolls back all event updates when a later historical row is corrupt", asyn
   assert.equal(first.parsed_content_json, JSON.stringify(original.parsedContent));
 });
 
-test("CLI prints aggregate-only JSON and rejects a missing database value", async () => {
-  const { filename } = await fixture();
-  const store = openEventStore(filename);
+test("CLI prints aggregate-only JSON and redacts rejected arguments", async (t) => {
+  const { directory, filename } = await fixture();
+  let store = openEventStore(filename);
+  t.after(async () => {
+    try {
+      store?.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   store.insertEvent(
     event("cli-secret-event", [{ type: "text", msg: "secret body" }, { type: "text", msg: MX_DISCLAIMER }]),
     "cli-run",
   );
   store.close();
+  store = undefined;
 
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     migrationScript,
@@ -180,6 +208,37 @@ test("CLI prints aggregate-only JSON and rejects a missing database value", asyn
     execFileAsync(process.execPath, [migrationScript, "--database"]),
     ({ stderr: missingValueError }) => {
       assert.match(missingValueError, /requires a value/);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [migrationScript, "--database", ""]),
+    ({ stdout: emptyStdout, stderr: emptyValueError }) => {
+      assert.equal(emptyStdout, "");
+      assert.match(emptyValueError, /requires a value/);
+      return true;
+    },
+  );
+
+  const optionToken = "--secret-debugger-token";
+  await assert.rejects(
+    execFileAsync(process.execPath, [migrationScript, "--database", optionToken]),
+    ({ stdout: optionStdout, stderr: optionValueError }) => {
+      assert.equal(optionStdout.includes(optionToken), false);
+      assert.equal(optionValueError.includes(optionToken), false);
+      assert.match(optionValueError, /requires a value/);
+      return true;
+    },
+  );
+
+  const secretArgument = "https://private.example/event-id-secret-debugger";
+  await assert.rejects(
+    execFileAsync(process.execPath, [migrationScript, secretArgument]),
+    ({ stdout: unexpectedStdout, stderr: unexpectedError }) => {
+      assert.equal(unexpectedStdout.includes(secretArgument), false);
+      assert.equal(unexpectedError.includes(secretArgument), false);
+      assert.equal(unexpectedError, "Unexpected argument\n");
       return true;
     },
   );
