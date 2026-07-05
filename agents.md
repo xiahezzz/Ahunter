@@ -1,6 +1,6 @@
 # Event foundation operating rules
 
-Phase 1 is a passive, read-only MX event collector. It records only user-authorized RIDs for later evidence work. It does not place trades, simulate trades, produce portfolio advice, or implement Tushare backfill, evidence packs, reports, evaluation, or Champion/Challenger promotion.
+Phase 1 is a passive, read-only MX event collector. It records only user-authorized RIDs for later evidence work. The collector itself does not place or simulate trades and does not implement Tushare backfill, evidence packs, analysis, reports, evaluation, or Champion/Challenger promotion. These collector implementation limits do not prohibit the primary agent from separately analyzing successfully extracted data.
 
 ## Mandatory safety rules
 
@@ -12,9 +12,17 @@ Phase 1 is a passive, read-only MX event collector. It records only user-authori
 - Run the live smoke test only when the user has already enabled Chrome debugging and opened the authorized, logged-in MX page.
 - Use Chrome DevTools only. Never use Computer Use for this workflow.
 - If authorization or login expires, stop collection and ask the user to log in. Never enter, request, record, or expose credentials, cookies, tokens, Socket.IO session IDs, or Chrome debugging identifiers.
-- Do not generate reports or downstream artifacts after any data-quality failure.
+- Do not generate downstream analytical conclusions, reports, or stock recommendations after any data-quality failure until the failure is resolved.
 - Routine Phase 1 collection, smoke testing, reconnect, and recovery must never navigate, reload, click, type into, inject into, or otherwise operate the MX page. The collector passively connects through Chrome DevTools `Network` events. The disabled legacy page-injection diagnostic may be used only when the user explicitly requests that specific diagnostic action; never use it for routine recovery or as part of collector/smoke operation.
 - Never perform real trading or submit orders.
+
+## Agent analysis boundary
+
+The `analyze-a-hunter-data` skill is extraction-only. While that skill is active, follow its boundary and return stored data without analysis or investment judgment.
+
+After extraction is complete, the primary agent may independently analyze successfully extracted data, supplement it with lawful external research, generate analytical reports and simulated scenarios, and provide stock research opinions or recommendations. Do not attribute that downstream work to the extraction skill. Research opinions never authorize real trading or order submission.
+
+If a required data-quality check fails, do not produce downstream analytical conclusions or stock recommendations until the failure is resolved.
 
 ## RID configuration
 
@@ -56,4 +64,4 @@ Stop with `Ctrl-C` in the collector terminal. On login expiry, connection failur
 
 ## Data handling
 
-Store no credentials or debugging identifiers. Rejected, undecodable, and non-allowlisted content must not enter SQLite, JSON output, logs, or media paths. Raw accepted payloads expire after 30 days; hashes remain for deduplication and audit. Do not copy event data into reports after a quality check fails.
+Store no credentials or debugging identifiers. Rejected, undecodable, and non-allowlisted content must not enter SQLite, JSON output, logs, or media paths. Raw accepted payloads expire after 30 days; hashes remain for deduplication and audit. Do not use event data for downstream analytical conclusions or stock recommendations after a quality check fails until the failure is resolved.
