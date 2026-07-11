@@ -2,17 +2,53 @@ from pathlib import Path
 
 import pytest
 
-from advisor.config import load_advisor_config
+from advisor.config import AdvisorConfig, load_advisor_config, resolve_state_db
 
 
-def test_load_default_advisor_config():
+def configured_for(database: str) -> AdvisorConfig:
+    return AdvisorConfig.model_validate(
+        {
+            "market": {"primary": "A股"},
+            "schedule": {"premarket_time": "08:30", "review_time": "22:30"},
+            "storage": {"database": database},
+            "data_sources": {"allow_tushare": False, "free_sources": ["sina"]},
+        }
+    )
+
+
+def test_load_default_advisor_config_uses_one_database():
     config = load_advisor_config()
+
     assert config.market.primary == "A股"
     assert config.schedule.premarket_time == "08:30"
     assert config.schedule.review_time == "22:30"
     assert config.data_sources.allow_tushare is False
-    assert "mootdx" in config.data_sources.free_sources
-    assert config.storage.market_db.endswith("data/advisor/market.sqlite")
+    assert "sina" in config.data_sources.free_sources
+    assert config.storage.database == "data/advisor/advisor.sqlite"
+    assert not hasattr(config.storage, "market_db")
+    assert not hasattr(config.storage, "advisor_db")
+
+
+def test_storage_uses_one_operational_database(tmp_path: Path):
+    config = configured_for("data/advisor/advisor.sqlite")
+
+    assert resolve_state_db(config, tmp_path) == tmp_path / "data/advisor/advisor.sqlite"
+
+
+def test_storage_rejects_legacy_split_database_paths():
+    payload = configured_for("data/advisor/advisor.sqlite").model_dump()
+    payload["storage"]["market_db"] = "data/advisor/market.sqlite"
+
+    with pytest.raises(ValueError, match="market_db"):
+        AdvisorConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize("database", ["../outside.sqlite", "/tmp/outside.sqlite"])
+def test_operational_database_cannot_escape_repository(tmp_path: Path, database: str):
+    config = configured_for(database)
+
+    with pytest.raises(ValueError, match="database"):
+        resolve_state_db(config, tmp_path)
 
 
 def test_rejects_tushare_enabled(tmp_path: Path):
@@ -25,13 +61,13 @@ schedule:
   premarket_time: "08:30"
   review_time: "22:30"
 storage:
-  market_db: data/advisor/market.sqlite
-  advisor_db: data/advisor/advisor.sqlite
+  database: data/advisor/advisor.sqlite
 data_sources:
   allow_tushare: true
-  free_sources: [mootdx]
+  free_sources: [sina]
 """,
         encoding="utf-8",
     )
+
     with pytest.raises(ValueError, match="Tushare"):
         load_advisor_config(filename)

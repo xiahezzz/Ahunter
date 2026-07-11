@@ -3,6 +3,10 @@ from datetime import date
 from typing import Protocol
 
 
+class MarketSourceError(RuntimeError):
+    """A free market source failed or returned ambiguous data."""
+
+
 @dataclass(frozen=True)
 class DailyBar:
     code: str
@@ -23,5 +27,8 @@ class DailyBar:
 
 
 class MarketDataProvider(Protocol):
+    source: str
+    endpoint: str
+
     def fetch_daily_bars(self, code: str, start: date, end: date) -> list[DailyBar]:
         raise NotImplementedError
