@@ -17,7 +17,7 @@ from fastapi.responses import StreamingResponse
 from advisor import paths as advisor_paths
 from advisor.db.migrate import migrate_database
 from advisor.ledger.model import LedgerTransaction, apply_transactions
-from advisor.reporting.contracts import list_verified_archives, read_active_verified_archive, read_verified_archive
+from advisor.reporting.contracts import list_verified_archives, page_verified_archives, read_active_verified_archive, read_verified_archive
 
 
 _COMPONENTS = ("collector", "market_updater", "advisor_scheduler", "frontend", "api")
@@ -50,15 +50,16 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
     @app.get("/api/reports")
     def reports(
         limit: int = Query(default=50, ge=1, le=100),
-        offset: int = Query(default=0, ge=0, le=1000),
+        cursor: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> dict:
         try:
-            links = _read_report_links(max_items=offset + limit, start_date=start_date, end_date=end_date)
+            page = page_verified_archives(advisor_paths.reports_dir(), limit=limit, cursor=cursor, start_date=start_date, end_date=end_date)
         except ValueError:
             raise HTTPException(status_code=503, detail="report listing unavailable") from None
-        return {"reports": links[offset : offset + limit]}
+        page["reports"] = [{**item, "href": f"/api/reports/{item['report_date']}/{item['report_type']}?run_id={item['run_id']}"} for item in page["items"]]
+        return page
 
     @app.get("/api/reports/{report_date}/{report_type}")
     def report(report_date: str, report_type: str, run_id: str = "initial") -> dict:

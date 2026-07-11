@@ -348,7 +348,7 @@ def test_report_and_ledger_lists_enforce_bounded_limit_and_offset(tmp_path):
     assert paged.status_code == 200
     assert [row["transaction_id"] for row in paged.json()["transactions"]] == ["cash-2"]
     assert client.get("/api/ledger/transactions?limit=101").status_code == 422
-    assert client.get("/api/reports?offset=1001").status_code == 422
+    assert client.get("/api/reports?cursor=not-a-valid-cursor").status_code == 503
 
 
 def test_ledger_replay_cap_returns_degraded_error_without_unbounded_history(tmp_path, monkeypatch):

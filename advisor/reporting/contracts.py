@@ -1,6 +1,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
+import base64
 import fcntl
 import hashlib
 import json
@@ -408,6 +409,87 @@ def list_verified_archives(output_dir: Path, *, start_date: str | None = None, e
                 }
             )
     return _sort_archives(archives)
+
+
+def page_verified_archives(
+    output_dir: Path,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> dict:
+    if not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("invalid report page limit")
+    start = _parse_report_date(start_date) if start_date else date.today() - timedelta(days=365)
+    end = _parse_report_date(end_date) if end_date else date.today()
+    if start > end or (end - start).days > 365:
+        raise ValueError("invalid report date window")
+    after = _decode_report_cursor(cursor) if cursor else None
+    root = _validated_root_path(output_dir)
+    items: list[dict] = []
+    verified = 0
+    invalid = 0
+    invalid_budget = limit + 10
+    for report_date in _report_date_window(start.isoformat(), end.isoformat()):
+        try:
+            root_fd, date_fd = _open_existing_report_fds(root, report_date)
+            try:
+                markers = _bounded_directory_names(date_fd, _MAX_ARCHIVE_CANDIDATES)
+            finally:
+                os.close(date_fd)
+                os.close(root_fd)
+        except ArchiveListingLimitError:
+            raise
+        except (OSError, ValueError):
+            continue
+        candidates = []
+        for marker in markers:
+            match = _MARKER_NAME_RE.fullmatch(marker)
+            if match:
+                candidates.append((match.group("report_type"), match.group("run_id") or "initial"))
+        for report_type, run_id in sorted(candidates, reverse=True):
+            key = (report_date, report_type, run_id)
+            if after is not None and key >= after:
+                continue
+            try:
+                archive = read_verified_archive(root, report_date, report_type, run_id)
+            except ValueError:
+                invalid += 1
+                if invalid > invalid_budget:
+                    raise ArchiveListingLimitError("invalid archive candidate limit exceeded")
+                continue
+            verified += 1
+            if len(items) == limit:
+                return {
+                    "items": items,
+                    "next_cursor": _encode_report_cursor(items[-1]),
+                    "truncated": True,
+                    "requested_start_date": start.isoformat(),
+                    "requested_end_date": end.isoformat(),
+                    "verified_candidate_count": verified,
+                }
+            items.append({"report_date": report_date, "report_type": report_type, "run_id": run_id, "quality_status": archive["json"].get("quality_status", "unknown")})
+    return {"items": items, "next_cursor": None, "truncated": False, "requested_start_date": start.isoformat(), "requested_end_date": end.isoformat(), "verified_candidate_count": verified}
+
+
+def _encode_report_cursor(item: dict) -> str:
+    payload = json.dumps([item["report_date"], item["report_type"], item["run_id"]], separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_report_cursor(cursor: str) -> tuple[str, str, str]:
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 256:
+        raise ValueError("invalid report cursor")
+    try:
+        values = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        report_date, report_type, run_id = values
+        _validate_report_date(report_date)
+        _validate_report_type(report_type)
+        _validate_run_id(run_id)
+        return report_date, report_type, run_id
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid report cursor") from error
 
 
 def read_active_verified_archive(output_dir: Path, report_date: str, report_type: str) -> dict:

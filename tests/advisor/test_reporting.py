@@ -190,6 +190,19 @@ def test_list_verified_archives_uses_deterministic_date_window_without_root_enum
     assert [archive["report_date"] for archive in archives] == ["2026-07-11", "2026-07-10"]
 
 
+def test_verified_archive_page_uses_cursor_without_duplicate_items(tmp_path: Path):
+    write_premarket_report("2026-07-10", [], tmp_path, quality_results=passing_quality())
+    write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
+
+    first = contracts.page_verified_archives(tmp_path, start_date="2026-07-10", end_date="2026-07-11", limit=1)
+    second = contracts.page_verified_archives(tmp_path, start_date="2026-07-10", end_date="2026-07-11", limit=1, cursor=first["next_cursor"])
+
+    assert [item["report_date"] for item in first["items"] + second["items"]] == ["2026-07-11", "2026-07-10"]
+    assert first["next_cursor"]
+    assert second["next_cursor"] is None
+    assert first["verified_candidate_count"] <= 2
+
+
 def test_write_review_report_links_to_morning_advice(tmp_path: Path):
     advice = [AdviceItem("adv-1", "600519", "watch", 0.72, "morning rationale", ["ev-1"])]
     archive_morning_advice(tmp_path, advice)
