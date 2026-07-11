@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 from importlib import import_module
+import json
 from pathlib import Path
-from typing import Any, Callable, Protocol
 import re
 import sys
+from typing import Any, Callable, Protocol
 
 
 UPSTREAM_ANALYST_ROLES = (
@@ -31,6 +32,36 @@ ANALYST_ROLES = UPSTREAM_ANALYST_ROLES + (
 DEFAULT_TRADINGAGENTS_REPOSITORY = Path("/Users/mac/Documents/TradingAgents-astock")
 _HARD_CHECKS_HEADER = "### 硬检查结果"
 _HARD_CHECK_GRADE = re.compile(r"\[([ABCDF])\]")
+_SAFE_EVIDENCE_FIELDS = (
+    "evidence_id",
+    "as_of",
+    "code",
+    "name",
+    "source_type",
+    "source_id",
+    "summary",
+    "confidence",
+    "facts",
+    "inferences",
+    "conflicts",
+    "quality_flags",
+    "quality_status",
+    "blocking_failure",
+)
+_SENSITIVE_FIELD_PARTS = (
+    "credential",
+    "cookie",
+    "token",
+    "socket",
+    "debug",
+    "raw",
+    "password",
+    "authorization",
+    "session",
+)
+_MAX_EVIDENCE_ITEMS = 20
+_MAX_EVIDENCE_CONTEXT_CHARS = 6_000
+_MAX_EVIDENCE_VALUE_CHARS = 800
 
 
 class DataQualityBlockedError(RuntimeError):
@@ -72,21 +103,27 @@ class ExternalTradingAgentsRunner:
     def __init__(
         self,
         repository_path: Path | str = DEFAULT_TRADINGAGENTS_REPOSITORY,
-        graph_factory: Callable[[list[str]], Any] | None = None,
+        graph_factory: Callable[[list[str], dict[str, Any]], Any] | None = None,
+        upstream_config: dict[str, Any] | None = None,
     ) -> None:
         self.repository_path = Path(repository_path)
         self.graph_factory = graph_factory
+        self.upstream_config = upstream_config
 
     def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
-        graph = self._create_graph()
-        graph.config["checkpoint_enabled"] = False
-        initial_state, args, _ = graph.prepare_graph_run(code, trade_date)
-        stream_args = dict(args)
-        stream_args["stream_mode"] = "values"
-        final_state: dict[str, Any] | None = None
-        quality_outcome: QualityOutcome | None = None
+        graph: Any | None = None
 
         try:
+            graph = self._create_graph(self._graph_config())
+            initial_state, args, _ = graph.prepare_graph_run(code, trade_date)
+            if initial_state is None:
+                raise DataQualityBlockedError("cannot inject current evidence into a resumed graph state")
+            _inject_evidence_context(initial_state, evidence)
+
+            stream_args = dict(args)
+            stream_args["stream_mode"] = "values"
+            final_state: dict[str, Any] | None = None
+            quality_outcome: QualityOutcome | None = None
             for state in graph.graph.stream(initial_state, **stream_args):
                 final_state = state
                 if "data_quality_summary" in state:
@@ -100,12 +137,43 @@ class ExternalTradingAgentsRunner:
             graph.finalize_graph_run(code, trade_date, final_state)
             return _outputs_from_state(code, final_state, quality_outcome)
         finally:
-            graph.close_graph_run()
+            if graph is not None:
+                graph.close_graph_run()
 
-    def _create_graph(self) -> Any:
+    def _graph_config(self) -> dict[str, Any]:
+        source_config = self.upstream_config
+        if source_config is None:
+            if self.graph_factory is not None:
+                source_config = {}
+            else:
+                self._configure_repository_path()
+                try:
+                    source_config = import_module("tradingagents.default_config").DEFAULT_CONFIG
+                except (ImportError, AttributeError) as error:
+                    raise RuntimeError(
+                        "TradingAgents-astock dependencies or graph configuration are unavailable; "
+                        "install its declared dependencies and configure its LLM provider"
+                    ) from error
+
+        config = dict(source_config)
+        config["checkpoint_enabled"] = False
+        return config
+
+    def _create_graph(self, config: dict[str, Any]) -> Any:
         if self.graph_factory is not None:
-            return self.graph_factory(list(UPSTREAM_ANALYST_ROLES))
+            return self.graph_factory(list(UPSTREAM_ANALYST_ROLES), config)
 
+        self._configure_repository_path()
+        try:
+            graph_class = import_module("tradingagents.graph.trading_graph").TradingAgentsGraph
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "TradingAgents-astock dependencies or graph configuration are unavailable; "
+                "install its declared dependencies and configure its LLM provider"
+            ) from error
+        return graph_class(selected_analysts=list(UPSTREAM_ANALYST_ROLES), config=config)
+
+    def _configure_repository_path(self) -> None:
         if not self.repository_path.is_dir():
             raise RuntimeError(
                 f"TradingAgents-astock repository is unavailable at {self.repository_path}; "
@@ -115,14 +183,6 @@ class ExternalTradingAgentsRunner:
         repository = str(self.repository_path)
         if repository not in sys.path:
             sys.path.insert(0, repository)
-        try:
-            graph_class = import_module("tradingagents.graph.trading_graph").TradingAgentsGraph
-        except (ImportError, AttributeError) as error:
-            raise RuntimeError(
-                "TradingAgents-astock dependencies or graph configuration are unavailable; "
-                "install its declared dependencies and configure its LLM provider"
-            ) from error
-        return graph_class(selected_analysts=list(UPSTREAM_ANALYST_ROLES))
 
 
 def run_analyst_flow(
@@ -147,6 +207,61 @@ def _has_blocking_evidence(evidence: list[dict]) -> bool:
         if str(item.get("quality_status", "")).lower() in {"failed", "blocked"}:
             return True
     return False
+
+
+def _inject_evidence_context(initial_state: dict[str, Any], evidence: list[dict]) -> None:
+    context = _build_evidence_context(evidence)
+    if not context:
+        return
+
+    messages = list(initial_state.get("messages", []))
+    messages.append(("human", context))
+    initial_state["messages"] = messages
+
+    existing_context = initial_state.get("past_context", "")
+    initial_state["past_context"] = f"{existing_context}\n\n{context}".strip()
+
+
+def _build_evidence_context(evidence: list[dict]) -> str:
+    records = []
+    for item in evidence[:_MAX_EVIDENCE_ITEMS]:
+        normalized = {
+            field: _safe_evidence_value(item[field])
+            for field in _SAFE_EVIDENCE_FIELDS
+            if field in item and not _is_sensitive_field(field)
+        }
+        normalized = {field: value for field, value in normalized.items() if value is not None}
+        if normalized:
+            records.append(normalized)
+
+    if not records:
+        return ""
+    serialized = json.dumps(records, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return (
+        "Authorized normalized evidence context. Cite stable evidence_id values where feasible.\n"
+        f"{serialized}"
+    )[:_MAX_EVIDENCE_CONTEXT_CHARS]
+
+
+def _safe_evidence_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:_MAX_EVIDENCE_VALUE_CHARS]
+    if isinstance(value, list):
+        return [_safe_evidence_value(item) for item in value[:20]]
+    if isinstance(value, dict):
+        return {
+            str(key): _safe_evidence_value(item)
+            for key, item in value.items()
+            if not _is_sensitive_field(str(key))
+        }
+    return str(value)[:_MAX_EVIDENCE_VALUE_CHARS]
+
+
+def _is_sensitive_field(field: str) -> bool:
+    lowered = field.lower()
+    return any(part in lowered for part in _SENSITIVE_FIELD_PARTS)
 
 
 def _validate_outputs(outputs: list[AnalystOutput]) -> None:

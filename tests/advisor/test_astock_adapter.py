@@ -98,13 +98,17 @@ class FakeGraph:
     finalized: bool = False
     closed: bool = False
     config: dict | None = None
+    initial_state: dict | None = None
+    prepare_error: Exception | None = None
 
     def __post_init__(self):
         self.config = self.config or {"checkpoint_enabled": True}
         self.graph = self
 
     def prepare_graph_run(self, code: str, trade_date: str):
-        return {"company_of_interest": code}, {"stream_mode": "values"}, None
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        return self.initial_state or {"company_of_interest": code}, {"stream_mode": "values"}, None
 
     def stream(self, initial_state: dict, **args):
         yield from self.snapshots
@@ -149,14 +153,15 @@ def test_external_runner_uses_full_analyst_set_and_maps_passing_staged_state():
     created_with: list[tuple[str, ...]] = []
     graph = FakeGraph([passing_state("600519")])
 
-    def graph_factory(selected_analysts: list[str]):
+    def graph_factory(selected_analysts: list[str], config: dict):
         created_with.append(tuple(selected_analysts))
+        assert config["checkpoint_enabled"] is False
         return graph
 
     outputs = ExternalTradingAgentsRunner(graph_factory=graph_factory).run("600519", "2026-07-11", [])
 
     assert created_with == [ANALYST_ROLES[:7]]
-    assert graph.config["checkpoint_enabled"] is False
+    assert graph.config["checkpoint_enabled"] is True
     assert graph.finalized is True
     assert graph.closed is True
     assert [output.role for output in outputs] == list(ANALYST_ROLES)
@@ -169,7 +174,7 @@ def test_external_runner_stops_at_failing_quality_gate_before_downstream_state()
     graph = FakeGraph([quality_failure, {"trader_investment_plan": "must not be accepted"}])
 
     with pytest.raises(DataQualityBlockedError):
-        ExternalTradingAgentsRunner(graph_factory=lambda _: graph).run("600519", "2026-07-11", [])
+        ExternalTradingAgentsRunner(graph_factory=lambda _, __: graph).run("600519", "2026-07-11", [])
 
     assert graph.finalized is False
     assert graph.closed is True
@@ -208,3 +213,82 @@ def test_missing_roles_or_quality_outcome_fail_closed(outputs):
 
     with pytest.raises(DataQualityBlockedError):
         run_analyst_flow("600519", "2026-07-11", [], runner=Runner())
+
+
+def test_external_runner_bridges_only_safe_evidence_fields_into_messages_and_past_context():
+    graph = FakeGraph(
+        [passing_state("600519")],
+        initial_state={"messages": [("human", "600519")], "past_context": "existing portfolio memory"},
+    )
+    evidence = [
+        {
+            "evidence_id": "ev-1",
+            "as_of": "2026-07-11T09:30:00+08:00",
+            "code": "600519",
+            "name": "Kweichow Moutai",
+            "source_type": "mx",
+            "source_id": "source-1",
+            "summary": "Volume increased.",
+            "confidence": 0.8,
+            "facts": ["volume up"],
+            "inferences": ["momentum"],
+            "conflicts": [],
+            "quality_flags": ["verified"],
+            "quality_status": "passed",
+            "raw_payload": "do-not-forward",
+            "raw_ref": "do-not-forward",
+            "cookie": "do-not-forward",
+            "token": "do-not-forward",
+            "socket_io_id": "do-not-forward",
+            "chrome_debugging_id": "do-not-forward",
+            "unknown_field": "do-not-forward",
+        }
+    ]
+
+    ExternalTradingAgentsRunner(graph_factory=lambda _, __: graph).run("600519", "2026-07-11", evidence)
+
+    context = graph.initial_state["messages"][-1][1]
+    assert graph.initial_state["messages"][-1][0] == "human"
+    assert "ev-1" in context
+    assert "Volume increased." in context
+    assert "do-not-forward" not in context
+    assert "existing portfolio memory" in graph.initial_state["past_context"]
+    assert "ev-1" in graph.initial_state["past_context"]
+
+
+def test_external_runner_fails_closed_and_closes_when_initial_state_is_missing():
+    graph = FakeGraph([passing_state("600519")], initial_state=None)
+    graph.prepare_graph_run = lambda code, trade_date: (None, {"stream_mode": "values"}, 1)
+
+    with pytest.raises(DataQualityBlockedError):
+        ExternalTradingAgentsRunner(graph_factory=lambda _, __: graph).run("600519", "2026-07-11", [])
+
+    assert graph.closed is True
+
+
+def test_external_runner_closes_when_preparation_raises():
+    graph = FakeGraph([], prepare_error=RuntimeError("prepare failed"))
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        ExternalTradingAgentsRunner(graph_factory=lambda _, __: graph).run("600519", "2026-07-11", [])
+
+    assert graph.closed is True
+
+
+def test_graph_factory_receives_fresh_checkpoint_disabled_config_without_mutating_source():
+    source_config = {"checkpoint_enabled": True, "provider": "test"}
+    received: list[dict] = []
+    graph = FakeGraph([passing_state("600519")])
+
+    def graph_factory(selected_analysts: list[str], config: dict):
+        received.append(config)
+        return graph
+
+    ExternalTradingAgentsRunner(
+        graph_factory=graph_factory,
+        upstream_config=source_config,
+    ).run("600519", "2026-07-11", [])
+
+    assert source_config == {"checkpoint_enabled": True, "provider": "test"}
+    assert received[0] is not source_config
+    assert received[0] == {"checkpoint_enabled": False, "provider": "test"}
