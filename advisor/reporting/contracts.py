@@ -2,6 +2,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 import base64
+import hmac
+import secrets
 import fcntl
 import hashlib
 import json
@@ -418,6 +420,7 @@ def page_verified_archives(
     end_date: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
+    cursor_secret: bytes | None = None,
 ) -> dict:
     if not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("invalid report page limit")
@@ -425,7 +428,8 @@ def page_verified_archives(
     end = _parse_report_date(end_date) if end_date else date.today()
     if start > end or (end - start).days > 365:
         raise ValueError("invalid report date window")
-    after = _decode_report_cursor(cursor) if cursor else None
+    secret = cursor_secret or b"advisor-report-page-test-secret"
+    after = _decode_report_cursor(cursor, secret, start.isoformat(), end.isoformat()) if cursor else None
     root = _validated_root_path(output_dir)
     items: list[dict] = []
     verified = 0
@@ -463,7 +467,7 @@ def page_verified_archives(
             if len(items) == limit:
                 return {
                     "items": items,
-                    "next_cursor": _encode_report_cursor(items[-1]),
+                    "next_cursor": _encode_report_cursor(items[-1], secret, start.isoformat(), end.isoformat()),
                     "truncated": True,
                     "requested_start_date": start.isoformat(),
                     "requested_end_date": end.isoformat(),
@@ -473,17 +477,24 @@ def page_verified_archives(
     return {"items": items, "next_cursor": None, "truncated": False, "requested_start_date": start.isoformat(), "requested_end_date": end.isoformat(), "verified_candidate_count": verified}
 
 
-def _encode_report_cursor(item: dict) -> str:
-    payload = json.dumps([item["report_date"], item["report_type"], item["run_id"]], separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+def _encode_report_cursor(item: dict, secret: bytes, start_date: str, end_date: str) -> str:
+    payload = json.dumps({"v": 1, "s": start_date, "e": end_date, "k": [item["report_date"], item["report_type"], item["run_id"]]}, separators=(",", ":")).encode("utf-8")
+    signature = hmac.digest(secret, payload, "sha256")
+    return base64.urlsafe_b64encode(payload + signature).decode("ascii").rstrip("=")
 
 
-def _decode_report_cursor(cursor: str) -> tuple[str, str, str]:
+def _decode_report_cursor(cursor: str, secret: bytes, start_date: str, end_date: str) -> tuple[str, str, str]:
     if not isinstance(cursor, str) or not cursor or len(cursor) > 256:
         raise ValueError("invalid report cursor")
     try:
-        values = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
-        report_date, report_type, run_id = values
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload, signature = raw[:-32], raw[-32:]
+        if not hmac.compare_digest(signature, hmac.digest(secret, payload, "sha256")):
+            raise ValueError("invalid report cursor")
+        values = json.loads(payload)
+        if values.get("v") != 1 or values.get("s") != start_date or values.get("e") != end_date:
+            raise ValueError("invalid report cursor")
+        report_date, report_type, run_id = values["k"]
         _validate_report_date(report_date)
         _validate_report_type(report_type)
         _validate_run_id(run_id)

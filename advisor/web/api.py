@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import stat
 from collections import defaultdict
@@ -37,6 +38,7 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 def create_app(state_dir: Path | None = None) -> FastAPI:
     """Create the local-only advisor API without creating state on read paths."""
     resolved_state_dir = Path(state_dir) if state_dir is not None else advisor_paths.advisor_data_dir()
+    report_cursor_secret = secrets.token_bytes(32)
     app = FastAPI(title="A Hunter Advisor")
 
     @app.get("/api/health")
@@ -55,7 +57,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
         end_date: str | None = None,
     ) -> dict:
         try:
-            page = page_verified_archives(advisor_paths.reports_dir(), limit=limit, cursor=cursor, start_date=start_date, end_date=end_date)
+            page = page_verified_archives(advisor_paths.reports_dir(), limit=limit, cursor=cursor, start_date=start_date, end_date=end_date, cursor_secret=report_cursor_secret)
         except ValueError:
             raise HTTPException(status_code=503, detail="report listing unavailable") from None
         page["reports"] = [{**item, "href": f"/api/reports/{item['report_date']}/{item['report_type']}?run_id={item['run_id']}"} for item in page["items"]]
@@ -188,7 +190,7 @@ app = create_app()
 
 
 def _current_state(state_dir: Path) -> dict:
-    today = date.today().isoformat()
+    today = _shanghai_today().isoformat()
     health = _health_payload(state_dir)
     connection = _read_connection(state_dir / "advisor.sqlite")
     try:
@@ -656,6 +658,10 @@ def _parse_shanghai_datetime(value: object) -> datetime:
     except ValueError as error:
         raise ValueError("invalid run timestamp") from error
     return parsed.replace(tzinfo=_SHANGHAI) if parsed.tzinfo is None else parsed.astimezone(_SHANGHAI)
+
+
+def _shanghai_today() -> date:
+    return datetime.now(_SHANGHAI).date()
 
 
 def _is_current_run_date(value: object, today: str) -> bool:
