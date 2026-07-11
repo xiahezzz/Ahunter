@@ -52,6 +52,7 @@ const currentState = {
   ],
   report_list: { status: "ok", truncated: false },
   profiles: [{ code: "600519", name: "贵州茅台", href: "/api/profiles/600519" }],
+  profile_list: { status: "ok" },
   charts: [
     {
       asset_id: "chart-1",
@@ -61,6 +62,7 @@ const currentState = {
       href: "/api/charts/chart-1",
     },
   ],
+  chart_list: { status: "ok" },
   health: {
     status: "ok",
     service: "advisor-api",
@@ -133,8 +135,17 @@ describe("advisor dashboard", () => {
     render(<App />);
 
     expect(await screen.findByText("建议已阻断")).toBeInTheDocument();
+    expect(screen.getByText("报告 已阻断")).toBeInTheDocument();
     expect(screen.getByText("market_stale")).toBeInTheDocument();
     expect(screen.queryByText("等待量价确认")).not.toBeInTheDocument();
+  });
+
+  it("shows missing current review status instead of archive listing health", async () => {
+    mockFetch(response({ ...currentState, review: { status: "missing", items: [] } }));
+    render(<App />);
+
+    expect(await screen.findByText("报告 缺失")).toBeInTheDocument();
+    expect(screen.queryByText("报告 正常")).not.toBeInTheDocument();
   });
 
   it("fails closed when the core advice status is unknown", async () => {
@@ -195,6 +206,51 @@ describe("advisor dashboard", () => {
     const capital = within(flows).getByText("资金流").parentElement as HTMLElement;
     expect(within(capital).getByText("暂无数据")).toBeInTheDocument();
     expect(within(capital).queryByText("2 条")).not.toBeInTheDocument();
+  });
+
+  it("rejects a negative flow count without rendering it", async () => {
+    mockFetch(response({
+      ...currentState,
+      flows: { ...currentState.flows, information: { status: "ok", count: -1 } },
+    }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByText("-1 条")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["today", { today: "2026-02-30" }],
+    ["last update", { last_successful_data_update: "2026-02-30T08:32:00+08:00" }],
+    ["chart as_of", { charts: [{ ...currentState.charts[0], as_of: "2026-02-30" }] }],
+  ])("rejects an invalid %s date", async (_label, override) => {
+    mockFetch(response({ ...currentState, ...override }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it("rejects an unknown report quality status", async () => {
+    mockFetch(response({
+      ...currentState,
+      reports: [{ ...currentState.reports[0], quality_status: "unexpected" }],
+    }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["profile", { profile_list: { status: "degraded" }, profiles: currentState.profiles }],
+    ["chart", { chart_list: { status: "degraded" }, charts: currentState.charts }],
+  ])("suppresses %s links when the parent list is degraded", async (_label, override) => {
+    mockFetch(response({ ...currentState, ...override }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
 
   it.each([

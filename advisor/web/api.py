@@ -242,6 +242,7 @@ def _current_state(state_dir: Path, report_cursor_secret: bytes) -> dict:
     today = _shanghai_today().isoformat()
     health = _health_payload(state_dir)
     db_path = state_dir / "advisor.sqlite"
+    database_present = _database_entry_present(db_path)
     connection = _read_connection(db_path)
     try:
         try:
@@ -253,10 +254,10 @@ def _current_state(state_dir: Path, report_cursor_secret: bytes) -> dict:
         current_quality = _resolve_current_run_quality(
             connection,
             today,
-            database_present=_database_entry_present(db_path),
+            database_present=database_present,
         )
-        profiles = _read_profile_links(connection)
-        charts = _read_chart_links(connection, state_dir)
+        profiles, profile_list = _read_profile_links_with_status(connection)
+        charts, chart_list = _read_chart_links_with_status(connection, state_dir)
     finally:
         if connection is not None:
             connection.close()
@@ -293,7 +294,9 @@ def _current_state(state_dir: Path, report_cursor_secret: bytes) -> dict:
         "reports": reports,
         "report_list": report_list,
         "profiles": profiles,
+        "profile_list": profile_list,
         "charts": charts,
+        "chart_list": chart_list,
         "health": health,
     }
 
@@ -816,8 +819,12 @@ def _valid_quality_details(value: object) -> bool:
 
 
 def _read_profile_links(connection: sqlite3.Connection | None) -> list[dict]:
+    return _read_profile_links_with_status(connection)[0]
+
+
+def _read_profile_links_with_status(connection: sqlite3.Connection | None) -> tuple[list[dict], dict]:
     if connection is None:
-        return []
+        return [], {"status": "degraded"}
     try:
         rows = connection.execute(
             """
@@ -829,18 +836,18 @@ def _read_profile_links(connection: sqlite3.Connection | None) -> list[dict]:
             """
         ).fetchall()
     except sqlite3.Error:
-        return []
+        return [], {"status": "degraded"}
     profiles = []
     for row in rows:
         if not isinstance(row["code"], str) or not _CODE_RE.fullmatch(row["code"]):
-            continue
+            return [], {"status": "degraded"}
         profile = _read_profile(connection, row["code"])
         if profile is None:
-            continue
+            return [], {"status": "degraded"}
         profiles.append(
             {"code": row["code"], "name": profile["name"], "href": f"/api/profiles/{row['code']}"}
         )
-    return profiles
+    return profiles, {"status": "ok"}
 
 
 def _read_profile(connection: sqlite3.Connection | None, code: str) -> dict | None:
@@ -948,8 +955,14 @@ def _validate_profile_json_value(payload: object) -> None:
 
 
 def _read_chart_links(connection: sqlite3.Connection | None, state_dir: Path) -> list[dict]:
+    return _read_chart_links_with_status(connection, state_dir)[0]
+
+
+def _read_chart_links_with_status(
+    connection: sqlite3.Connection | None, state_dir: Path
+) -> tuple[list[dict], dict]:
     if connection is None:
-        return []
+        return [], {"status": "degraded"}
     try:
         rows = connection.execute(
             """
@@ -960,7 +973,7 @@ def _read_chart_links(connection: sqlite3.Connection | None, state_dir: Path) ->
             """
         ).fetchall()
     except sqlite3.Error:
-        return []
+        return [], {"status": "degraded"}
     charts = []
     for row in rows:
         if not (
@@ -973,7 +986,7 @@ def _read_chart_links(connection: sqlite3.Connection | None, state_dir: Path) ->
             and _valid_db_timestamp(row["as_of"])
             and _safe_chart_path(row["path"], state_dir) is not None
         ):
-            continue
+            return [], {"status": "degraded"}
         charts.append(
             {
                 "asset_id": row["asset_id"],
@@ -983,7 +996,7 @@ def _read_chart_links(connection: sqlite3.Connection | None, state_dir: Path) ->
                 "href": f"/api/charts/{row['asset_id']}",
             }
         )
-    return charts
+    return charts, {"status": "ok"}
 
 
 def _open_chart_descriptor(connection: sqlite3.Connection | None, state_dir: Path, asset_id: str) -> int | None:

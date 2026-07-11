@@ -51,7 +51,7 @@ def test_current_state_degrades_explicitly_when_local_state_is_missing(tmp_path)
 
     assert response.status_code == 200
     payload = response.json()
-    assert {"today", "last_successful_data_update", "advice", "review", "ledger", "flows", "blocking_quality_checks", "reports", "profiles", "charts", "health"} <= payload.keys()
+    assert {"today", "last_successful_data_update", "advice", "review", "ledger", "flows", "blocking_quality_checks", "reports", "report_list", "profiles", "profile_list", "charts", "chart_list", "health"} <= payload.keys()
     assert payload["last_successful_data_update"] is None
     assert payload["advice"] == []
     assert payload["review"] == {"status": "missing", "items": []}
@@ -72,7 +72,9 @@ def test_current_state_degrades_explicitly_when_local_state_is_missing(tmp_path)
     assert payload["reports"] == []
     assert payload["report_list"]["status"] == "ok"
     assert payload["profiles"] == []
+    assert payload["profile_list"] == {"status": "degraded"}
     assert payload["charts"] == []
+    assert payload["chart_list"] == {"status": "degraded"}
 
 
 def test_report_routes_list_and_serve_only_verified_archives(tmp_path, monkeypatch):
@@ -271,6 +273,41 @@ def test_profile_routes_read_structured_profiles_and_reject_malformed_data(tmp_p
     assert client.get("/api/profiles/../../etc").status_code == 404
 
 
+def test_current_state_degrades_profile_list_on_validation_failure(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO securities (code, name, exchange, concepts_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("600519", "Moutai", "SSE", "[]", "2026-07-12T08:00:00+08:00", "2026-07-12T08:00:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO stock_profiles (code, thesis_json, updated_at) VALUES (?, ?, ?)",
+        ("600519", "not-json", "2026-07-12T08:30:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["profile_list"] == {"status": "degraded"}
+    assert payload["profiles"] == []
+
+
+def test_current_state_degrades_profile_list_on_read_failure(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute("DROP TABLE stock_profiles")
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["profile_list"] == {"status": "degraded"}
+    assert payload["profiles"] == []
+
+
 @pytest.mark.parametrize(
     ("payload", "constant", "bound"),
     [
@@ -387,6 +424,40 @@ def test_chart_listing_excludes_unbounded_db_metadata(tmp_path, field, value):
     connection.close()
 
     assert TestClient(create_app(tmp_path)).get("/api/charts").json()["charts"] == []
+
+
+def test_current_state_degrades_chart_list_on_validation_failure(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    chart_path = tmp_path / "charts" / "invalid-metadata.png"
+    chart_path.parent.mkdir()
+    chart_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO chart_assets (asset_id, code, chart_type, as_of, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("chart-1", "600519", "kline", "not-a-date", str(chart_path), "2026-07-12T08:30:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["chart_list"] == {"status": "degraded"}
+    assert payload["charts"] == []
+
+
+def test_current_state_degrades_chart_list_on_read_failure(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute("DROP TABLE chart_assets")
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["chart_list"] == {"status": "degraded"}
+    assert payload["charts"] == []
 
 
 def test_chart_route_streams_descriptor_pinned_bytes_during_replacement_race(tmp_path, monkeypatch):
@@ -772,7 +843,9 @@ def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_p
     ]
     assert payload["reports"][0]["report_date"] == today
     assert payload["profiles"] == [{"code": "600519", "name": "Moutai", "href": "/api/profiles/600519"}]
+    assert payload["profile_list"] == {"status": "ok"}
     assert payload["charts"][0]["asset_id"] == "chart-1"
+    assert payload["chart_list"] == {"status": "ok"}
     assert payload["health"]["collector"] == "running"
     assert "token" not in payload["health"]
 

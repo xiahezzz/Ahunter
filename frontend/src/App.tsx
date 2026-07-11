@@ -14,7 +14,10 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 
-type StatusCount = { status: string; count: number };
+type FlowStatus = "ok" | "degraded" | "unknown";
+type ReportStatus = "passed" | "blocked" | "missing";
+type ListStatus = "ok" | "degraded";
+type StatusCount = { status: FlowStatus; count: number };
 type Advice = {
   advice_id: string;
   code: string;
@@ -31,15 +34,15 @@ type Position = {
   market_value: number | null;
   unrealized_pnl: number;
 };
-type ReportLink = { report_date: string; report_type: "premarket" | "review"; run_id: string; quality_status: string; href: string };
+type ReportLink = { report_date: string; report_type: "premarket" | "review"; run_id: string; quality_status: "passed" | "blocked"; href: string };
 type ProfileLink = { code: string; name: string; href: string };
 type ChartLink = { asset_id: string; code: string; chart_type: string; as_of: string; href: string };
 type CurrentState = {
   today: string;
   last_successful_data_update: string | null;
-  advice_status: string;
+  advice_status: ReportStatus;
   advice: Advice[];
-  review: { status: string; items: unknown[] };
+  review: { status: ReportStatus; items: unknown[] };
   ledger: {
     cash: number;
     positions: Position[];
@@ -56,9 +59,11 @@ type CurrentState = {
     created_at: string;
   }>;
   reports: ReportLink[];
-  report_list: { status: string; truncated?: boolean };
+  report_list: { status: ListStatus; truncated?: boolean };
   profiles: ProfileLink[];
+  profile_list: { status: ListStatus };
   charts: ChartLink[];
+  chart_list: { status: ListStatus };
   health: Record<string, string>;
 };
 
@@ -73,27 +78,46 @@ function isFiniteNumber(value: unknown): value is number {
 }
 
 function isStatusCount(value: unknown): value is StatusCount {
-  return isRecord(value) && typeof value.status === "string" && isFiniteNumber(value.count);
+  return isRecord(value) &&
+    (value.status === "ok" || value.status === "degraded" || value.status === "unknown") &&
+    Number.isSafeInteger(value.count) &&
+    (value.count as number) >= 0;
 }
 
 const A_SHARE_CODE = /^[0368]\d{5}$/;
 const ASSET_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const REPORT_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const REPORT_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 function isBoundedTimestamp(value: unknown): value is string {
-  return typeof value === "string" && value.length <= 64 && ISO_TIMESTAMP.test(value) && Number.isFinite(Date.parse(value));
+  return typeof value === "string" &&
+    value.length <= 64 &&
+    ISO_TIMESTAMP.test(value) &&
+    isDateString(value.slice(0, 10)) &&
+    Number.isFinite(Date.parse(value));
+}
+
+function isDateString(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = REPORT_DATE.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1];
 }
 
 function isReportLink(value: unknown): value is ReportLink {
   if (!isRecord(value) ||
     typeof value.report_date !== "string" ||
-    !REPORT_DATE.test(value.report_date) ||
+    !isDateString(value.report_date) ||
     (value.report_type !== "premarket" && value.report_type !== "review") ||
     typeof value.run_id !== "string" ||
     !RUN_ID.test(value.run_id) ||
-    typeof value.quality_status !== "string" ||
+    (value.quality_status !== "passed" && value.quality_status !== "blocked") ||
     typeof value.href !== "string") {
     return false;
   }
@@ -116,7 +140,7 @@ function isChartLink(value: unknown): value is ChartLink {
     typeof value.code === "string" &&
     A_SHARE_CODE.test(value.code) &&
     value.chart_type === "kline" &&
-    typeof value.as_of === "string" &&
+    isDateString(value.as_of) &&
     typeof value.href === "string" &&
     value.href === `/api/charts/${value.asset_id}`;
 }
@@ -127,8 +151,10 @@ function parseCurrentState(value: unknown): CurrentState {
   const flows = value.flows;
   const review = value.review;
   const reportList = value.report_list;
+  const profileList = value.profile_list;
+  const chartList = value.chart_list;
   if (
-    typeof value.today !== "string" ||
+    !isDateString(value.today) ||
     (value.last_successful_data_update !== null && !isBoundedTimestamp(value.last_successful_data_update)) ||
     typeof value.advice_status !== "string" ||
     !["passed", "blocked", "missing"].includes(value.advice_status) ||
@@ -151,10 +177,14 @@ function parseCurrentState(value: unknown): CurrentState {
     !Array.isArray(value.blocking_quality_checks) ||
     !Array.isArray(value.reports) ||
     !isRecord(reportList) ||
-    typeof reportList.status !== "string" ||
-    !["ok", "degraded"].includes(reportList.status) ||
+    (reportList.status !== "ok" && reportList.status !== "degraded") ||
+    (reportList.truncated !== undefined && typeof reportList.truncated !== "boolean") ||
     !Array.isArray(value.profiles) ||
+    !isRecord(profileList) ||
+    (profileList.status !== "ok" && profileList.status !== "degraded") ||
     !Array.isArray(value.charts) ||
+    !isRecord(chartList) ||
+    (chartList.status !== "ok" && chartList.status !== "degraded") ||
     !isRecord(value.health)
   ) {
     throw new Error("当前状态格式无效");
@@ -198,6 +228,8 @@ function parseCurrentState(value: unknown): CurrentState {
     !validChecks ||
     !adviceFieldsAgree ||
     (reportList.status === "degraded" && value.reports.length !== 0) ||
+    (profileList.status === "degraded" && value.profiles.length !== 0) ||
+    (chartList.status === "degraded" && value.charts.length !== 0) ||
     !value.reports.every(isReportLink) ||
     !value.profiles.every(isProfileLink) ||
     !value.charts.every(isChartLink) ||
@@ -403,14 +435,14 @@ function App() {
     : null;
   const adviceAvailable = snapshotCurrent && state.advice_status === "passed" && state.blocking_quality_checks.length === 0;
   const reports = snapshotCurrent && state.report_list.status === "ok" ? state.reports : [];
-  const profiles = snapshotCurrent ? state.profiles : [];
-  const charts = snapshotCurrent ? state.charts : [];
+  const profiles = snapshotCurrent && state.profile_list.status === "ok" ? state.profiles : [];
+  const charts = snapshotCurrent && state.chart_list.status === "ok" ? state.charts : [];
 
   return (
     <main className="shell">
       <header className="topbar">
         <div><p className="eyebrow">本地投顾运行台</p><h1>A Hunter Advisor</h1></div>
-        <div className="topbar-meta"><span>{snapshotCurrent ? state.today : "日期 暂不可确认"}</span><span>{snapshotCurrent ? `最近数据更新 ${state.last_successful_data_update ?? "暂无数据"}` : "最近数据更新 暂不可确认"}</span><span className={statusClass(snapshotCurrent ? state.report_list.status : "unknown")}>报告 {snapshotCurrent ? statusLabel(state.report_list.status) : "刷新失败"}</span><button type="button" className="icon-button" aria-label="刷新当前状态" title="刷新当前状态" onClick={() => void loadState()} disabled={isRefreshing}><RefreshCw className={isRefreshing ? "spin" : undefined} size={17} /></button></div>
+        <div className="topbar-meta"><span>{snapshotCurrent ? state.today : "日期 暂不可确认"}</span><span>{snapshotCurrent ? `最近数据更新 ${state.last_successful_data_update ?? "暂无数据"}` : "最近数据更新 暂不可确认"}</span><span className={statusClass(snapshotCurrent ? state.review.status : "unknown")}>报告 {snapshotCurrent ? statusLabel(state.review.status) : "刷新失败"}</span><button type="button" className="icon-button" aria-label="刷新当前状态" title="刷新当前状态" onClick={() => void loadState()} disabled={isRefreshing}><RefreshCw className={isRefreshing ? "spin" : undefined} size={17} /></button></div>
       </header>
 
       {!snapshotCurrent && <section className="stale-banner" role="alert"><strong>状态刷新失败，先前快照已停用</strong><span>请刷新成功后再查看建议、账户指标和资源链接</span></section>}
