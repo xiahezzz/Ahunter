@@ -45,7 +45,7 @@ type CurrentState = {
     realized_pnl: number;
     unrealized_pnl: number;
     accounts: unknown[];
-    status?: string;
+    status?: "ok" | "degraded" | "unknown";
   };
   flows: { information: StatusCount; capital: StatusCount; analyst: StatusCount };
   blocking_quality_checks: Array<{
@@ -75,30 +75,44 @@ function isStatusCount(value: unknown): value is StatusCount {
   return isRecord(value) && typeof value.status === "string" && isFiniteNumber(value.count);
 }
 
-function isSafeHref(value: unknown): value is string {
-  return typeof value === "string" && value.startsWith("/api/") && !value.startsWith("//");
-}
+const A_SHARE_CODE = /^[0368]\d{5}$/;
+const ASSET_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const REPORT_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 function isReportLink(value: unknown): value is ReportLink {
-  return isRecord(value) &&
-    typeof value.report_date === "string" &&
-    (value.report_type === "premarket" || value.report_type === "review") &&
-    typeof value.run_id === "string" &&
-    typeof value.quality_status === "string" &&
-    isSafeHref(value.href);
+  if (!isRecord(value) ||
+    typeof value.report_date !== "string" ||
+    !REPORT_DATE.test(value.report_date) ||
+    (value.report_type !== "premarket" && value.report_type !== "review") ||
+    typeof value.run_id !== "string" ||
+    !RUN_ID.test(value.run_id) ||
+    typeof value.quality_status !== "string" ||
+    typeof value.href !== "string") {
+    return false;
+  }
+  return value.href === `/api/reports/${value.report_date}/${value.report_type}?run_id=${value.run_id}`;
 }
 
 function isProfileLink(value: unknown): value is ProfileLink {
-  return isRecord(value) && typeof value.code === "string" && typeof value.name === "string" && isSafeHref(value.href);
+  return isRecord(value) &&
+    typeof value.code === "string" &&
+    A_SHARE_CODE.test(value.code) &&
+    typeof value.name === "string" &&
+    typeof value.href === "string" &&
+    value.href === `/api/profiles/${value.code}`;
 }
 
 function isChartLink(value: unknown): value is ChartLink {
   return isRecord(value) &&
     typeof value.asset_id === "string" &&
+    ASSET_ID.test(value.asset_id) &&
     typeof value.code === "string" &&
-    typeof value.chart_type === "string" &&
+    A_SHARE_CODE.test(value.code) &&
+    value.chart_type === "kline" &&
     typeof value.as_of === "string" &&
-    isSafeHref(value.href);
+    typeof value.href === "string" &&
+    value.href === `/api/charts/${value.asset_id}`;
 }
 
 function parseCurrentState(value: unknown): CurrentState {
@@ -122,6 +136,7 @@ function parseCurrentState(value: unknown): CurrentState {
     !isFiniteNumber(ledger.realized_pnl) ||
     !isFiniteNumber(ledger.unrealized_pnl) ||
     !Array.isArray(ledger.accounts) ||
+    (ledger.status !== undefined && !["ok", "degraded", "unknown"].includes(String(ledger.status))) ||
     !isRecord(flows) ||
     !isStatusCount(flows.information) ||
     !isStatusCount(flows.capital) ||
@@ -167,10 +182,14 @@ function parseCurrentState(value: unknown): CurrentState {
       typeof item.created_at === "string",
   );
   const validHealth = Object.values(value.health).every((item) => typeof item === "string");
+  const adviceFieldsAgree = value.advice_status === "passed"
+    ? value.blocking_quality_checks.length === 0
+    : value.advice.length === 0;
   if (
     !validAdvice ||
     !validPositions ||
     !validChecks ||
+    !adviceFieldsAgree ||
     !value.reports.every(isReportLink) ||
     !value.profiles.every(isProfileLink) ||
     !value.charts.every(isChartLink) ||
@@ -206,7 +225,7 @@ async function apiError(response: Response) {
   return `请求失败 (${response.status})`;
 }
 
-function ManualLedgerForm({ onSaved }: { onSaved: () => Promise<void> }) {
+function ManualLedgerForm({ onSaved }: { onSaved: () => Promise<boolean> }) {
   const [transactionId, setTransactionId] = useState("");
   const [tradeDate, setTradeDate] = useState("");
   const [transactionType, setTransactionType] = useState("cash_deposit");
@@ -249,7 +268,9 @@ function ManualLedgerForm({ onSaved }: { onSaved: () => Promise<void> }) {
         body: JSON.stringify(payload),
       });
       if (!response.ok) throw new Error(await apiError(response));
-      await onSaved();
+      if (!await onSaved()) {
+        throw new Error("流水已保存，但状态刷新失败；输入已保留，请刷新确认");
+      }
       setMessage({ kind: "success", text: "流水已保存，状态已刷新" });
       setTransactionId("");
       setAmount("0");
@@ -281,7 +302,7 @@ function ManualLedgerForm({ onSaved }: { onSaved: () => Promise<void> }) {
 const MAX_IMPORT_CHARACTERS = 512 * 1024;
 const MAX_IMPORT_ITEMS = 500;
 
-function LedgerImportForm({ onImported }: { onImported: () => Promise<void> }) {
+function LedgerImportForm({ onImported }: { onImported: () => Promise<boolean> }) {
   const [text, setText] = useState("");
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
@@ -311,7 +332,9 @@ function LedgerImportForm({ onImported }: { onImported: () => Promise<void> }) {
         body: text,
       });
       if (!response.ok) throw new Error(await apiError(response));
-      await onImported();
+      if (!await onImported()) {
+        throw new Error("JSON 流水已导入，但状态刷新失败；内容已保留，请刷新确认");
+      }
       setMessage({ kind: "success", text: "JSON 流水已导入，状态已刷新" });
       setText("");
     } catch (caught) {
@@ -342,10 +365,11 @@ function App() {
       const result = await fetch("/api/current-state", { signal });
       if (!result.ok) throw new Error(`请求失败 (${result.status})`);
       setState(parseCurrentState(await result.json()));
+      return true;
     } catch (caught) {
-      if (caught instanceof DOMException && caught.name === "AbortError") return;
-      setState(null);
+      if (caught instanceof DOMException && caught.name === "AbortError") return false;
       setError(caught instanceof Error ? caught.message : "未知错误");
+      return false;
     } finally {
       setIsRefreshing(false);
     }
@@ -360,10 +384,14 @@ function App() {
   if (!state && !error) return <main className="center-state" aria-live="polite">正在读取当前状态…</main>;
   if (!state) return <main className="center-state" role="alert"><strong>当前状态读取失败</strong><span>{error}</span><button type="button" onClick={() => void loadState()} disabled={isRefreshing}><RefreshCw size={16} />{isRefreshing ? "正在重试" : "重试读取"}</button></main>;
 
-  const knownValues = state.ledger.positions.flatMap((position) => position.market_value === null ? [] : [position.market_value]);
-  const exposure = knownValues.length === state.ledger.positions.length
+  const ledgerAvailable = state.ledger.status !== "degraded" && state.ledger.status !== "unknown";
+  const knownValues = ledgerAvailable
+    ? state.ledger.positions.flatMap((position) => position.market_value === null ? [] : [position.market_value])
+    : [];
+  const exposure = ledgerAvailable && knownValues.length === state.ledger.positions.length
     ? knownValues.reduce((sum, value) => sum + value, 0)
     : null;
+  const adviceAvailable = state.advice_status === "passed" && state.blocking_quality_checks.length === 0;
   const reports = state.reports;
   const profiles = state.profiles;
   const charts = state.charts;
@@ -378,12 +406,31 @@ function App() {
       <section className="summary-grid" aria-label="投资概览">
         <article className="panel ledger-summary">
           <h2><BriefcaseBusiness size={18} />账户</h2>
-          <dl className="metrics"><Metric label="可用现金" value={CNY.format(state.ledger.cash)} /><Metric label="持仓市值" value={exposure === null ? "暂无数据" : CNY.format(exposure)} /><Metric label="已实现盈亏" value={CNY.format(state.ledger.realized_pnl)} /><Metric label="未实现盈亏" value={CNY.format(state.ledger.unrealized_pnl)} /></dl>
+          {ledgerAvailable ? (
+            <dl className="metrics">
+              <Metric label="可用现金" value={CNY.format(state.ledger.cash)} />
+              <Metric label="持仓市值" value={exposure === null ? "暂无数据" : CNY.format(exposure)} />
+              <Metric label="已实现盈亏" value={CNY.format(state.ledger.realized_pnl)} />
+              <Metric label="未实现盈亏" value={CNY.format(state.ledger.unrealized_pnl)} />
+            </dl>
+          ) : (
+            <p className="unavailable-message">
+              {state.ledger.status === "degraded" ? "账户数据已降级" : "账户数据状态未知"}
+            </p>
+          )}
         </article>
         <article className="panel advice-summary">
           <h2><TrendingUp size={18} />08:30 建议</h2>
           <span className={`status-badge ${statusClass(state.advice_status)}`}>{statusLabel(state.advice_status)}</span>
-          {state.advice_status === "blocked" ? <p className="blocked-message">建议已阻断</p> : state.advice.length === 0 ? <p className="empty">暂无建议</p> : <ul className="plain-list">{state.advice.map((item) => <li key={item.advice_id}><div><strong>{item.code}</strong><span>{item.action} · {Math.round(item.confidence * 100)}%</span></div><p>{item.rationale}</p></li>)}</ul>}
+          {!adviceAvailable ? (
+            <p className={state.advice_status === "blocked" ? "blocked-message" : "unavailable-message"}>
+              {state.advice_status === "blocked" ? "建议已阻断" : "建议不可用"}
+            </p>
+          ) : state.advice.length === 0 ? (
+            <p className="empty">暂无建议</p>
+          ) : (
+            <ul className="plain-list">{state.advice.map((item) => <li key={item.advice_id}><div><strong>{item.code}</strong><span>{item.action} · {Math.round(item.confidence * 100)}%</span></div><p>{item.rationale}</p></li>)}</ul>
+          )}
         </article>
       </section>
 
@@ -392,7 +439,16 @@ function App() {
       </section>
 
       <section className="main-grid">
-        <article className="panel positions-panel"><h2><BarChart3 size={18} />持仓</h2>{state.ledger.positions.length === 0 ? <p className="empty">暂无持仓</p> : <div className="table-wrap"><table><thead><tr><th>代码</th><th>数量</th><th>成本</th><th>现价</th><th>市值</th><th>浮动盈亏</th></tr></thead><tbody>{state.ledger.positions.map((position) => <tr key={position.code}><td>{position.code}</td><td>{position.quantity}</td><td>{CNY.format(position.cost_basis)}</td><td>{position.market_price === null ? "暂无数据" : CNY.format(position.market_price)}</td><td>{position.market_value === null ? "暂无数据" : CNY.format(position.market_value)}</td><td>{CNY.format(position.unrealized_pnl)}</td></tr>)}</tbody></table></div>}</article>
+        <article className="panel positions-panel">
+          <h2><BarChart3 size={18} />持仓</h2>
+          {!ledgerAvailable ? (
+            <p className="unavailable-message">持仓数据不可用</p>
+          ) : state.ledger.positions.length === 0 ? (
+            <p className="empty">暂无持仓</p>
+          ) : (
+            <div className="table-wrap"><table><thead><tr><th>代码</th><th>数量</th><th>成本</th><th>现价</th><th>市值</th><th>浮动盈亏</th></tr></thead><tbody>{state.ledger.positions.map((position) => <tr key={position.code}><td>{position.code}</td><td>{position.quantity}</td><td>{CNY.format(position.cost_basis)}</td><td>{position.market_price === null ? "暂无数据" : CNY.format(position.market_price)}</td><td>{position.market_value === null ? "暂无数据" : CNY.format(position.market_value)}</td><td>{CNY.format(position.unrealized_pnl)}</td></tr>)}</tbody></table></div>
+          )}
+        </article>
         <article className="panel quality-panel"><h2><ShieldAlert size={18} />质量检查</h2>{state.blocking_quality_checks.length === 0 ? <p className="healthy">无阻断项</p> : <ul className="plain-list">{state.blocking_quality_checks.map((check) => <li key={`${check.check_name}-${check.created_at}`}><strong>{check.check_name}</strong><span>{statusLabel(check.status)}</span><small>{check.created_at}</small></li>)}</ul>}</article>
         <article className="panel health-panel"><h2><HeartPulse size={18} />进程健康</h2><dl className="status-list">{Object.entries(state.health).filter(([name]) => !["status", "service"].includes(name)).map(([name, status]) => <div key={name}><dt>{name}</dt><dd className={statusClass(status)}>{statusLabel(status)}</dd></div>)}</dl></article>
       </section>

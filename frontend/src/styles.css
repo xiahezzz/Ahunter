@@ -352,6 +352,11 @@ th {
   color: #9a6412;
 }
 
+.unavailable-message {
+  color: #9a6412;
+  font-size: 12px;
+}
+
 .status-muted,
 .empty {
   color: #737d79;
