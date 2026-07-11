@@ -302,6 +302,35 @@ describe("advisor dashboard", () => {
     expect(screen.queryByText("worker_token")).not.toBeInTheDocument();
   });
 
+  it("localizes healthy and stopped health components with semantic status styles", async () => {
+    mockFetch(response({
+      ...currentState,
+      health: {
+        ...currentState.health,
+        collector: "healthy",
+        market_updater: "stopped",
+        advisor_scheduler: "healthy",
+        frontend: "stopped",
+        api: "healthy",
+      },
+    }));
+    render(<App />);
+
+    const healthList = (await screen.findByText("采集器")).closest("dl") as HTMLElement;
+    const health = within(healthList);
+    expect(health.getByText("行情更新")).toBeInTheDocument();
+    expect(health.getByText("投顾调度")).toBeInTheDocument();
+    expect(health.getByText("前端")).toBeInTheDocument();
+    expect(health.getByText("接口")).toBeInTheDocument();
+    expect(health.getAllByText("健康")).toHaveLength(3);
+    for (const status of health.getAllByText("健康")) expect(status).toHaveClass("status-ok");
+    expect(health.getAllByText("已停止")).toHaveLength(2);
+    for (const status of health.getAllByText("已停止")) expect(status).toHaveClass("status-warn");
+    for (const identifier of ["collector", "market_updater", "advisor_scheduler", "frontend", "api"]) {
+      expect(health.queryByText(identifier)).not.toBeInTheDocument();
+    }
+  });
+
   it.each([
     ["profile", { profile_list: { status: "degraded" }, profiles: currentState.profiles }],
     ["chart", { chart_list: { status: "degraded" }, charts: currentState.charts }],

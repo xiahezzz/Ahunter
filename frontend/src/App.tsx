@@ -96,6 +96,13 @@ function isStatusCount(value: unknown): value is StatusCount {
 
 const HEALTH_STATUSES = new Set<unknown>(["ok", "healthy", "running", "degraded", "failed", "stopped", "unknown"]);
 const HEALTH_COMPONENTS = ["collector", "market_updater", "advisor_scheduler", "frontend", "api"] as const;
+const HEALTH_COMPONENT_LABELS: Record<(typeof HEALTH_COMPONENTS)[number], string> = {
+  collector: "采集器",
+  market_updater: "行情更新",
+  advisor_scheduler: "投顾调度",
+  frontend: "前端",
+  api: "接口",
+};
 const HEALTH_KEYS = new Set(["status", "service", ...HEALTH_COMPONENTS]);
 
 function isHealth(value: unknown): value is Health {
@@ -268,14 +275,27 @@ function parseCurrentState(value: unknown): CurrentState {
   return value as CurrentState;
 }
 
+const STATUS_LABELS = {
+  passed: "已通过",
+  blocked: "已阻断",
+  missing: "缺失",
+  ok: "正常",
+  healthy: "健康",
+  running: "运行中",
+  degraded: "降级",
+  failed: "失败",
+  stopped: "已停止",
+  unknown: "未知",
+} satisfies Record<HealthStatus | ReportStatus | FlowStatus | "failed", string>;
+
 function statusLabel(status: string) {
-  return { passed: "已通过", blocked: "已阻断", missing: "缺失", ok: "正常", running: "运行中", degraded: "降级", unknown: "未知", failed: "失败" }[status] ?? status;
+  return STATUS_LABELS[status as keyof typeof STATUS_LABELS] ?? status;
 }
 
 function statusClass(status: string) {
-  if (["ok", "passed", "running"].includes(status)) return "status-ok";
+  if (["ok", "healthy", "passed", "running"].includes(status)) return "status-ok";
   if (["blocked", "failed"].includes(status)) return "status-danger";
-  if (["degraded", "missing"].includes(status)) return "status-warn";
+  if (["degraded", "missing", "stopped"].includes(status)) return "status-warn";
   return "status-muted";
 }
 
@@ -522,7 +542,7 @@ function App() {
           )}
         </article>
         <article className="panel quality-panel"><h2><ShieldAlert size={18} />质量检查</h2>{!snapshotCurrent ? <p className="unavailable-message">质量状态不可用</p> : state.blocking_quality_checks.length === 0 ? <p className="healthy">无阻断项</p> : <ul className="plain-list">{state.blocking_quality_checks.map((check) => <li key={`${check.check_name}-${check.created_at}`}><strong>{check.check_name}</strong><span>{statusLabel(check.status)}</span><small>{check.created_at}</small></li>)}</ul>}</article>
-        <article className="panel health-panel"><h2><HeartPulse size={18} />进程健康</h2>{!snapshotCurrent ? <p className="unavailable-message">进程状态不可用</p> : <dl className="status-list">{HEALTH_COMPONENTS.map((name) => <div key={name}><dt>{name}</dt><dd className={statusClass(state.health[name])}>{statusLabel(state.health[name])}</dd></div>)}</dl>}</article>
+        <article className="panel health-panel"><h2><HeartPulse size={18} />进程健康</h2>{!snapshotCurrent ? <p className="unavailable-message">进程状态不可用</p> : <dl className="status-list">{HEALTH_COMPONENTS.map((name) => <div key={name}><dt>{HEALTH_COMPONENT_LABELS[name]}</dt><dd className={statusClass(state.health[name])}>{statusLabel(state.health[name])}</dd></div>)}</dl>}</article>
       </section>
 
       <section className="resources">
