@@ -1,0 +1,23 @@
+market:
+  primary: A股
+schedule:
+  premarket_time: "08:30"
+  review_time: "22:30"
+storage:
+  market_db: data/advisor/market.sqlite
+  advisor_db: data/advisor/advisor.sqlite
+  chart_dir: data/advisor/charts
+  profile_dir: data/advisor/profiles
+data_sources:
+  allow_tushare: false
+  free_sources:
+    - mootdx
+    - tencent
+    - eastmoney
+    - sina
+    - 10jqka
+    - cailianpress
+    - baidu_stock
+quality:
+  max_market_data_staleness_minutes: 1440
+  require_trading_calendar: true

@@ -1,0 +1,22 @@
+sources:
+  mootdx:
+    enabled: true
+    rate_limit_per_second: 5
+  tencent:
+    enabled: true
+    rate_limit_per_second: 2
+  eastmoney:
+    enabled: true
+    rate_limit_per_second: 1
+  sina:
+    enabled: true
+    rate_limit_per_second: 1
+  10jqka:
+    enabled: true
+    rate_limit_per_second: 1
+  cailianpress:
+    enabled: true
+    rate_limit_per_second: 1
+  baidu_stock:
+    enabled: true
+    rate_limit_per_second: 1
