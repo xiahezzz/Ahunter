@@ -48,6 +48,41 @@ _SAFE_EVIDENCE_FIELDS = (
     "quality_status",
     "blocking_failure",
 )
+_COLLECTION_EVIDENCE_FIELDS = (
+    "facts",
+    "inferences",
+    "conflicts",
+    "quality_flags",
+)
+_SCALAR_EVIDENCE_FIELDS = tuple(
+    field for field in _SAFE_EVIDENCE_FIELDS if field not in _COLLECTION_EVIDENCE_FIELDS
+)
+_SENSITIVE_FIELD_NAMES = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "credential",
+        "authorization",
+        "cookie",
+        "token",
+        "session",
+        "socket",
+        "socket_id",
+        "socketio",
+        "socket_io",
+        "chrome",
+        "chrome_debugging_id",
+        "debug",
+        "debug_id",
+        "debugger",
+        "cdp",
+        "raw",
+        "payload",
+        "raw_ref",
+    }
+)
 _SENSITIVE_FIELD_PARTS = (
     "credential",
     "cookie",
@@ -58,7 +93,16 @@ _SENSITIVE_FIELD_PARTS = (
     "password",
     "authorization",
     "session",
+    "api_key",
+    "apikey",
+    "secret",
+    "payload",
 )
+_SENSITIVE_VALUE = re.compile(
+    r"\b(?:api[_-]?key|apikey|secret|password|credential|authorization|cookie|token|session|socket(?:[_.-]?id)?|chrome(?:[ _.-]?debug(?:ging)?(?:[ _.-]?id)?)?|debug(?:ger|[ _.-]?id)?|cdp|raw(?:[ _.-]?ref)?|payload)\s*[:=]",
+    re.IGNORECASE,
+)
+_SECRET_VALUE_PREFIX = re.compile(r"\b(?:sk|pk|sess)_[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 _MAX_EVIDENCE_ITEMS = 20
 _MAX_EVIDENCE_CONTEXT_CHARS = 6_000
 _MAX_EVIDENCE_VALUE_CHARS = 800
@@ -225,12 +269,7 @@ def _inject_evidence_context(initial_state: dict[str, Any], evidence: list[dict]
 def _build_evidence_context(evidence: list[dict]) -> str:
     records = []
     for item in evidence[:_MAX_EVIDENCE_ITEMS]:
-        normalized = {
-            field: _safe_evidence_value(item[field])
-            for field in _SAFE_EVIDENCE_FIELDS
-            if field in item and not _is_sensitive_field(field)
-        }
-        normalized = {field: value for field, value in normalized.items() if value is not None}
+        normalized = _normalize_evidence_item(item)
         if normalized:
             records.append(normalized)
 
@@ -243,24 +282,51 @@ def _build_evidence_context(evidence: list[dict]) -> str:
     )[:_MAX_EVIDENCE_CONTEXT_CHARS]
 
 
-def _safe_evidence_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float)):
+def _normalize_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = {}
+    for field in _SCALAR_EVIDENCE_FIELDS:
+        if field not in item or _is_sensitive_field(field):
+            continue
+        value = _bounded_scalar(item[field])
+        if value is not None:
+            normalized[field] = value
+
+    for field in _COLLECTION_EVIDENCE_FIELDS:
+        if field not in item or _is_sensitive_field(field):
+            continue
+        value = _bounded_scalar_collection(item[field])
+        if value:
+            normalized[field] = value
+    return normalized
+
+
+def _bounded_scalar_collection(value: Any) -> list[bool | int | float | str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    values = []
+    for item in value[:20]:
+        scalar = _bounded_scalar(item)
+        if scalar is not None:
+            values.append(scalar)
+    return values
+
+
+def _bounded_scalar(value: Any) -> bool | int | float | str | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
         return value
     if isinstance(value, str):
+        if _SENSITIVE_VALUE.search(value) or _SECRET_VALUE_PREFIX.search(value):
+            return None
         return value[:_MAX_EVIDENCE_VALUE_CHARS]
-    if isinstance(value, list):
-        return [_safe_evidence_value(item) for item in value[:20]]
-    if isinstance(value, dict):
-        return {
-            str(key): _safe_evidence_value(item)
-            for key, item in value.items()
-            if not _is_sensitive_field(str(key))
-        }
-    return str(value)[:_MAX_EVIDENCE_VALUE_CHARS]
+    return None
 
 
 def _is_sensitive_field(field: str) -> bool:
-    lowered = field.lower()
+    lowered = field.lower().replace("-", "_")
+    if lowered in _SENSITIVE_FIELD_NAMES:
+        return True
     return any(part in lowered for part in _SENSITIVE_FIELD_PARTS)
 
 

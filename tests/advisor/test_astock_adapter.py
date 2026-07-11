@@ -256,6 +256,34 @@ def test_external_runner_bridges_only_safe_evidence_fields_into_messages_and_pas
     assert "ev-1" in graph.initial_state["past_context"]
 
 
+def test_external_runner_drops_nested_and_secret_compound_evidence_values():
+    graph = FakeGraph(
+        [passing_state("600519")],
+        initial_state={"messages": [("human", "600519")], "past_context": "existing memory"},
+    )
+    leaked_values = ("LEAK", "LEAK2", "LEAK3", "LEAK4", "LEAK5", "LEAK6")
+    evidence = [
+        {
+            "evidence_id": "ev-safe",
+            "summary": "Safe summary.",
+            "facts": ["safe fact", {"api_key": "LEAK", "unknown": "LEAK2"}, ["LEAK3"], b"LEAK4", "token=LEAK5"],
+            "inferences": [{"secret": "LEAK"}, ["LEAK2"], b"LEAK3", "safe inference"],
+            "conflicts": [{"password": "LEAK4"}, ["LEAK5"], b"LEAK6", "safe conflict"],
+            "quality_flags": [{"raw_ref": "LEAK"}, ["LEAK2"], b"LEAK3", "authorization=LEAK4", "safe flag"],
+        }
+    ]
+
+    ExternalTradingAgentsRunner(graph_factory=lambda _, __: graph).run("600519", "2026-07-11", evidence)
+
+    message_context = graph.initial_state["messages"][-1][1]
+    past_context = graph.initial_state["past_context"]
+    for forbidden in (*leaked_values, "api_key", "unknown", "secret", "password", "raw_ref", "token=", "authorization="):
+        assert forbidden not in message_context
+        assert forbidden not in past_context
+    for expected in ("ev-safe", "Safe summary.", "safe fact", "safe inference", "safe conflict", "safe flag"):
+        assert expected in message_context
+
+
 def test_external_runner_fails_closed_and_closes_when_initial_state_is_missing():
     graph = FakeGraph([passing_state("600519")], initial_state=None)
     graph.prepare_graph_run = lambda code, trade_date: (None, {"stream_mode": "values"}, 1)
