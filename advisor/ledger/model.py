@@ -21,32 +21,38 @@ class LedgerState:
     realized_pnl: float = 0.0
 
 
+def _require_code(tx: LedgerTransaction) -> str:
+    if tx.code is None:
+        raise ValueError(f"{tx.transaction_type} transaction requires code")
+    return tx.code
+
+
 def apply_transactions(transactions: list[LedgerTransaction]) -> LedgerState:
     state = LedgerState()
     for tx in transactions:
-        if tx.transaction_type in {"cash_deposit", "cash_withdrawal"}:
+        if tx.transaction_type in {"cash_deposit", "cash_withdrawal", "fee", "tax"}:
             state.cash += tx.amount
         elif tx.transaction_type == "buy":
-            assert tx.code is not None
+            code = _require_code(tx)
             state.cash += tx.amount - tx.fees
-            state.positions[tx.code] = state.positions.get(tx.code, 0) + tx.quantity
-            state.cost_basis[tx.code] = state.cost_basis.get(tx.code, 0.0) + abs(tx.amount) + tx.fees
+            state.positions[code] = state.positions.get(code, 0) + tx.quantity
+            state.cost_basis[code] = state.cost_basis.get(code, 0.0) + abs(tx.amount) + tx.fees
         elif tx.transaction_type == "sell":
-            assert tx.code is not None
-            held = state.positions.get(tx.code, 0)
+            code = _require_code(tx)
+            held = state.positions.get(code, 0)
             if held < tx.quantity:
-                raise ValueError(f"cannot sell {tx.quantity} shares of {tx.code}; only {held} held")
-            prior_cost = state.cost_basis.get(tx.code, 0.0)
+                raise ValueError(f"cannot sell {tx.quantity} shares of {code}; only {held} held")
+            prior_cost = state.cost_basis.get(code, 0.0)
             sold_cost = prior_cost * (tx.quantity / held)
             state.cash += tx.amount - tx.fees
             state.realized_pnl += tx.amount - tx.fees - sold_cost
             remaining = held - tx.quantity
             if remaining == 0:
-                state.positions.pop(tx.code, None)
-                state.cost_basis.pop(tx.code, None)
+                state.positions.pop(code, None)
+                state.cost_basis.pop(code, None)
             else:
-                state.positions[tx.code] = remaining
-                state.cost_basis[tx.code] = prior_cost - sold_cost
+                state.positions[code] = remaining
+                state.cost_basis[code] = prior_cost - sold_cost
         else:
             raise ValueError(f"unsupported transaction_type: {tx.transaction_type}")
     return state

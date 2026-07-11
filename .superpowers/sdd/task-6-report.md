@@ -64,3 +64,52 @@ This confirmed the test was exercising missing functionality rather than passing
 - Preserved the advisor boundary: local ledger math only, no broker integration and no collector changes.
 - Followed the brief’s minimal behavior, including proportional cost-basis handling for sells and CSV parsing with typed fields.
 - Did not run unrelated tests in this task; only the targeted ledger test required by the RED/GREEN cycle was executed.
+
+## Review Fixes
+
+- Added support for schema-valid `fee` and `tax` transactions in `apply_transactions()`.
+- Kept CSV `amount` authoritative for signed cash movement, and only subtract `fees` on `buy` and `sell`.
+- Replaced `assert tx.code is not None` with explicit `ValueError` validation before any buy/sell state mutation.
+
+## Additional Regression Tests
+
+- `test_apply_fee_transaction_adjusts_cash`
+- `test_apply_tax_transaction_adjusts_cash`
+- `test_buy_without_code_raises_value_error`
+- `test_sell_without_code_raises_value_error`
+
+## Fix Validation
+
+### RED
+
+Ran before the model fix:
+
+```bash
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q
+```
+
+Observed:
+
+```text
+4 failed, 2 passed in 0.06s
+```
+
+Failures matched the review findings:
+- `fee` and `tax` raised `ValueError: unsupported transaction_type`
+- buy/sell without `code` raised `AssertionError` instead of `ValueError`
+
+### GREEN
+
+Ran after the model fix:
+
+```bash
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q
+.venv311/bin/python -m pytest tests/advisor -q
+```
+
+Observed:
+
+```text
+6 passed in 0.02s
+18 passed in 0.17s
+```
