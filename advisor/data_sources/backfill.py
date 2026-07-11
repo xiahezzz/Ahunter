@@ -169,7 +169,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         result = update_market_database(
             db_path,
             registry.historical_provider,
-            tuple(part for part in args.codes.split(",") if part),
+            tuple(args.codes.split(",")),
             args.start,
             args.end,
             sleep=time.sleep,

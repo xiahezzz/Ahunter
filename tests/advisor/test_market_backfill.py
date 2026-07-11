@@ -47,7 +47,7 @@ class FakeProvider(MarketDataProvider):
 
 def test_backfill_issues_36_month_request_and_writes_api_database(tmp_path: Path):
     state_dir = tmp_path / "data" / "advisor"
-    db_path = state_dir / "advisor.sqlite"
+    db_path = state_dir / "operational.sqlite"
     provider = FakeProvider()
 
     result = update_market_database(
@@ -64,7 +64,7 @@ def test_backfill_issues_36_month_request_and_writes_api_database(tmp_path: Path
     assert result.completed_codes == ("600519",)
     assert result.failed_codes == ()
     assert result.inserted_rows == 1
-    payload = TestClient(create_app(state_dir)).get("/api/current-state").json()
+    payload = TestClient(create_app(state_dir, db_path=db_path)).get("/api/current-state").json()
     assert payload["last_successful_data_update"] == "2026-07-11T08:00:00+08:00"
 
 
@@ -187,3 +187,47 @@ data_sources: {allow_tushare: false, free_sources: [sina]}
     db_path = tmp_path / "data" / "advisor" / "advisor.sqlite"
     statuses = sqlite3.connect(db_path).execute("SELECT status FROM market_sources ORDER BY rowid").fetchall()
     assert statuses == [("passed",), ("failed",)]
+
+
+@pytest.mark.parametrize("codes", ["600519,", "600519,,000001", "600519, 000001"])
+def test_cli_rejects_empty_or_whitespace_code_components_before_opening_sqlite(
+    tmp_path: Path, monkeypatch, codes: str
+):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "advisor.yaml"
+    config_path.write_text(
+        """
+market: {primary: A股}
+schedule: {premarket_time: "08:30", review_time: "22:30"}
+storage: {database: data/advisor/operational.sqlite}
+data_sources: {allow_tushare: false, free_sources: [sina]}
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "data-sources.yaml").write_text(
+        "sources:\n  sina:\n    enabled: true\n    rate_limit_per_second: 100\n",
+        encoding="utf-8",
+    )
+
+    class Registry:
+        historical_provider = FakeProvider()
+
+    monkeypatch.setattr("advisor.data_sources.backfill.ConfiguredProviderRegistry.from_yaml", lambda _: Registry())
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "--config",
+                str(config_path),
+                "--codes",
+                codes,
+                "--start",
+                "2026-07-01",
+                "--end",
+                "2026-07-12",
+            ]
+        )
+
+    assert exit_info.value.code == 2
+    assert not (tmp_path / "data" / "advisor" / "operational.sqlite").exists()

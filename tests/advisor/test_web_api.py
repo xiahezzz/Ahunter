@@ -718,6 +718,29 @@ def test_ledger_writes_shanghai_aware_created_at(tmp_path):
         assert parsed.utcoffset() == timedelta(hours=8)
 
 
+def test_ledger_uses_explicit_operational_database_path(tmp_path):
+    db_path = tmp_path / "database" / "operational.sqlite"
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        "/api/ledger/transactions",
+        json={
+            "transaction_id": "cash-1",
+            "trade_date": "2026-07-11",
+            "transaction_type": "cash_deposit",
+            "quantity": 0,
+            "price": 0,
+            "amount": 100,
+            "fees": 0,
+        },
+    )
+
+    assert response.status_code == 201
+    assert db_path.is_file()
+    assert not (tmp_path / "advisor.sqlite").exists()
+    connection = sqlite3.connect(db_path)
+    assert connection.execute("SELECT transaction_id FROM ledger_transactions").fetchone() == ("cash-1",)
+    connection.close()
+
+
 def test_ledger_rejects_huge_json_integer_without_overflow(tmp_path):
     response = TestClient(create_app(tmp_path)).post(
         "/api/ledger/transactions",

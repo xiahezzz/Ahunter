@@ -35,8 +35,21 @@ class RecordedSession:
         return self.response
 
 
+class FalsyRecordedSession(RecordedSession):
+    def __bool__(self):
+        return False
+
+
 def fixed_clock() -> datetime:
     return datetime.fromisoformat("2026-07-12T09:00:00+08:00")
+
+
+def test_sina_provider_keeps_falsy_injected_session():
+    session = FalsyRecordedSession([])
+
+    provider = SinaDailyBarProvider(session, fixed_clock)
+
+    assert provider._session is session
 
 
 def test_sina_provider_parses_and_bounds_daily_bars():

@@ -31,7 +31,7 @@ class SinaDailyBarProvider:
         session: requests.Session | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self._session = session or requests.Session()
+        self._session = session if session is not None else requests.Session()
         self._clock = clock or (lambda: datetime.now().astimezone())
         self.rate_limit_per_second = 1.0
 

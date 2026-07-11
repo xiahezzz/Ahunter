@@ -57,9 +57,10 @@ _MAX_SQLITE_INTEGER = 2**63 - 1
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
-def create_app(state_dir: Path | None = None) -> FastAPI:
+def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> FastAPI:
     """Create the local-only advisor API without creating state on read paths."""
     resolved_state_dir = Path(state_dir) if state_dir is not None else advisor_paths.advisor_data_dir()
+    resolved_db_path = Path(db_path) if db_path is not None else resolved_state_dir / "advisor.sqlite"
     report_cursor_secret = secrets.token_bytes(32)
     app = FastAPI(title="A Hunter Advisor")
 
@@ -69,7 +70,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/current-state")
     def current_state() -> dict:
-        return _current_state(resolved_state_dir, report_cursor_secret)
+        return _current_state(resolved_state_dir, resolved_db_path, report_cursor_secret)
 
     @app.get("/api/reports")
     def reports(
@@ -108,13 +109,12 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
             archive = read_verified_archive(advisor_paths.reports_dir(), report_date, report_type, run_id)
         except (OSError, ValueError, RuntimeError):
             raise HTTPException(status_code=404, detail="report not found") from None
-        db_path = resolved_state_dir / "advisor.sqlite"
-        connection = _read_connection(db_path)
+        connection = _read_connection(resolved_db_path)
         try:
             quality = _resolve_current_run_quality(
                 connection,
                 _shanghai_today().isoformat(),
-                database_present=_database_entry_present(db_path),
+                database_present=_database_entry_present(resolved_db_path),
             )
         finally:
             if connection is not None:
@@ -125,7 +125,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/profiles")
     def profiles(limit: int = Query(default=50, ge=1, le=100)) -> dict:
-        connection = _read_connection(resolved_state_dir / "advisor.sqlite")
+        connection = _read_connection(resolved_db_path)
         try:
             return {"profiles": _read_profile_links(connection)[:limit]}
         finally:
@@ -136,7 +136,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
     def profile(code: str) -> dict:
         if not _CODE_RE.fullmatch(code):
             raise HTTPException(status_code=404, detail="profile not found")
-        connection = _read_connection(resolved_state_dir / "advisor.sqlite")
+        connection = _read_connection(resolved_db_path)
         try:
             payload = _read_profile(connection, code)
         finally:
@@ -148,7 +148,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/charts")
     def charts(limit: int = Query(default=50, ge=1, le=100)) -> dict:
-        connection = _read_connection(resolved_state_dir / "advisor.sqlite")
+        connection = _read_connection(resolved_db_path)
         try:
             return {"charts": _read_chart_links(connection, resolved_state_dir)[:limit]}
         finally:
@@ -159,7 +159,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
     def chart(asset_id: str):
         if not _ASSET_ID_RE.fullmatch(asset_id):
             raise HTTPException(status_code=404, detail="chart not found")
-        connection = _read_connection(resolved_state_dir / "advisor.sqlite")
+        connection = _read_connection(resolved_db_path)
         try:
             descriptor = _open_chart_descriptor(connection, resolved_state_dir, asset_id)
         finally:
@@ -171,7 +171,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/ledger/transactions")
     def ledger_transactions(limit: int = Query(default=50, ge=1, le=100), offset: int = Query(default=0, ge=0, le=1000)) -> dict:
-        connection = _read_connection(resolved_state_dir / "advisor.sqlite")
+        connection = _read_connection(resolved_db_path)
         try:
             rows = _read_ledger_records(connection, limit=limit, offset=offset)
             try:
@@ -187,7 +187,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
     def add_ledger_transaction(payload: dict) -> dict:
         try:
             account_id, transaction = _transaction_from_payload(payload)
-            return _write_ledger_transactions(resolved_state_dir, [(account_id, transaction)], "manual")
+            return _write_ledger_transactions(resolved_db_path, [(account_id, transaction)], "manual")
         except _LedgerValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
         except _LedgerCapacityError:
@@ -201,7 +201,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail="too many transactions")
         try:
             transactions = [_transaction_from_payload(item) for item in payload]
-            return _write_ledger_transactions(resolved_state_dir, transactions, "import")
+            return _write_ledger_transactions(resolved_db_path, transactions, "import")
         except _LedgerValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
         except _LedgerCapacityError:
@@ -241,10 +241,9 @@ def _load_health_snapshot(path: Path) -> dict:
 app = create_app()
 
 
-def _current_state(state_dir: Path, report_cursor_secret: bytes) -> dict:
+def _current_state(state_dir: Path, db_path: Path, report_cursor_secret: bytes) -> dict:
     today = _shanghai_today().isoformat()
     health = _health_payload(state_dir)
-    db_path = state_dir / "advisor.sqlite"
     database_present = _database_entry_present(db_path)
     connection = _read_connection(db_path)
     try:
@@ -456,7 +455,7 @@ def _transaction_from_payload(payload: object) -> tuple[str, LedgerTransaction]:
 
 
 def _write_ledger_transactions(
-    state_dir: Path,
+    db_path: Path,
     transactions: list[tuple[str, LedgerTransaction]],
     source: str,
 ) -> dict:
@@ -465,7 +464,6 @@ def _write_ledger_transactions(
     transaction_ids = [transaction.transaction_id for _, transaction in transactions]
     if len(set(transaction_ids)) != len(transaction_ids):
         raise _LedgerValidationError("duplicate transaction id")
-    db_path = state_dir / "advisor.sqlite"
     try:
         migrate_database(db_path)
         connection = sqlite3.connect(db_path, timeout=5)
