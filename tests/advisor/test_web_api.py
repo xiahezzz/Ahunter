@@ -308,6 +308,23 @@ def test_current_state_degrades_profile_list_on_read_failure(tmp_path):
     assert payload["profiles"] == []
 
 
+def test_current_state_degrades_profile_list_for_prefixed_code(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO stock_profiles (code, updated_at) VALUES (?, ?)",
+        ("SH600519", "2026-07-12T08:30:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["profile_list"] == {"status": "degraded"}
+    assert payload["profiles"] == []
+
+
 @pytest.mark.parametrize(
     ("payload", "constant", "bound"),
     [
@@ -451,6 +468,26 @@ def test_current_state_degrades_chart_list_on_read_failure(tmp_path):
     migrate_database(db_path)
     connection = sqlite3.connect(db_path)
     connection.execute("DROP TABLE chart_assets")
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["chart_list"] == {"status": "degraded"}
+    assert payload["charts"] == []
+
+
+def test_current_state_degrades_chart_list_for_non_kline_chart(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    chart_path = tmp_path / "charts" / "thumbnail.png"
+    chart_path.parent.mkdir()
+    chart_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO chart_assets (asset_id, code, chart_type, as_of, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("chart-thumbnail", "600519", "thumbnail", "2026-07-12", str(chart_path), "2026-07-12T08:30:00+08:00"),
+    )
     connection.commit()
     connection.close()
 

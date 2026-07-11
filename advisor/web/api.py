@@ -30,6 +30,7 @@ _COMPONENTS = ("collector", "market_updater", "advisor_scheduler", "frontend", "
 _HEALTH_STATUSES = frozenset({"ok", "healthy", "running", "degraded", "failed", "stopped", "unknown"})
 _MAX_HEALTH_BYTES = 64 * 1024
 _CODE_RE = re.compile(r"(?:[0368]\d{5}|(?:SH|SZ|BJ)\d{6})\Z")
+_DASHBOARD_CODE_RE = re.compile(r"[0368]\d{5}\Z")
 _ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _TRANSACTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -819,10 +820,12 @@ def _valid_quality_details(value: object) -> bool:
 
 
 def _read_profile_links(connection: sqlite3.Connection | None) -> list[dict]:
-    return _read_profile_links_with_status(connection)[0]
+    return _read_profile_links_with_status(connection, dashboard_contract=False)[0]
 
 
-def _read_profile_links_with_status(connection: sqlite3.Connection | None) -> tuple[list[dict], dict]:
+def _read_profile_links_with_status(
+    connection: sqlite3.Connection | None, *, dashboard_contract: bool = True
+) -> tuple[list[dict], dict]:
     if connection is None:
         return [], {"status": "degraded"}
     try:
@@ -839,7 +842,8 @@ def _read_profile_links_with_status(connection: sqlite3.Connection | None) -> tu
         return [], {"status": "degraded"}
     profiles = []
     for row in rows:
-        if not isinstance(row["code"], str) or not _CODE_RE.fullmatch(row["code"]):
+        code_pattern = _DASHBOARD_CODE_RE if dashboard_contract else _CODE_RE
+        if not isinstance(row["code"], str) or not code_pattern.fullmatch(row["code"]):
             return [], {"status": "degraded"}
         profile = _read_profile(connection, row["code"])
         if profile is None:
@@ -955,11 +959,14 @@ def _validate_profile_json_value(payload: object) -> None:
 
 
 def _read_chart_links(connection: sqlite3.Connection | None, state_dir: Path) -> list[dict]:
-    return _read_chart_links_with_status(connection, state_dir)[0]
+    return _read_chart_links_with_status(connection, state_dir, dashboard_contract=False)[0]
 
 
 def _read_chart_links_with_status(
-    connection: sqlite3.Connection | None, state_dir: Path
+    connection: sqlite3.Connection | None,
+    state_dir: Path,
+    *,
+    dashboard_contract: bool = True,
 ) -> tuple[list[dict], dict]:
     if connection is None:
         return [], {"status": "degraded"}
@@ -976,13 +983,16 @@ def _read_chart_links_with_status(
         return [], {"status": "degraded"}
     charts = []
     for row in rows:
+        code_pattern = _DASHBOARD_CODE_RE if dashboard_contract else _CODE_RE
+        valid_chart_type = row["chart_type"] == "kline" if dashboard_contract else (
+            isinstance(row["chart_type"], str) and _CHART_TYPE_RE.fullmatch(row["chart_type"])
+        )
         if not (
             isinstance(row["asset_id"], str)
             and _ASSET_ID_RE.fullmatch(row["asset_id"])
             and isinstance(row["code"], str)
-            and _CODE_RE.fullmatch(row["code"])
-            and isinstance(row["chart_type"], str)
-            and _CHART_TYPE_RE.fullmatch(row["chart_type"])
+            and code_pattern.fullmatch(row["code"])
+            and valid_chart_type
             and _valid_db_timestamp(row["as_of"])
             and _safe_chart_path(row["path"], state_dir) is not None
         ):

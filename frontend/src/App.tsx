@@ -17,6 +17,7 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 type FlowStatus = "ok" | "degraded" | "unknown";
 type ReportStatus = "passed" | "blocked" | "missing";
 type ListStatus = "ok" | "degraded";
+type HealthStatus = "ok" | "healthy" | "running" | "degraded" | "failed" | "stopped" | "unknown";
 type StatusCount = { status: FlowStatus; count: number };
 type Advice = {
   advice_id: string;
@@ -37,6 +38,15 @@ type Position = {
 type ReportLink = { report_date: string; report_type: "premarket" | "review"; run_id: string; quality_status: "passed" | "blocked"; href: string };
 type ProfileLink = { code: string; name: string; href: string };
 type ChartLink = { asset_id: string; code: string; chart_type: string; as_of: string; href: string };
+type Health = {
+  status: "ok";
+  service: "advisor-api";
+  collector: HealthStatus;
+  market_updater: HealthStatus;
+  advisor_scheduler: HealthStatus;
+  frontend: HealthStatus;
+  api: HealthStatus;
+};
 type CurrentState = {
   today: string;
   last_successful_data_update: string | null;
@@ -64,7 +74,7 @@ type CurrentState = {
   profile_list: { status: ListStatus };
   charts: ChartLink[];
   chart_list: { status: ListStatus };
-  health: Record<string, string>;
+  health: Health;
 };
 
 const CNY = new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY" });
@@ -82,6 +92,19 @@ function isStatusCount(value: unknown): value is StatusCount {
     (value.status === "ok" || value.status === "degraded" || value.status === "unknown") &&
     Number.isSafeInteger(value.count) &&
     (value.count as number) >= 0;
+}
+
+const HEALTH_STATUSES = new Set<unknown>(["ok", "healthy", "running", "degraded", "failed", "stopped", "unknown"]);
+
+function isHealth(value: unknown): value is Health {
+  return isRecord(value) &&
+    value.status === "ok" &&
+    value.service === "advisor-api" &&
+    HEALTH_STATUSES.has(value.collector) &&
+    HEALTH_STATUSES.has(value.market_updater) &&
+    HEALTH_STATUSES.has(value.advisor_scheduler) &&
+    HEALTH_STATUSES.has(value.frontend) &&
+    HEALTH_STATUSES.has(value.api);
 }
 
 const A_SHARE_CODE = /^[0368]\d{5}$/;
@@ -185,7 +208,7 @@ function parseCurrentState(value: unknown): CurrentState {
     !Array.isArray(value.charts) ||
     !isRecord(chartList) ||
     (chartList.status !== "ok" && chartList.status !== "degraded") ||
-    !isRecord(value.health)
+    !isHealth(value.health)
   ) {
     throw new Error("当前状态格式无效");
   }
@@ -194,8 +217,11 @@ function parseCurrentState(value: unknown): CurrentState {
       isRecord(item) &&
       typeof item.advice_id === "string" &&
       typeof item.code === "string" &&
+      A_SHARE_CODE.test(item.code) &&
       typeof item.action === "string" &&
       isFiniteNumber(item.confidence) &&
+      item.confidence >= 0 &&
+      item.confidence <= 1 &&
       typeof item.rationale === "string" &&
       Array.isArray(item.evidence_ids) &&
       item.evidence_ids.every((id) => typeof id === "string"),
@@ -214,11 +240,10 @@ function parseCurrentState(value: unknown): CurrentState {
     (item) =>
       isRecord(item) &&
       typeof item.check_name === "string" &&
-      typeof item.severity === "string" &&
-      typeof item.status === "string" &&
-      typeof item.created_at === "string",
+      item.severity === "blocking" &&
+      item.status === "failed" &&
+      isBoundedTimestamp(item.created_at),
   );
-  const validHealth = Object.values(value.health).every((item) => typeof item === "string");
   const adviceFieldsAgree = value.advice_status === "passed"
     ? value.blocking_quality_checks.length === 0
     : value.advice.length === 0;
@@ -232,8 +257,7 @@ function parseCurrentState(value: unknown): CurrentState {
     (chartList.status === "degraded" && value.charts.length !== 0) ||
     !value.reports.every(isReportLink) ||
     !value.profiles.every(isProfileLink) ||
-    !value.charts.every(isChartLink) ||
-    !validHealth
+    !value.charts.every(isChartLink)
   ) {
     throw new Error("当前状态格式无效");
   }
@@ -498,9 +522,9 @@ function App() {
       </section>
 
       <section className="resources">
-        <div><h2><BookOpen size={18} />报告</h2>{reports.length === 0 ? <p className="empty">暂无报告</p> : <ul className="link-list">{reports.map((report) => <li key={report.href}><a href={report.href} target="_blank" rel="noreferrer">{report.report_date} {report.report_type === "premarket" ? "盘前" : "复盘"}<ExternalLink size={14} /></a></li>)}</ul>}</div>
-        <div><h2><Users size={18} />股票档案</h2>{profiles.length === 0 ? <p className="empty">暂无档案</p> : <ul className="link-list">{profiles.map((profile) => <li key={profile.href}><a href={profile.href} target="_blank" rel="noreferrer">{profile.code} {profile.name}<ExternalLink size={14} /></a></li>)}</ul>}</div>
-        <div><h2><Activity size={18} />K线图</h2>{charts.length === 0 ? <p className="empty">暂无图表</p> : <ul className="link-list">{charts.map((chart) => <li key={chart.href}><a href={chart.href} target="_blank" rel="noreferrer">{chart.code} K线 · {chart.as_of}<ExternalLink size={14} /></a></li>)}</ul>}</div>
+        <div><h2><BookOpen size={18} />报告</h2>{!snapshotCurrent ? <p className="unavailable-message">报告资源不可用，当前快照已失效</p> : state.report_list.status !== "ok" ? <p className="unavailable-message">报告列表已降级，暂不可用</p> : reports.length === 0 ? <p className="empty">暂无报告</p> : <ul className="link-list">{reports.map((report) => <li key={report.href}><a href={report.href} target="_blank" rel="noreferrer">{report.report_date} {report.report_type === "premarket" ? "盘前" : "复盘"}<ExternalLink size={14} /></a></li>)}</ul>}</div>
+        <div><h2><Users size={18} />股票档案</h2>{!snapshotCurrent ? <p className="unavailable-message">档案资源不可用，当前快照已失效</p> : state.profile_list.status !== "ok" ? <p className="unavailable-message">档案列表已降级，暂不可用</p> : profiles.length === 0 ? <p className="empty">暂无档案</p> : <ul className="link-list">{profiles.map((profile) => <li key={profile.href}><a href={profile.href} target="_blank" rel="noreferrer">{profile.code} {profile.name}<ExternalLink size={14} /></a></li>)}</ul>}</div>
+        <div><h2><Activity size={18} />K线图</h2>{!snapshotCurrent ? <p className="unavailable-message">图表资源不可用，当前快照已失效</p> : state.chart_list.status !== "ok" ? <p className="unavailable-message">图表列表已降级，暂不可用</p> : charts.length === 0 ? <p className="empty">暂无图表</p> : <ul className="link-list">{charts.map((chart) => <li key={chart.href}><a href={chart.href} target="_blank" rel="noreferrer">{chart.code} K线 · {chart.as_of}<ExternalLink size={14} /></a></li>)}</ul>}</div>
       </section>
       <section className="ledger-tools">
         <ManualLedgerForm onSaved={() => loadState()} />

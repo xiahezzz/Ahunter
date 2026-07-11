@@ -243,6 +243,56 @@ describe("advisor dashboard", () => {
   });
 
   it.each([
+    ["advice code", { advice: [{ ...currentState.advice[0], code: "SH600519" }] }],
+    ["negative confidence", { advice: [{ ...currentState.advice[0], confidence: -0.01 }] }],
+    ["excessive confidence", { advice: [{ ...currentState.advice[0], confidence: 1.01 }] }],
+  ])("rejects malformed %s without rendering advice or metrics", async (_label, override) => {
+    mockFetch(response({ ...currentState, ...override }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByText("等待量价确认")).not.toBeInTheDocument();
+    expect(screen.queryByText("¥89,995.00")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["severity", { severity: "warning" }],
+    ["status", { status: "passed" }],
+    ["timestamp", { created_at: "not-a-timestamp" }],
+  ])("rejects a blocking quality check with malformed %s", async (_label, checkOverride) => {
+    mockFetch(response({
+      ...currentState,
+      advice_status: "blocked",
+      advice: [],
+      blocking_quality_checks: [{
+        check_name: "market_stale",
+        severity: "blocking",
+        status: "failed",
+        created_at: "2026-07-12T08:31:00+08:00",
+        ...checkOverride,
+      }],
+    }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByText("market_stale")).not.toBeInTheDocument();
+    expect(screen.queryByText("¥89,995.00")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["overall status", { status: "unexpected" }],
+    ["service", { service: "other-api" }],
+    ["component status", { collector: "busy" }],
+  ])("rejects malformed health %s", async (_label, healthOverride) => {
+    mockFetch(response({ ...currentState, health: { ...currentState.health, ...healthOverride } }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByText("等待量价确认")).not.toBeInTheDocument();
+    expect(screen.queryByText("¥89,995.00")).not.toBeInTheDocument();
+  });
+
+  it.each([
     ["profile", { profile_list: { status: "degraded" }, profiles: currentState.profiles }],
     ["chart", { chart_list: { status: "degraded" }, charts: currentState.charts }],
   ])("suppresses %s links when the parent list is degraded", async (_label, override) => {
@@ -324,6 +374,51 @@ describe("advisor dashboard", () => {
     expect(screen.queryByText("4 条")).not.toBeInTheDocument();
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(screen.getByText("请刷新成功后再查看建议、账户指标和资源链接")).toBeInTheDocument();
+  });
+
+  it("reserves empty resource messages for available empty lists", async () => {
+    mockFetch(response({ ...currentState, reports: [], profiles: [], charts: [] }));
+    render(<App />);
+
+    expect(await screen.findByText("暂无报告")).toBeInTheDocument();
+    expect(screen.getByText("暂无档案")).toBeInTheDocument();
+    expect(screen.getByText("暂无图表")).toBeInTheDocument();
+    expect(screen.queryByText(/列表已降级/)).not.toBeInTheDocument();
+  });
+
+  it("renders unavailable messages for degraded resource parents", async () => {
+    mockFetch(response({
+      ...currentState,
+      reports: [],
+      report_list: { status: "degraded", truncated: true },
+      profiles: [],
+      profile_list: { status: "degraded" },
+      charts: [],
+      chart_list: { status: "degraded" },
+    }));
+    render(<App />);
+
+    expect(await screen.findByText("报告列表已降级，暂不可用")).toBeInTheDocument();
+    expect(screen.getByText("档案列表已降级，暂不可用")).toBeInTheDocument();
+    expect(screen.getByText("图表列表已降级，暂不可用")).toBeInTheDocument();
+    expect(screen.queryByText("暂无报告")).not.toBeInTheDocument();
+    expect(screen.queryByText("暂无档案")).not.toBeInTheDocument();
+    expect(screen.queryByText("暂无图表")).not.toBeInTheDocument();
+  });
+
+  it("renders unavailable resource messages for a stale snapshot", async () => {
+    mockFetch(response(currentState), new Error("refresh offline"));
+    render(<App />);
+    await screen.findByText("等待量价确认");
+
+    await userEvent.click(screen.getByRole("button", { name: "刷新当前状态" }));
+
+    expect(await screen.findByText("报告资源不可用，当前快照已失效")).toBeInTheDocument();
+    expect(screen.getByText("档案资源不可用，当前快照已失效")).toBeInTheDocument();
+    expect(screen.getByText("图表资源不可用，当前快照已失效")).toBeInTheDocument();
+    expect(screen.queryByText("暂无报告")).not.toBeInTheDocument();
+    expect(screen.queryByText("暂无档案")).not.toBeInTheDocument();
+    expect(screen.queryByText("暂无图表")).not.toBeInTheDocument();
   });
 
   it("keeps a stale snapshot suppressed until a retry succeeds", async () => {
