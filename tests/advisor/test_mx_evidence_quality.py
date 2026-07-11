@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from advisor.evidence.mx_adapter import read_mx_events
-from advisor.quality import has_blocking_failure
+from advisor.quality import evaluate_quality, has_blocking_failure
 
 
 def make_events_db(path: Path) -> None:
@@ -47,3 +47,50 @@ def test_quality_blocks_when_required_history_missing(tmp_path: Path):
         required_codes=["600519"],
         as_of="2026-07-11T08:30:00+08:00",
     )
+
+
+def make_quality_db(path: Path, rows: list[tuple[str, str]]) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE market_daily (code TEXT, trade_date TEXT);
+        CREATE TABLE ledger_transactions (transaction_id TEXT);
+        """
+    )
+    connection.executemany(
+        "INSERT INTO market_daily (code, trade_date) VALUES (?, ?)",
+        rows,
+    )
+    return connection
+
+
+def test_quality_blocks_when_only_recent_market_row_exists(tmp_path: Path):
+    connection = make_quality_db(
+        tmp_path / "advisor.sqlite",
+        [("600519", "2026-07-10")],
+    )
+
+    results = evaluate_quality(
+        connection,
+        required_codes=["600519"],
+        as_of="2026-07-11T08:30:00+08:00",
+    )
+
+    assert results[0].blocking_failure is True
+    assert results[0].passed is False
+
+
+def test_quality_passes_with_recent_and_three_year_boundary_rows(tmp_path: Path):
+    connection = make_quality_db(
+        tmp_path / "advisor.sqlite",
+        [("600519", "2023-07-11"), ("600519", "2026-07-10")],
+    )
+
+    results = evaluate_quality(
+        connection,
+        required_codes=["600519"],
+        as_of="2026-07-11T08:30:00+08:00",
+    )
+
+    assert results[0].blocking_failure is False
+    assert results[0].passed is True

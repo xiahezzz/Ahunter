@@ -84,3 +84,55 @@ Result:
 
 - `NormalizedEvent.as_of` currently carries the collector `received_at` integer as a string because the brief’s snippet and tests only require deterministic pass-through, not timestamp normalization.
 - `evaluate_quality(...)` currently checks for any `market_daily` history rather than enforcing a true three-year window. That matches the provided brief snippet and tests, but a later task may need a stricter rule once the final data-quality contract is specified.
+
+## Fix After Review
+
+Addressed the controller-approved design requirement that `evaluate_quality(connection, required_codes, as_of)` must block unless each required code has both:
+
+- at least one `market_daily` row with `trade_date <= as_of_date`
+- at least one `market_daily` row with `trade_date <= as_of_date - 3 years`
+
+Implementation notes:
+
+- parsed `as_of` with `datetime.fromisoformat(...).date()`
+- computed the three-year cutoff with `date.replace(year=year - 3)`
+- handled Feb 29 by falling back to Feb 28
+- kept zero-row behavior blocking
+- made the gate deterministic with explicit existence checks instead of a raw row count
+
+Added coverage for the review gap:
+
+- a single recent row is still a blocking failure
+- a row exactly three years before `as_of` plus a recent row passes
+
+RED command and output:
+
+```bash
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py -q
+```
+
+```text
+..F.                                                                     [100%]
+FAILED tests/advisor/test_mx_evidence_quality.py::test_quality_blocks_when_only_recent_market_row_exists
+1 failed, 3 passed in 0.06s
+```
+
+GREEN targeted command and output:
+
+```bash
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py -q
+```
+
+```text
+4 passed in 0.04s
+```
+
+Regression command and output:
+
+```bash
+.venv311/bin/python -m pytest tests/advisor -q
+```
+
+```text
+12 passed in 0.17s
+```
