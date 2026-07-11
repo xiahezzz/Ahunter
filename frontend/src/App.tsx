@@ -95,9 +95,13 @@ function isStatusCount(value: unknown): value is StatusCount {
 }
 
 const HEALTH_STATUSES = new Set<unknown>(["ok", "healthy", "running", "degraded", "failed", "stopped", "unknown"]);
+const HEALTH_COMPONENTS = ["collector", "market_updater", "advisor_scheduler", "frontend", "api"] as const;
+const HEALTH_KEYS = new Set(["status", "service", ...HEALTH_COMPONENTS]);
 
 function isHealth(value: unknown): value is Health {
   return isRecord(value) &&
+    Object.keys(value).length === HEALTH_KEYS.size &&
+    Object.keys(value).every((key) => HEALTH_KEYS.has(key)) &&
     value.status === "ok" &&
     value.service === "advisor-api" &&
     HEALTH_STATUSES.has(value.collector) &&
@@ -518,7 +522,7 @@ function App() {
           )}
         </article>
         <article className="panel quality-panel"><h2><ShieldAlert size={18} />质量检查</h2>{!snapshotCurrent ? <p className="unavailable-message">质量状态不可用</p> : state.blocking_quality_checks.length === 0 ? <p className="healthy">无阻断项</p> : <ul className="plain-list">{state.blocking_quality_checks.map((check) => <li key={`${check.check_name}-${check.created_at}`}><strong>{check.check_name}</strong><span>{statusLabel(check.status)}</span><small>{check.created_at}</small></li>)}</ul>}</article>
-        <article className="panel health-panel"><h2><HeartPulse size={18} />进程健康</h2>{!snapshotCurrent ? <p className="unavailable-message">进程状态不可用</p> : <dl className="status-list">{Object.entries(state.health).filter(([name]) => !["status", "service"].includes(name)).map(([name, status]) => <div key={name}><dt>{name}</dt><dd className={statusClass(status)}>{statusLabel(status)}</dd></div>)}</dl>}</article>
+        <article className="panel health-panel"><h2><HeartPulse size={18} />进程健康</h2>{!snapshotCurrent ? <p className="unavailable-message">进程状态不可用</p> : <dl className="status-list">{HEALTH_COMPONENTS.map((name) => <div key={name}><dt>{name}</dt><dd className={statusClass(state.health[name])}>{statusLabel(state.health[name])}</dd></div>)}</dl>}</article>
       </section>
 
       <section className="resources">

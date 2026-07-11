@@ -292,6 +292,16 @@ describe("advisor dashboard", () => {
     expect(screen.queryByText("¥89,995.00")).not.toBeInTheDocument();
   });
 
+  it("rejects health payloads with extra component keys", async () => {
+    mockFetch(response({ ...currentState, health: { ...currentState.health, worker_token: "unknown" } }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByText("等待量价确认")).not.toBeInTheDocument();
+    expect(screen.queryByText("¥89,995.00")).not.toBeInTheDocument();
+    expect(screen.queryByText("worker_token")).not.toBeInTheDocument();
+  });
+
   it.each([
     ["profile", { profile_list: { status: "degraded" }, profiles: currentState.profiles }],
     ["chart", { chart_list: { status: "degraded" }, charts: currentState.charts }],

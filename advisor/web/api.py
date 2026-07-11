@@ -43,6 +43,8 @@ _MAX_CURRENT_RUN_CANDIDATES = 100
 _MAX_CURRENT_QUALITY_CHECKS = 100
 _MAX_QUALITY_DETAILS_BYTES = 64 * 1024
 _MAX_CURRENT_REPORT_LINKS = 20
+_MAX_CURRENT_PROFILE_LINKS = 100
+_MAX_CURRENT_CHART_LINKS = 100
 _CURRENT_REPORT_LOOKBACK_DAYS = 30
 _MAX_PROFILE_JSON_BYTES = 64 * 1024
 _MAX_PROFILE_JSON_DEPTH = 8
@@ -835,10 +837,13 @@ def _read_profile_links_with_status(
             FROM stock_profiles
             LEFT JOIN securities ON securities.code = stock_profiles.code
             ORDER BY stock_profiles.code
-            LIMIT 100
-            """
+            LIMIT ?
+            """,
+            (_MAX_CURRENT_PROFILE_LINKS + 1 if dashboard_contract else _MAX_CURRENT_PROFILE_LINKS,),
         ).fetchall()
     except sqlite3.Error:
+        return [], {"status": "degraded"}
+    if dashboard_contract and len(rows) > _MAX_CURRENT_PROFILE_LINKS:
         return [], {"status": "degraded"}
     profiles = []
     for row in rows:
@@ -976,10 +981,13 @@ def _read_chart_links_with_status(
             SELECT asset_id, code, chart_type, as_of, path
             FROM chart_assets
             ORDER BY as_of DESC, asset_id ASC
-            LIMIT 100
-            """
+            LIMIT ?
+            """,
+            (_MAX_CURRENT_CHART_LINKS + 1 if dashboard_contract else _MAX_CURRENT_CHART_LINKS,),
         ).fetchall()
     except sqlite3.Error:
+        return [], {"status": "degraded"}
+    if dashboard_contract and len(rows) > _MAX_CURRENT_CHART_LINKS:
         return [], {"status": "degraded"}
     charts = []
     for row in rows:
@@ -993,7 +1001,11 @@ def _read_chart_links_with_status(
             and isinstance(row["code"], str)
             and code_pattern.fullmatch(row["code"])
             and valid_chart_type
-            and _valid_db_timestamp(row["as_of"])
+            and (
+                _valid_dashboard_date(row["as_of"])
+                if dashboard_contract
+                else _valid_db_timestamp(row["as_of"])
+            )
             and _safe_chart_path(row["path"], state_dir) is not None
         ):
             return [], {"status": "degraded"}
@@ -1177,6 +1189,15 @@ def _valid_db_timestamp(value: object) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _valid_dashboard_date(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
 
 
 def _valid_account_id(value: object) -> bool:

@@ -325,6 +325,26 @@ def test_current_state_degrades_profile_list_for_prefixed_code(tmp_path):
     assert payload["profiles"] == []
 
 
+def test_current_state_degrades_profile_list_for_invalid_row_after_display_cap(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.executemany(
+        "INSERT INTO stock_profiles (code, updated_at) VALUES (?, ?)",
+        [
+            (f"{600000 + index:06d}", "2026-07-12T08:30:00+08:00")
+            for index in range(100)
+        ] + [("SH600519", "2026-07-12T08:30:00+08:00")],
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["profile_list"] == {"status": "degraded"}
+    assert payload["profiles"] == []
+
+
 @pytest.mark.parametrize(
     ("payload", "constant", "bound"),
     [
@@ -487,6 +507,49 @@ def test_current_state_degrades_chart_list_for_non_kline_chart(tmp_path):
     connection.execute(
         "INSERT INTO chart_assets (asset_id, code, chart_type, as_of, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         ("chart-thumbnail", "600519", "thumbnail", "2026-07-12", str(chart_path), "2026-07-12T08:30:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["chart_list"] == {"status": "degraded"}
+    assert payload["charts"] == []
+
+
+def test_current_state_degrades_chart_list_for_timestamp_as_of(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    chart_path = tmp_path / "charts" / "timestamp-as-of.png"
+    chart_path.parent.mkdir()
+    chart_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO chart_assets (asset_id, code, chart_type, as_of, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("chart-timestamp", "600519", "kline", "2026-07-12T08:30:00+08:00", str(chart_path), "2026-07-12T08:30:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["chart_list"] == {"status": "degraded"}
+    assert payload["charts"] == []
+
+
+def test_current_state_degrades_chart_list_when_display_cap_is_exceeded(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    chart_path = tmp_path / "charts" / "overflow.png"
+    chart_path.parent.mkdir()
+    chart_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+    connection = sqlite3.connect(db_path)
+    connection.executemany(
+        "INSERT INTO chart_assets (asset_id, code, chart_type, as_of, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (f"chart-{index:03d}", "600519", "kline", "2026-07-12", str(chart_path), "2026-07-12T08:30:00+08:00")
+            for index in range(101)
+        ],
     )
     connection.commit()
     connection.close()
