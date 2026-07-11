@@ -1,9 +1,14 @@
+import asyncio
+import inspect
+import os
 import sqlite3
 import tomllib
 from datetime import date, datetime
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from fastapi.responses import StreamingResponse
+import pytest
 
 from advisor import paths as advisor_paths
 from advisor.db.migrate import migrate_database
@@ -196,6 +201,33 @@ def test_chart_route_streams_descriptor_pinned_bytes_during_replacement_race(tmp
     assert response.content == original
 
 
+def test_chart_stream_closes_descriptor_when_asgi_send_fails(tmp_path):
+    path = tmp_path / "chart.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\npayload")
+    descriptor = os.open(path, os.O_RDONLY)
+    stream = web_api._stream_descriptor(descriptor)
+
+    async def run_response():
+        response = StreamingResponse(stream, media_type="image/png")
+
+        async def receive():
+            await asyncio.sleep(60)
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise RuntimeError("send failed")
+
+        try:
+            await response({"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "http", "path": "/", "raw_path": b"/", "query_string": b"", "headers": [], "client": ("test", 1), "server": ("test", 80)}, receive, send)
+        except RuntimeError:
+            pass
+
+    assert inspect.isasyncgen(stream)
+    asyncio.run(run_response())
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
 def test_ledger_routes_store_valid_local_transactions_and_reject_oversells(tmp_path):
     client = TestClient(create_app(tmp_path))
     deposit = {
@@ -319,6 +351,26 @@ def test_report_and_ledger_lists_enforce_bounded_limit_and_offset(tmp_path):
     assert client.get("/api/reports?offset=1001").status_code == 422
 
 
+def test_ledger_replay_cap_returns_degraded_error_without_unbounded_history(tmp_path, monkeypatch):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute("INSERT INTO ledger_accounts (account_id, name, created_at) VALUES (?, ?, ?)", ("default", "default", "2026-07-10T08:30:00"))
+    for transaction_id, trade_date in (("cash-1", "2026-07-10"), ("cash-2", "2026-07-11")):
+        connection.execute(
+            "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, transaction_type, quantity, price, amount, fees, source, created_at) VALUES (?, ?, ?, 'cash_deposit', 0, 0, 1, 0, 'manual', ?)",
+            (transaction_id, "default", trade_date, f"{trade_date}T08:30:00"),
+        )
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr(web_api, "_MAX_LEDGER_REPLAY_ROWS", 1, raising=False)
+
+    response = TestClient(create_app(tmp_path)).get("/api/ledger/transactions")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "ledger history exceeds replay limit"
+
+
 def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
@@ -421,6 +473,28 @@ def test_current_state_ignores_yesterday_quality_failure_for_today_passed_report
     assert payload["advice"] == [advice[0].to_dict()]
     assert payload["advice_status"] == "passed"
     assert payload["blocking_quality_checks"] == []
+
+
+def test_current_blocked_run_without_checks_fails_closed(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    today = date.today().isoformat()
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "fixture", ["evidence-1"])]
+    write_premarket_report(today, advice, reports_root, quality_results=[QualityResult("market", "blocking", True, "current")])
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("blocked-run", "premarket", today, "blocked", "2026-07-11T08:30:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice"] == []
+    assert payload["advice_status"] == "blocked"
 
 
 def test_current_state_fails_closed_for_malformed_report_quality(tmp_path, monkeypatch):

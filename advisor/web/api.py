@@ -27,6 +27,7 @@ _ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _MAX_IMPORT_TRANSACTIONS = 500
 _LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
+_MAX_LEDGER_REPLAY_ROWS = 10_000
 _MAX_CHART_BYTES = 5 * 1024 * 1024
 
 
@@ -106,7 +107,11 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
         connection = _read_connection(resolved_state_dir / "advisor.sqlite")
         try:
             rows = _read_ledger_records(connection, limit=limit, offset=offset)
-            return {"transactions": rows, "ledger": _read_ledger_state(connection)}
+            try:
+                ledger = _read_ledger_state(connection)
+            except _LedgerCapacityError:
+                raise HTTPException(status_code=503, detail="ledger history exceeds replay limit") from None
+            return {"transactions": rows, "ledger": ledger}
         finally:
             if connection is not None:
                 connection.close()
@@ -170,10 +175,13 @@ def _current_state(state_dir: Path) -> dict:
     health = _health_payload(state_dir)
     connection = _read_connection(state_dir / "advisor.sqlite")
     try:
-        ledger = _read_ledger_state(connection)
+        try:
+            ledger = _read_ledger_state(connection)
+        except _LedgerCapacityError:
+            ledger = {**_empty_ledger_state(), "status": "degraded"}
         flows = _read_flows(connection)
-        premarket_checks = _read_blocking_quality_checks(connection, today, "premarket")
-        review_checks = _read_blocking_quality_checks(connection, today, "review")
+        premarket_quality = _read_current_run_quality(connection, today, "premarket")
+        review_quality = _read_current_run_quality(connection, today, "review")
         profiles = _read_profile_links(connection)
         charts = _read_chart_links(connection, state_dir)
     finally:
@@ -185,9 +193,11 @@ def _current_state(state_dir: Path) -> dict:
     review = _latest_report(today, "review", reports)
     premarket_status = _report_status(premarket)
     review_status = _report_status(review)
-    premarket_blocked = bool(premarket_checks) or premarket_status == "blocked"
-    review_blocked = bool(review_checks) or review_status == "blocked"
-    checks = premarket_checks + [check for check in review_checks if check not in premarket_checks]
+    premarket_blocked = not premarket_quality["safe"] or premarket_status == "blocked"
+    review_blocked = not review_quality["safe"] or review_status == "blocked"
+    checks = premarket_quality["blocking_checks"] + [
+        check for check in review_quality["blocking_checks"] if check not in premarket_quality["blocking_checks"]
+    ]
     return {
         "today": today,
         "advice": [] if premarket_blocked else premarket["json"].get("advice", []) if premarket else [],
@@ -221,13 +231,7 @@ def _read_ledger_state(connection: sqlite3.Connection | None) -> dict:
     if connection is None:
         return _empty_ledger_state()
     try:
-        rows = connection.execute(
-            f"""
-            SELECT transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees
-            FROM ledger_transactions
-            ORDER BY {_LEDGER_ORDER_BY}
-            """
-        ).fetchall()
+        rows = _read_capped_ledger_history(connection)
     except sqlite3.Error:
         return _empty_ledger_state()
     return _derive_ledger_state(rows, connection)
@@ -265,6 +269,25 @@ class _LedgerValidationError(ValueError):
 
 class _LedgerConflictError(ValueError):
     pass
+
+
+class _LedgerCapacityError(ValueError):
+    pass
+
+
+def _read_capped_ledger_history(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    rows = connection.execute(
+        f"""
+        SELECT transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees
+        FROM ledger_transactions
+        ORDER BY {_LEDGER_ORDER_BY}
+        LIMIT ?
+        """,
+        (_MAX_LEDGER_REPLAY_ROWS + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_LEDGER_REPLAY_ROWS:
+        raise _LedgerCapacityError("ledger history exceeds replay limit")
+    return rows
 
 
 def _transaction_from_payload(payload: object) -> tuple[str, LedgerTransaction]:
@@ -315,13 +338,7 @@ def _write_ledger_transactions(
     except sqlite3.Error as error:
         raise _LedgerConflictError("ledger unavailable") from error
     try:
-        existing_rows = connection.execute(
-            f"""
-            SELECT transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees
-            FROM ledger_transactions
-            ORDER BY {_LEDGER_ORDER_BY}
-            """
-        ).fetchall()
+        existing_rows = _read_capped_ledger_history(connection)
         existing_ids = {row["transaction_id"] for row in existing_rows}
         if existing_ids.intersection(transaction_ids):
             raise _LedgerConflictError("duplicate transaction id")
@@ -354,11 +371,14 @@ def _write_ledger_transactions(
                 ),
             )
         connection.commit()
-        rows = _read_ledger_records(connection)
+        rows = _read_ledger_records(connection, limit=min(len(transactions), 100))
         result = {"transactions": rows, "ledger": _read_ledger_state(connection)}
     except _LedgerConflictError:
         connection.rollback()
         raise
+    except _LedgerCapacityError as error:
+        connection.rollback()
+        raise _LedgerConflictError("ledger history exceeds replay limit") from error
     except (sqlite3.Error, ValueError) as error:
         connection.rollback()
         raise _LedgerValidationError("invalid transaction") from error
@@ -499,33 +519,55 @@ def _flow_status(connection: sqlite3.Connection | None, table: str) -> dict:
     return {"status": "ok", "count": int(count)}
 
 
-def _read_blocking_quality_checks(connection: sqlite3.Connection | None, as_of: str, run_type: str) -> list[dict]:
+def _read_current_run_quality(connection: sqlite3.Connection | None, as_of: str, run_type: str) -> dict:
     if connection is None:
-        return []
+        return {"safe": True, "blocking_checks": []}
+    try:
+        run = connection.execute(
+            """
+            SELECT run_id, run_type, status
+            FROM advisor_runs
+            WHERE as_of = ? AND run_type = ?
+                ORDER BY started_at DESC, run_id DESC
+                LIMIT 50
+                """,
+                (as_of, run_type),
+        ).fetchone()
+    except sqlite3.Error:
+        return {"safe": False, "blocking_checks": []}
+    if run is None:
+        return {"safe": True, "blocking_checks": []}
     try:
         rows = connection.execute(
             """
-            SELECT checks.check_name, checks.severity, checks.status, checks.created_at
-            FROM data_quality_checks AS checks
-            JOIN advisor_runs AS runs ON runs.run_id = checks.run_id
-            WHERE checks.severity = 'blocking'
-              AND checks.status = 'failed'
-              AND checks.run_id = (
-                SELECT run_id
-                FROM advisor_runs
-                WHERE as_of = ? AND run_type = ?
-                ORDER BY started_at DESC, run_id DESC
-                LIMIT 1
-              )
-            ORDER BY checks.created_at DESC, checks.check_name ASC
+            SELECT check_name, severity, status, created_at
+            FROM data_quality_checks
+            WHERE run_id = ?
+            ORDER BY created_at DESC, check_name ASC
             LIMIT 50
-            """
-            ,
-            (as_of, run_type),
+            """,
+            (run["run_id"],),
         ).fetchall()
     except sqlite3.Error:
-        return []
-    return [dict(row) for row in rows]
+        return {"safe": False, "blocking_checks": []}
+    if not rows:
+        return {"safe": False, "blocking_checks": []}
+    checks = [dict(row) for row in rows]
+    if not all(
+        isinstance(check["check_name"], str)
+        and bool(check["check_name"])
+        and check["severity"] in {"blocking", "warning", "info"}
+        and check["status"] in {"passed", "failed"}
+        and isinstance(check["created_at"], str)
+        for check in checks
+    ):
+        return {"safe": False, "blocking_checks": []}
+    return {
+        "safe": run["run_type"] == run_type
+        and run["status"] == "passed"
+        and not any(check["severity"] == "blocking" and check["status"] == "failed" for check in checks),
+        "blocking_checks": [check for check in checks if check["severity"] == "blocking" and check["status"] == "failed"],
+    }
 
 
 def _read_profile_links(connection: sqlite3.Connection | None) -> list[dict]:
@@ -691,7 +733,7 @@ def _open_contained_regular_fd(root: Path, relative: Path) -> int:
         raise
 
 
-def _stream_descriptor(descriptor: int):
+async def _stream_descriptor(descriptor: int):
     try:
         while chunk := os.read(descriptor, 64 * 1024):
             yield chunk

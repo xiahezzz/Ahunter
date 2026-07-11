@@ -375,7 +375,7 @@ def list_verified_archives(output_dir: Path) -> list[dict]:
     root = _validated_root_path(output_dir)
     root_fd = _open_existing_root_fd(root)
     try:
-        report_dates = sorted(os.listdir(root_fd), reverse=True)
+        report_dates = _bounded_directory_names(root_fd, _MAX_ARCHIVE_CANDIDATES, reverse=True)
     finally:
         os.close(root_fd)
 
@@ -389,7 +389,7 @@ def list_verified_archives(output_dir: Path) -> list[dict]:
         try:
             root_fd, date_fd = _open_existing_report_fds(root, report_date)
             try:
-                markers = sorted(os.listdir(date_fd))
+                markers = _bounded_directory_names(date_fd, _MAX_ARCHIVE_CANDIDATES)
             finally:
                 os.close(date_fd)
                 os.close(root_fd)
@@ -424,6 +424,17 @@ def _sort_archives(archives: list[dict]) -> list[dict]:
         key=lambda archive: (archive["report_date"], archive["report_type"], archive["run_id"]),
         reverse=True,
     )
+
+
+def _bounded_directory_names(directory_fd: int, limit: int, *, reverse: bool = False) -> list[str]:
+    names: list[str] = []
+    with os.scandir(os.dup(directory_fd)) as entries:
+        while len(names) < limit:
+            try:
+                names.append(next(entries).name)
+            except StopIteration:
+                break
+    return sorted(names, reverse=reverse)
 
 
 def _validate_predecessor_archive(

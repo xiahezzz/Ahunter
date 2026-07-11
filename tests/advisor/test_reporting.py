@@ -148,6 +148,40 @@ def test_list_verified_archives_bounds_candidate_verification(tmp_path: Path, mo
     assert len(archives) == 1
 
 
+def test_list_verified_archives_stops_scandir_before_unbounded_materialization(tmp_path: Path, monkeypatch):
+    archive_morning_advice(tmp_path)
+    write_review_report("2026-07-11", [], [], tmp_path, quality_results=passing_quality())
+    monkeypatch.setattr(contracts, "_MAX_ARCHIVE_CANDIDATES", 1)
+    original_scandir = contracts.os.scandir
+    advances = []
+
+    def tracking_scandir(directory):
+        context = original_scandir(directory)
+
+        class TrackingIterator:
+            def __enter__(self):
+                self.iterator = context.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return context.__exit__(*args)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                advances.append(directory)
+                return next(self.iterator)
+
+        return TrackingIterator()
+
+    monkeypatch.setattr(contracts.os, "scandir", tracking_scandir)
+    archives = contracts.list_verified_archives(tmp_path)
+
+    assert len(archives) == 1
+    assert len(advances) == 2
+
+
 def test_write_review_report_links_to_morning_advice(tmp_path: Path):
     advice = [AdviceItem("adv-1", "600519", "watch", 0.72, "morning rationale", ["ev-1"])]
     archive_morning_advice(tmp_path, advice)
