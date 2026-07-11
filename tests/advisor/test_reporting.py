@@ -101,6 +101,18 @@ def test_write_premarket_report_archives_markdown_and_json(tmp_path: Path):
     }
 
 
+def test_read_verified_archive_returns_only_marker_verified_contents(tmp_path: Path):
+    paths = archive_morning_advice(tmp_path)
+
+    archive = contracts.read_verified_archive(tmp_path, "2026-07-11", "premarket", "initial")
+
+    assert archive["report_date"] == "2026-07-11"
+    assert archive["report_type"] == "premarket"
+    assert archive["run_id"] == "initial"
+    assert archive["json"] == json.loads(paths.json_path.read_text(encoding="utf-8"))
+    assert "08:30 Premarket Advice" in archive["markdown"]
+
+
 def test_write_review_report_links_to_morning_advice(tmp_path: Path):
     advice = [AdviceItem("adv-1", "600519", "watch", 0.72, "morning rationale", ["ev-1"])]
     archive_morning_advice(tmp_path, advice)

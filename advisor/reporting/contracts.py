@@ -15,6 +15,10 @@ from advisor.quality import QualityResult
 
 
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+_REPORT_TYPES = frozenset({"premarket", "review", "failure"})
+_MARKER_NAME_RE = re.compile(
+    r"(?P<report_type>premarket|review|failure)(?:\.(?P<run_id>[A-Za-z0-9][A-Za-z0-9_-]{0,63}))?\.complete\.json\Z"
+)
 _QUALITY_SEVERITIES = frozenset({"blocking", "warning", "info"})
 _NATIVE_DIR_FD_SUPPORT = all(
     function in os.supports_dir_fd for function in (os.open, os.mkdir, os.link, os.stat, os.unlink, os.rmdir)
@@ -315,6 +319,93 @@ def validate_run_id(run_id: str) -> None:
     _validate_run_id(run_id)
 
 
+def read_verified_archive(
+    output_dir: Path,
+    report_date: str,
+    report_type: str,
+    run_id: str = "initial",
+) -> dict:
+    """Read an immutable report archive only after its completion marker verifies it."""
+    _require_filesystem_capabilities()
+    _validate_report_date(report_date)
+    _validate_report_type(report_type)
+    _validate_run_id(run_id)
+    root = _validated_root_path(output_dir)
+    root_fd, date_fd = _open_existing_report_fds(root, report_date)
+    try:
+        names = _archive_names(report_type, run_id)
+        _validate_complete_archive_fd(date_fd, names, report_type, report_date, run_id)
+        try:
+            payload = json.loads(_read_regular_bytes(date_fd, names["json"]).decode("utf-8"))
+            markdown = _read_regular_bytes(date_fd, names["markdown"]).decode("utf-8")
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid report archive") from error
+    except (OSError, ValueError) as error:
+        raise ValueError("invalid report archive") from error
+    finally:
+        os.close(date_fd)
+        os.close(root_fd)
+
+    if not isinstance(payload, dict):
+        raise ValueError("invalid report archive")
+    return {
+        "report_date": report_date,
+        "report_type": report_type,
+        "run_id": run_id,
+        "json": payload,
+        "markdown": markdown,
+    }
+
+
+def list_verified_archives(output_dir: Path) -> list[dict]:
+    """Return metadata for complete, immutable report archives without writing to disk."""
+    _require_filesystem_capabilities()
+    root = _validated_root_path(output_dir)
+    root_fd = _open_existing_root_fd(root)
+    try:
+        report_dates = sorted(os.listdir(root_fd), reverse=True)
+    finally:
+        os.close(root_fd)
+
+    archives: list[dict] = []
+    for report_date in report_dates:
+        try:
+            _validate_report_date(report_date)
+        except ValueError:
+            continue
+        try:
+            root_fd, date_fd = _open_existing_report_fds(root, report_date)
+            try:
+                markers = sorted(os.listdir(date_fd))
+            finally:
+                os.close(date_fd)
+                os.close(root_fd)
+        except (OSError, ValueError):
+            continue
+        for marker_name in markers:
+            match = _MARKER_NAME_RE.fullmatch(marker_name)
+            if match is None:
+                continue
+            run_id = match.group("run_id") or "initial"
+            try:
+                archive = read_verified_archive(root, report_date, match.group("report_type"), run_id)
+            except ValueError:
+                continue
+            archives.append(
+                {
+                    "report_date": archive["report_date"],
+                    "report_type": archive["report_type"],
+                    "run_id": archive["run_id"],
+                    "quality_status": archive["json"].get("quality_status", "unknown"),
+                }
+            )
+    return sorted(
+        archives,
+        key=lambda archive: (archive["report_date"], archive["report_type"], archive["run_id"]),
+        reverse=True,
+    )
+
+
 def _validate_predecessor_archive(
     report_directory: Path,
     report_type: str,
@@ -446,6 +537,11 @@ def _validate_report_date(report_date: str) -> None:
         raise ValueError("invalid report_date")
 
 
+def _validate_report_type(report_type: str) -> None:
+    if report_type not in _REPORT_TYPES:
+        raise ValueError("unsupported report type")
+
+
 def _validated_root_path(output_dir: Path) -> Path:
     supplied_root = Path(output_dir)
     if ".." in supplied_root.parts:
@@ -484,6 +580,24 @@ def _open_root_fd(root: Path) -> int:
     except OSError as error:
         os.close(current_fd)
         raise ValueError("symlinked reports root") from error
+
+
+def _open_existing_root_fd(root: Path) -> int:
+    try:
+        return _open_directory(root)
+    except OSError as error:
+        raise ValueError("reports root unavailable") from error
+
+
+def _open_existing_report_fds(output_dir: Path, report_date: str) -> tuple[int, int]:
+    root_fd = _open_existing_root_fd(output_dir)
+    try:
+        date_fd = _open_directory(report_date, dir_fd=root_fd)
+        _verify_date_binding(root_fd, date_fd, report_date)
+        return root_fd, date_fd
+    except OSError as error:
+        os.close(root_fd)
+        raise ValueError("report archive unavailable") from error
 
 
 def _open_report_fds(output_dir: Path, report_date: str, *, create_date: bool) -> tuple[int, int]:
