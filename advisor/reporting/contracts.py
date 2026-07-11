@@ -410,6 +410,53 @@ def list_verified_archives(output_dir: Path, *, start_date: str | None = None, e
     return _sort_archives(archives)
 
 
+def read_active_verified_archive(output_dir: Path, report_date: str, report_type: str) -> dict:
+    root = _validated_root_path(output_dir)
+    _validate_report_date(report_date)
+    _validate_report_type(report_type)
+    root_fd, date_fd = _open_existing_report_fds(root, report_date)
+    try:
+        markers = _bounded_directory_names(date_fd, _MAX_ARCHIVE_CANDIDATES)
+    finally:
+        os.close(date_fd)
+        os.close(root_fd)
+    archives: dict[str, dict] = {}
+    predecessors: set[str] = set()
+    for marker in markers:
+        match = _MARKER_NAME_RE.fullmatch(marker)
+        if match is None or match.group("report_type") != report_type:
+            continue
+        run_id = match.group("run_id") or "initial"
+        archive = read_verified_archive(root, report_date, report_type, run_id)
+        supersession = archive["json"].get("supersession")
+        if run_id == "initial":
+            if supersession is not None:
+                raise ValueError("invalid report supersession")
+        elif not isinstance(supersession, dict) or set(supersession) != {"reason", "supersedes"} or not isinstance(supersession["reason"], str):
+            raise ValueError("invalid report supersession")
+        if run_id != "initial":
+            predecessor = supersession["supersedes"]
+            _validate_run_id(predecessor)
+            predecessors.add(predecessor)
+        archives[run_id] = archive
+    if not archives or any(predecessor not in archives for predecessor in predecessors):
+        raise ValueError("invalid report supersession")
+    heads = set(archives) - predecessors
+    if len(heads) != 1:
+        raise ValueError("invalid report supersession")
+    head = heads.pop()
+    seen: set[str] = set()
+    current = head
+    while current != "initial":
+        if current in seen:
+            raise ValueError("invalid report supersession")
+        seen.add(current)
+        current = archives[current]["json"]["supersession"]["supersedes"]
+    if set(archives) != seen | {"initial"}:
+        raise ValueError("invalid report supersession")
+    return archives[head]
+
+
 def _sort_archives(archives: list[dict]) -> list[dict]:
     return sorted(
         archives,

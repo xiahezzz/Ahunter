@@ -7,8 +7,9 @@ import re
 import sqlite3
 import stat
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -16,7 +17,7 @@ from fastapi.responses import StreamingResponse
 from advisor import paths as advisor_paths
 from advisor.db.migrate import migrate_database
 from advisor.ledger.model import LedgerTransaction, apply_transactions
-from advisor.reporting.contracts import list_verified_archives, read_verified_archive
+from advisor.reporting.contracts import list_verified_archives, read_active_verified_archive, read_verified_archive
 
 
 _COMPONENTS = ("collector", "market_updater", "advisor_scheduler", "frontend", "api")
@@ -29,6 +30,8 @@ _MAX_IMPORT_TRANSACTIONS = 500
 _LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
 _MAX_LEDGER_REPLAY_ROWS = 10_000
 _MAX_CHART_BYTES = 5 * 1024 * 1024
+_MAX_CURRENT_RUN_CANDIDATES = 100
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def create_app(state_dir: Path | None = None) -> FastAPI:
@@ -387,7 +390,23 @@ def _write_ledger_transactions(
                 ),
             )
         connection.commit()
-        rows = _read_ledger_records(connection, limit=min(len(transactions), 100))
+        rows = [
+            {
+                "transaction_id": transaction.transaction_id,
+                "account_id": account_id,
+                "trade_date": transaction.trade_date,
+                "transaction_type": transaction.transaction_type,
+                "code": transaction.code,
+                "quantity": transaction.quantity,
+                "price": transaction.price,
+                "amount": transaction.amount,
+                "fees": transaction.fees,
+            }
+            for account_id, transaction in sorted(
+                transactions,
+                key=lambda item: (item[0], item[1].trade_date, item[1].transaction_id),
+            )
+        ]
         result = {"transactions": rows, "ledger": _read_ledger_state(connection)}
     except _LedgerConflictError:
         connection.rollback()
@@ -590,25 +609,52 @@ def _current_day_run_guard(connection: sqlite3.Connection | None, today: str) ->
     if connection is None:
         return True
     try:
+        parsed_today = date.fromisoformat(today)
+        prefixes = tuple((parsed_today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1))
         rows = connection.execute(
             """
             SELECT run_id, run_type, as_of, status, started_at
             FROM advisor_runs
-            WHERE substr(as_of, 1, 10) = ?
+            WHERE substr(as_of, 1, 10) IN (?, ?, ?)
               AND run_type IN ('premarket', 'review', 'failure')
-            ORDER BY started_at DESC, run_id DESC
-            LIMIT 50
+            LIMIT ?
             """,
-            (today,),
+            (*prefixes, _MAX_CURRENT_RUN_CANDIDATES + 1),
         ).fetchall()
     except sqlite3.Error:
         return False
+    if len(rows) > _MAX_CURRENT_RUN_CANDIDATES:
+        return False
+    candidates = []
     for row in rows:
-        if not _is_current_run_date(row["as_of"], today) or row["run_type"] not in {"premarket", "review", "failure"}:
+        try:
+            as_of = _parse_shanghai_datetime(row["as_of"])
+            started = _parse_shanghai_datetime(row["started_at"])
+        except ValueError:
             return False
-        if row["status"] != "passed":
-            return False
-    return True
+        if as_of.date().isoformat() == today:
+            if row["status"] not in {"passed", "failed", "blocked", "running"}:
+                return False
+            candidates.append((started, row["run_id"], row))
+    if not candidates:
+        return True
+    latest = max(candidates, key=lambda item: (item[0], item[1]))[2]
+    return latest["status"] == "passed"
+
+
+def _parse_shanghai_datetime(value: object) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError("invalid run timestamp")
+    if len(value) == 10:
+        try:
+            return datetime.combine(date.fromisoformat(value), time.min, tzinfo=_SHANGHAI)
+        except ValueError as error:
+            raise ValueError("invalid run timestamp") from error
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + ("+00:00" if value.endswith("Z") else ""))
+    except ValueError as error:
+        raise ValueError("invalid run timestamp") from error
+    return parsed.replace(tzinfo=_SHANGHAI) if parsed.tzinfo is None else parsed.astimezone(_SHANGHAI)
 
 
 def _is_current_run_date(value: object, today: str) -> bool:
@@ -842,7 +888,7 @@ def _latest_report(today: str, report_type: str, report_links: list[dict]) -> di
 
 def _read_today_report(today: str, report_type: str) -> dict | None:
     try:
-        return read_verified_archive(advisor_paths.reports_dir(), today, report_type, "initial")
+        return read_active_verified_archive(advisor_paths.reports_dir(), today, report_type)
     except (OSError, ValueError, RuntimeError):
         return None
     candidate = candidates[0]
