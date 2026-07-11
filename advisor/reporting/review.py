@@ -8,7 +8,6 @@ from advisor.reporting.contracts import (
     ReportPaths,
     ReviewItem,
     atomic_write_pair,
-    ensure_archive_is_new,
     load_premarket_link,
     normalize_context,
     normalize_quality_results,
@@ -42,7 +41,6 @@ def write_review_report(
         supersedes=supersedes,
     )
     validate_run_id(premarket_run_id)
-    ensure_archive_is_new(paths)
     if quality_status == "passed":
         validate_unique_ids(morning_advice, "advice_id")
         validate_unique_ids(review_items, "review_id")

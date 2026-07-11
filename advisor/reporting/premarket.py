@@ -7,7 +7,6 @@ from advisor.reporting.contracts import (
     AdviceItem,
     ReportPaths,
     atomic_write_pair,
-    ensure_archive_is_new,
     normalize_context,
     normalize_quality_results,
     report_paths,
@@ -38,7 +37,6 @@ def write_premarket_report(
         rerun_reason=rerun_reason,
         supersedes=supersedes,
     )
-    ensure_archive_is_new(paths)
     if quality_status == "passed":
         validate_unique_ids(advice_items, "advice_id")
         published_advice = advice_items
