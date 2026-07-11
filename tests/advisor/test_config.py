@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from advisor.config import AdvisorConfig, load_advisor_config, resolve_state_db
+from advisor.config import (
+    AdvisorConfig,
+    load_advisor_config,
+    resolve_chart_dir,
+    resolve_profile_dir,
+    resolve_state_db,
+)
 
 
 def configured_for(database: str) -> AdvisorConfig:
@@ -49,6 +55,31 @@ def test_operational_database_cannot_escape_repository(tmp_path: Path, database:
 
     with pytest.raises(ValueError, match="database"):
         resolve_state_db(config, tmp_path)
+
+
+def test_chart_dir_cannot_escape_repository(tmp_path: Path):
+    payload = configured_for("data/advisor/advisor.sqlite").model_dump()
+    payload["storage"]["chart_dir"] = "../outside"
+    config = AdvisorConfig.model_validate(payload)
+
+    with pytest.raises(ValueError, match="chart_dir"):
+        resolve_chart_dir(config, tmp_path)
+
+
+def test_profile_dir_cannot_be_absolute_outside_repository(tmp_path: Path):
+    payload = configured_for("data/advisor/advisor.sqlite").model_dump()
+    payload["storage"]["profile_dir"] = str(tmp_path.parent / "outside-profiles")
+    config = AdvisorConfig.model_validate(payload)
+
+    with pytest.raises(ValueError, match="profile_dir"):
+        resolve_profile_dir(config, tmp_path)
+
+
+def test_storage_directory_resolvers_return_root_contained_paths(tmp_path: Path):
+    config = configured_for("data/advisor/advisor.sqlite")
+
+    assert resolve_chart_dir(config, tmp_path) == tmp_path / "data/advisor/charts"
+    assert resolve_profile_dir(config, tmp_path) == tmp_path / "data/advisor/profiles"
 
 
 def test_rejects_tushare_enabled(tmp_path: Path):

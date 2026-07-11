@@ -55,13 +55,27 @@ def load_advisor_config(path: Path | None = None) -> AdvisorConfig:
     return AdvisorConfig.model_validate(payload)
 
 
-def resolve_state_db(config: AdvisorConfig, root: Path) -> Path:
-    """Resolve the single operational database without permitting path escape."""
-    configured = Path(config.storage.database)
+def _resolve_storage_path(configured_path: str, root: Path, field_name: str) -> Path:
+    configured = Path(configured_path)
     if configured.is_absolute():
-        raise ValueError("storage database must be relative to the repository root")
+        raise ValueError(f"storage {field_name} must be relative to the repository root")
     resolved_root = root.resolve()
     resolved = (resolved_root / configured).resolve()
     if not resolved.is_relative_to(resolved_root):
-        raise ValueError("storage database must remain within the repository root")
+        raise ValueError(f"storage {field_name} must remain within the repository root")
     return resolved
+
+
+def resolve_state_db(config: AdvisorConfig, root: Path) -> Path:
+    """Resolve the single operational database without permitting path escape."""
+    return _resolve_storage_path(config.storage.database, root, "database")
+
+
+def resolve_chart_dir(config: AdvisorConfig, root: Path) -> Path:
+    """Resolve the chart directory without permitting path escape."""
+    return _resolve_storage_path(config.storage.chart_dir, root, "chart_dir")
+
+
+def resolve_profile_dir(config: AdvisorConfig, root: Path) -> Path:
+    """Resolve the profile directory without permitting path escape."""
+    return _resolve_storage_path(config.storage.profile_dir, root, "profile_dir")
