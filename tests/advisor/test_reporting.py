@@ -1,5 +1,6 @@
 import json
 import hashlib
+import fcntl
 import os
 from pathlib import Path
 import threading
@@ -550,6 +551,12 @@ def test_second_link_failure_never_deletes_first_public_file(tmp_path: Path, mon
     assert not (date_dir / "premarket.complete.json").exists()
     assert (date_dir / ".premarket.claim").is_file()
 
+    monkeypatch.setattr(contracts.os, "link", real_link)
+    paths = write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
+    assert paths.json_path.is_file()
+    assert completion_marker(paths).is_file()
+    assert not (date_dir / ".premarket.claim").exists()
+
 
 def test_publication_never_overwrites_destination_created_before_first_link(tmp_path: Path, monkeypatch):
     real_link = contracts.os.link
@@ -630,7 +637,7 @@ def test_concurrent_publication_uses_live_exclusive_report_claim(tmp_path: Path,
     thread.start()
     assert first_writer_started.wait(timeout=2)
     try:
-        with pytest.raises(FileExistsError, match="live publication claim"):
+        with pytest.raises(FileExistsError, match="active publication claim"):
             write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
     finally:
         release_first_writer.set()
@@ -639,6 +646,30 @@ def test_concurrent_publication_uses_live_exclusive_report_claim(tmp_path: Path,
     assert not thread.is_alive()
     assert thread_errors == []
     assert (tmp_path / "2026-07-11" / "premarket.json").is_file()
+
+
+def test_active_locked_claim_rejects_even_with_forged_dead_pid(tmp_path: Path, monkeypatch):
+    def crash_after_markdown(event: str, **_context) -> None:
+        if event == "after_markdown_link":
+            raise SimulatedCrash()
+
+    monkeypatch.setattr(contracts, "_publication_hook", crash_after_markdown)
+    with pytest.raises(SimulatedCrash):
+        archive_morning_advice(tmp_path)
+
+    claim_path = tmp_path / "2026-07-11" / ".premarket.claim"
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    claim["pid"] = 999999
+    claim_path.write_text(json.dumps(claim), encoding="utf-8")
+    claim_fd = os.open(claim_path, os.O_RDWR | os.O_NOFOLLOW)
+    fcntl.flock(claim_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(contracts, "_publication_hook", lambda *_args, **_kwargs: None)
+    try:
+        with pytest.raises(FileExistsError, match="active publication claim"):
+            archive_morning_advice(tmp_path)
+    finally:
+        fcntl.flock(claim_fd, fcntl.LOCK_UN)
+        os.close(claim_fd)
 
 
 def test_stale_claim_recovers_interruption_after_first_final_link(tmp_path: Path, monkeypatch):
@@ -663,7 +694,6 @@ def test_stale_claim_recovers_interruption_after_first_final_link(tmp_path: Path
     assert claim["run_id"] == "initial"
 
     monkeypatch.setattr(contracts, "_publication_hook", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(contracts, "_pid_is_alive", lambda _pid: False, raising=False)
     paths = write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
 
     assert paths.markdown_path.is_file()
@@ -687,7 +717,6 @@ def test_stale_recovery_rejects_conflicting_destination_without_deleting_public_
     date_dir = tmp_path / "2026-07-11"
     (date_dir / "premarket.json").write_text("conflicting json", encoding="utf-8")
     monkeypatch.setattr(contracts, "_publication_hook", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(contracts, "_pid_is_alive", lambda _pid: False, raising=False)
     with pytest.raises(ValueError, match="conflicting recovery destination"):
         write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
 
@@ -708,7 +737,6 @@ def test_stale_recovery_rejects_claim_with_unbound_stage_path(tmp_path: Path, mo
         "transaction_id": "a" * 32,
     }
     (date_dir / ".premarket.claim").write_text(json.dumps(claim), encoding="utf-8")
-    monkeypatch.setattr(contracts, "_pid_is_alive", lambda _pid: False)
 
     with pytest.raises(ValueError, match="invalid publication claim"):
         archive_morning_advice(tmp_path)
@@ -727,8 +755,34 @@ def test_final_links_are_fd_relative_and_completion_marker_is_last(tmp_path: Pat
     monkeypatch.setattr(contracts.os, "link", record_link)
     archive_morning_advice(tmp_path)
 
-    assert [name for name, _ in links] == ["premarket.md", "premarket.json", "premarket.complete.json"]
+    assert [name for name, _ in links] == [
+        ".premarket.claim",
+        "premarket.md",
+        "premarket.json",
+        "premarket.complete.json",
+    ]
     assert all(call["src_dir_fd"] is not None and call["dst_dir_fd"] is not None for _, call in links)
+
+
+def test_canonical_claim_becomes_visible_only_after_creator_holds_lock(tmp_path: Path, monkeypatch):
+    real_link = contracts.os.link
+    observed_locked_claim = False
+
+    def inspect_claim_link(source: str, destination: str, *args, **kwargs) -> None:
+        nonlocal observed_locked_claim
+        real_link(source, destination, *args, **kwargs)
+        if destination == ".premarket.claim":
+            claim_fd = os.open(destination, os.O_RDWR | os.O_NOFOLLOW, dir_fd=kwargs["dst_dir_fd"])
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(claim_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed_locked_claim = True
+            finally:
+                os.close(claim_fd)
+
+    monkeypatch.setattr(contracts.os, "link", inspect_claim_link)
+    archive_morning_advice(tmp_path)
+    assert observed_locked_claim is True
 
 
 def test_staged_transaction_directory_is_durable_before_first_public_link(tmp_path: Path, monkeypatch):
@@ -827,3 +881,18 @@ def test_symlinked_root_date_or_report_path_is_rejected(tmp_path: Path, monkeypa
     (date_dir / "premarket.md").symlink_to(tmp_path / "outside.md")
     with pytest.raises(ValueError, match="symlinked report path"):
         write_premarket_report("2026-07-13", [], real_root, quality_results=passing_quality())
+
+
+@pytest.mark.parametrize("missing_capability", ["O_NOFOLLOW", "flock"])
+def test_missing_mandatory_filesystem_capability_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+    missing_capability: str,
+):
+    if missing_capability == "O_NOFOLLOW":
+        monkeypatch.delattr(contracts.os, "O_NOFOLLOW")
+    else:
+        monkeypatch.setattr(contracts, "fcntl", None, raising=False)
+
+    with pytest.raises(RuntimeError, match="required report filesystem capabilities unavailable"):
+        archive_morning_advice(tmp_path)

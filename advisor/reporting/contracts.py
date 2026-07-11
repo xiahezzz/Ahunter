@@ -1,6 +1,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
+import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +16,10 @@ from advisor.quality import QualityResult
 
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _QUALITY_SEVERITIES = frozenset({"blocking", "warning", "info"})
+_NATIVE_DIR_FD_SUPPORT = all(
+    function in os.supports_dir_fd for function in (os.open, os.mkdir, os.link, os.stat, os.unlink, os.rmdir)
+)
+_NATIVE_LINK_NOFOLLOW_SUPPORT = os.link in os.supports_follow_symlinks
 
 
 @dataclass(frozen=True)
@@ -228,29 +233,29 @@ def atomic_write_pair(paths: ReportPaths, markdown_content: str, json_content: s
             else:
                 raise FileExistsError("report archive already exists")
 
-        if _entry_exists(date_fd, names["claim"]):
-            if _recover_claim(date_fd, root_fd, report_date, names, report_type, run_id):
-                return
+        while True:
+            transaction_id = uuid.uuid4().hex
+            stage_name = f".txn-{paths.markdown_path.stem}-{transaction_id}"
+            candidate_claim = {
+                "pid": os.getpid(),
+                "report_date": report_date,
+                "report_type": report_type,
+                "run_id": run_id,
+                "stage": stage_name,
+                "transaction_id": transaction_id,
+            }
+            claim_fd, existing_claim, claim = _acquire_claim(date_fd, names["claim"], candidate_claim)
+            if not existing_claim:
+                break
+            try:
+                if _recover_claim(date_fd, root_fd, report_date, names, report_type, run_id, claim):
+                    return
+            finally:
+                _release_claim_lock(claim_fd)
 
-        transaction_id = uuid.uuid4().hex
-        stage_name = f".txn-{paths.markdown_path.stem}-{transaction_id}"
-        claim = {
-            "pid": os.getpid(),
-            "report_date": report_date,
-            "report_type": report_type,
-            "run_id": run_id,
-            "stage": stage_name,
-            "transaction_id": transaction_id,
-        }
-        _write_exclusive_file(date_fd, names["claim"], _json_bytes(claim))
-        os.fsync(date_fd)
-        _publication_hook("claim_acquired", claim=claim, date_fd=date_fd)
-
-        stage_created = False
-        manifest_durable = False
         try:
+            _publication_hook("claim_acquired", claim=claim, date_fd=date_fd)
             os.mkdir(stage_name, 0o700, dir_fd=date_fd)
-            stage_created = True
             stage_fd = _open_directory(stage_name, dir_fd=date_fd)
             try:
                 markdown_bytes = markdown_content.encode("utf-8")
@@ -260,7 +265,6 @@ def atomic_write_pair(paths: ReportPaths, markdown_content: str, json_content: s
                 _write_exclusive_file(stage_fd, names["json"], json_bytes)
                 _write_exclusive_file(stage_fd, names["marker"], manifest_bytes)
                 os.fsync(stage_fd)
-                manifest_durable = True
                 os.fsync(date_fd)
                 _publication_hook("stage_manifest_durable", stage=stage_name, stage_fd=stage_fd)
                 _verify_date_binding(root_fd, date_fd, report_date)
@@ -292,17 +296,11 @@ def atomic_write_pair(paths: ReportPaths, markdown_content: str, json_content: s
                 _validate_complete_archive_fd(date_fd, names, report_type, report_date, run_id)
             finally:
                 os.close(stage_fd)
-        except Exception:
-            if not manifest_durable:
-                if stage_created:
-                    _cleanup_hidden_stage(date_fd, stage_name, names)
-                _unlink_hidden(date_fd, names["claim"])
-                os.fsync(date_fd)
-            raise
-
-        _unlink_hidden(date_fd, names["claim"])
-        os.fsync(date_fd)
-        _cleanup_hidden_stage(date_fd, stage_name, names)
+            _unlink_hidden(date_fd, names["claim"])
+            os.fsync(date_fd)
+            _cleanup_hidden_stage(date_fd, stage_name, names)
+        finally:
+            _release_claim_lock(claim_fd)
     finally:
         os.close(date_fd)
         os.close(root_fd)
@@ -419,6 +417,7 @@ def _validate_complete_archive_fd(
 
 
 def _resolve_report_directory(output_dir: Path, report_date: str) -> Path:
+    _require_filesystem_capabilities()
     _validate_report_date(report_date)
     configured_root = _validated_root_path(output_dir)
     root_fd, date_fd = _open_report_fds(configured_root, report_date, create_date=True)
@@ -488,6 +487,7 @@ def _open_root_fd(root: Path) -> int:
 
 
 def _open_report_fds(output_dir: Path, report_date: str, *, create_date: bool) -> tuple[int, int]:
+    _require_filesystem_capabilities()
     _validate_report_date(report_date)
     root = _validated_root_path(output_dir)
     root_fd = _open_root_fd(root)
@@ -568,6 +568,87 @@ def _any_archive_entry(directory_fd: int, names: dict[str, str]) -> bool:
     return any(_entry_exists(directory_fd, names[key]) for key in ("markdown", "json", "marker"))
 
 
+def _acquire_claim(
+    date_fd: int,
+    canonical_name: str,
+    candidate_claim: dict,
+) -> tuple[int, bool, dict]:
+    private_name = f"{canonical_name}.{candidate_claim['transaction_id']}.private"
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
+    private_fd = os.open(private_name, flags, 0o600, dir_fd=date_fd)
+    try:
+        fcntl.flock(private_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _write_locked_claim(private_fd, candidate_claim)
+        try:
+            os.link(
+                private_name,
+                canonical_name,
+                src_dir_fd=date_fd,
+                dst_dir_fd=date_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            _unlink_hidden(date_fd, private_name)
+            _release_claim_lock(private_fd)
+            return _open_existing_claim(date_fd, canonical_name)
+        _unlink_hidden(date_fd, private_name)
+        os.fsync(date_fd)
+        return private_fd, False, candidate_claim
+    except BaseException:
+        _unlink_hidden(date_fd, private_name)
+        try:
+            _release_claim_lock(private_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _open_existing_claim(date_fd: int, canonical_name: str) -> tuple[int, bool, dict]:
+    flags = os.O_RDWR | os.O_NOFOLLOW
+    claim_fd = os.open(canonical_name, flags, dir_fd=date_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(claim_fd).st_mode):
+            raise ValueError("invalid publication claim")
+        try:
+            fcntl.flock(claim_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise FileExistsError("active publication claim") from error
+        claim = json.loads(_read_locked_claim(claim_fd).decode("utf-8"))
+        return claim_fd, True, claim
+    except BaseException:
+        try:
+            _release_claim_lock(claim_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _write_locked_claim(claim_fd: int, claim: dict) -> None:
+    content = _json_bytes(claim)
+    os.ftruncate(claim_fd, 0)
+    os.lseek(claim_fd, 0, os.SEEK_SET)
+    view = memoryview(content)
+    while view:
+        written = os.write(claim_fd, view)
+        view = view[written:]
+    os.fsync(claim_fd)
+
+
+def _read_locked_claim(claim_fd: int) -> bytes:
+    os.lseek(claim_fd, 0, os.SEEK_SET)
+    chunks = []
+    while chunk := os.read(claim_fd, 64 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _release_claim_lock(claim_fd: int) -> None:
+    try:
+        fcntl.flock(claim_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(claim_fd)
+
+
 def _recover_claim(
     date_fd: int,
     root_fd: int,
@@ -575,11 +656,8 @@ def _recover_claim(
     names: dict[str, str],
     report_type: str,
     run_id: str,
+    claim: dict,
 ) -> bool:
-    try:
-        claim = json.loads(_read_regular_bytes(date_fd, names["claim"]).decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-        raise ValueError("invalid publication claim") from error
     if not isinstance(claim, dict) or any(
         claim.get(key) != value
         for key, value in {"report_date": report_date, "report_type": report_type, "run_id": run_id}.items()
@@ -593,8 +671,6 @@ def _recover_claim(
     expected_stage = f".txn-{names['markdown'].removesuffix('.md')}-{transaction_id}"
     if not re.fullmatch(r"[a-f0-9]{32}", transaction_id) or stage_name != expected_stage:
         raise ValueError("invalid publication claim")
-    if _pid_is_alive(pid):
-        raise FileExistsError("live publication claim")
 
     try:
         stage_fd = _open_directory(stage_name, dir_fd=date_fd)
@@ -678,19 +754,23 @@ def _unlink_stage_entry(stage_fd: int, name: str) -> None:
         pass
 
 
-def _pid_is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
 def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def _publication_hook(_event: str, **_context) -> None:
     return None
+
+
+def _require_filesystem_capabilities() -> None:
+    required_constants = ("O_DIRECTORY", "O_NOFOLLOW")
+    if (
+        fcntl is None
+        or not callable(getattr(fcntl, "flock", None))
+        or not all(hasattr(fcntl, name) for name in ("LOCK_EX", "LOCK_NB", "LOCK_UN"))
+        or not all(hasattr(os, name) for name in required_constants)
+        or not callable(getattr(os, "link", None))
+        or not _NATIVE_DIR_FD_SUPPORT
+        or not _NATIVE_LINK_NOFOLLOW_SUPPORT
+    ):
+        raise RuntimeError("required report filesystem capabilities unavailable")
