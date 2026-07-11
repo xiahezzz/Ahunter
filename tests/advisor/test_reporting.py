@@ -113,6 +113,41 @@ def test_read_verified_archive_returns_only_marker_verified_contents(tmp_path: P
     assert "08:30 Premarket Advice" in archive["markdown"]
 
 
+def test_read_verified_archive_returns_captured_bytes_during_replacement_race(tmp_path: Path, monkeypatch):
+    paths = archive_morning_advice(tmp_path)
+    original = json.loads(paths.json_path.read_text(encoding="utf-8"))
+    called = []
+
+    def replace_after_capture(event: str, **_context):
+        if event == "buffers_captured":
+            paths.json_path.write_text('{"replacement": true}', encoding="utf-8")
+            called.append(event)
+
+    monkeypatch.setattr(contracts, "_reader_hook", replace_after_capture, raising=False)
+    archive = contracts.read_verified_archive(tmp_path, "2026-07-11", "premarket", "initial")
+
+    assert called == ["buffers_captured"]
+    assert archive["json"] == original
+
+
+def test_read_verified_archive_rejects_oversized_json_before_decoding(tmp_path: Path, monkeypatch):
+    archive_morning_advice(tmp_path)
+    monkeypatch.setattr(contracts, "_MAX_REPORT_JSON_BYTES", 1, raising=False)
+
+    with pytest.raises(ValueError, match="invalid report archive"):
+        contracts.read_verified_archive(tmp_path, "2026-07-11", "premarket", "initial")
+
+
+def test_list_verified_archives_bounds_candidate_verification(tmp_path: Path, monkeypatch):
+    archive_morning_advice(tmp_path)
+    write_review_report("2026-07-11", [], [], tmp_path, quality_results=passing_quality())
+    monkeypatch.setattr(contracts, "_MAX_ARCHIVE_CANDIDATES", 1)
+
+    archives = contracts.list_verified_archives(tmp_path)
+
+    assert len(archives) == 1
+
+
 def test_write_review_report_links_to_morning_advice(tmp_path: Path):
     advice = [AdviceItem("adv-1", "600519", "watch", 0.72, "morning rationale", ["ev-1"])]
     archive_morning_advice(tmp_path, advice)

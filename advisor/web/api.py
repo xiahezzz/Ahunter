@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import re
 import sqlite3
 import stat
@@ -10,7 +11,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 
 from advisor import paths as advisor_paths
 from advisor.db.migrate import migrate_database
@@ -25,6 +26,8 @@ _CODE_RE = re.compile(r"(?:[0368]\d{5}|(?:SH|SZ|BJ)\d{6})\Z")
 _ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _MAX_IMPORT_TRANSACTIONS = 500
+_LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
+_MAX_CHART_BYTES = 5 * 1024 * 1024
 
 
 def create_app(state_dir: Path | None = None) -> FastAPI:
@@ -41,8 +44,8 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
         return _current_state(resolved_state_dir)
 
     @app.get("/api/reports")
-    def reports(limit: int = Query(default=50, ge=1, le=100)) -> dict:
-        return {"reports": _read_report_links()[:limit]}
+    def reports(limit: int = Query(default=50, ge=1, le=100), offset: int = Query(default=0, ge=0, le=1000)) -> dict:
+        return {"reports": _read_report_links(max_items=offset + limit)[offset : offset + limit]}
 
     @app.get("/api/reports/{report_date}/{report_type}")
     def report(report_date: str, report_type: str, run_id: str = "initial") -> dict:
@@ -90,19 +93,19 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="chart not found")
         connection = _read_connection(resolved_state_dir / "advisor.sqlite")
         try:
-            path = _read_chart_path(connection, resolved_state_dir, asset_id)
+            descriptor = _open_chart_descriptor(connection, resolved_state_dir, asset_id)
         finally:
             if connection is not None:
                 connection.close()
-        if path is None:
+        if descriptor is None:
             raise HTTPException(status_code=404, detail="chart not found")
-        return FileResponse(path, media_type="image/png")
+        return StreamingResponse(_stream_descriptor(descriptor), media_type="image/png")
 
     @app.get("/api/ledger/transactions")
-    def ledger_transactions() -> dict:
+    def ledger_transactions(limit: int = Query(default=50, ge=1, le=100), offset: int = Query(default=0, ge=0, le=1000)) -> dict:
         connection = _read_connection(resolved_state_dir / "advisor.sqlite")
         try:
-            rows = _read_ledger_records(connection)
+            rows = _read_ledger_records(connection, limit=limit, offset=offset)
             return {"transactions": rows, "ledger": _read_ledger_state(connection)}
         finally:
             if connection is not None:
@@ -169,7 +172,8 @@ def _current_state(state_dir: Path) -> dict:
     try:
         ledger = _read_ledger_state(connection)
         flows = _read_flows(connection)
-        checks = _read_blocking_quality_checks(connection)
+        premarket_checks = _read_blocking_quality_checks(connection, today, "premarket")
+        review_checks = _read_blocking_quality_checks(connection, today, "review")
         profiles = _read_profile_links(connection)
         charts = _read_chart_links(connection, state_dir)
     finally:
@@ -179,14 +183,18 @@ def _current_state(state_dir: Path) -> dict:
     reports = _read_report_links()
     premarket = _latest_report(today, "premarket", reports)
     review = _latest_report(today, "review", reports)
-    quality_blocked = bool(checks)
+    premarket_status = _report_status(premarket)
+    review_status = _report_status(review)
+    premarket_blocked = bool(premarket_checks) or premarket_status == "blocked"
+    review_blocked = bool(review_checks) or review_status == "blocked"
+    checks = premarket_checks + [check for check in review_checks if check not in premarket_checks]
     return {
         "today": today,
-        "advice": [] if quality_blocked else premarket["json"].get("advice", []) if premarket else [],
-        "advice_status": "blocked" if quality_blocked else _report_status(premarket),
+        "advice": [] if premarket_blocked else premarket["json"].get("advice", []) if premarket else [],
+        "advice_status": "blocked" if premarket_blocked else premarket_status,
         "review": {
-            "status": "blocked" if quality_blocked else _report_status(review),
-            "items": [] if quality_blocked else review["json"].get("reviews", []) if review else [],
+            "status": "blocked" if review_blocked else review_status,
+            "items": [] if review_blocked else review["json"].get("reviews", []) if review else [],
         },
         "ledger": ledger,
         "flows": flows,
@@ -214,10 +222,10 @@ def _read_ledger_state(connection: sqlite3.Connection | None) -> dict:
         return _empty_ledger_state()
     try:
         rows = connection.execute(
-            """
+            f"""
             SELECT transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees
             FROM ledger_transactions
-            ORDER BY account_id, trade_date, created_at, transaction_id
+            ORDER BY {_LEDGER_ORDER_BY}
             """
         ).fetchall()
     except sqlite3.Error:
@@ -225,17 +233,20 @@ def _read_ledger_state(connection: sqlite3.Connection | None) -> dict:
     return _derive_ledger_state(rows, connection)
 
 
-def _read_ledger_records(connection: sqlite3.Connection | None) -> list[dict]:
+def _read_ledger_records(connection: sqlite3.Connection | None, *, limit: int | None = None, offset: int = 0) -> list[dict]:
     if connection is None:
         return []
     try:
-        rows = connection.execute(
-            """
+        query = f"""
             SELECT transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees
             FROM ledger_transactions
-            ORDER BY account_id, trade_date, created_at, transaction_id
-            """
-        ).fetchall()
+            ORDER BY {_LEDGER_ORDER_BY}
+        """
+        parameters: tuple[int, int] = ()
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            parameters = (limit, offset)
+        rows = connection.execute(query, parameters).fetchall()
     except sqlite3.Error:
         return []
     records = []
@@ -305,10 +316,10 @@ def _write_ledger_transactions(
         raise _LedgerConflictError("ledger unavailable") from error
     try:
         existing_rows = connection.execute(
-            """
+            f"""
             SELECT transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees
             FROM ledger_transactions
-            ORDER BY account_id, trade_date, created_at, transaction_id
+            ORDER BY {_LEDGER_ORDER_BY}
             """
         ).fetchall()
         existing_ids = {row["transaction_id"] for row in existing_rows}
@@ -370,7 +381,7 @@ def _validate_candidate_ledger_state(
         grouped[account_id].append(transaction)
     for account_transactions in grouped.values():
         try:
-            apply_transactions(account_transactions)
+            apply_transactions(sorted(account_transactions, key=lambda transaction: (transaction.trade_date, transaction.transaction_id)))
         except ValueError as error:
             raise _LedgerValidationError("invalid transaction") from error
 
@@ -488,18 +499,29 @@ def _flow_status(connection: sqlite3.Connection | None, table: str) -> dict:
     return {"status": "ok", "count": int(count)}
 
 
-def _read_blocking_quality_checks(connection: sqlite3.Connection | None) -> list[dict]:
+def _read_blocking_quality_checks(connection: sqlite3.Connection | None, as_of: str, run_type: str) -> list[dict]:
     if connection is None:
         return []
     try:
         rows = connection.execute(
             """
-            SELECT check_name, severity, status, created_at
-            FROM data_quality_checks
-            WHERE severity = 'blocking' AND status = 'failed'
-            ORDER BY created_at DESC, check_name ASC
+            SELECT checks.check_name, checks.severity, checks.status, checks.created_at
+            FROM data_quality_checks AS checks
+            JOIN advisor_runs AS runs ON runs.run_id = checks.run_id
+            WHERE checks.severity = 'blocking'
+              AND checks.status = 'failed'
+              AND checks.run_id = (
+                SELECT run_id
+                FROM advisor_runs
+                WHERE as_of = ? AND run_type = ?
+                ORDER BY started_at DESC, run_id DESC
+                LIMIT 1
+              )
+            ORDER BY checks.created_at DESC, checks.check_name ASC
             LIMIT 50
             """
+            ,
+            (as_of, run_type),
         ).fetchall()
     except sqlite3.Error:
         return []
@@ -616,14 +638,65 @@ def _read_chart_links(connection: sqlite3.Connection | None, state_dir: Path) ->
     ]
 
 
-def _read_chart_path(connection: sqlite3.Connection | None, state_dir: Path, asset_id: str) -> Path | None:
+def _open_chart_descriptor(connection: sqlite3.Connection | None, state_dir: Path, asset_id: str) -> int | None:
     if connection is None:
         return None
     try:
         row = connection.execute("SELECT path FROM chart_assets WHERE asset_id = ?", (asset_id,)).fetchone()
     except sqlite3.Error:
         return None
-    return _safe_chart_path(row["path"], state_dir) if row is not None else None
+    return _open_chart_asset_fd(row["path"], state_dir) if row is not None else None
+
+
+def _open_chart_asset_fd(raw_path: object, state_dir: Path) -> int | None:
+    if not isinstance(raw_path, str) or len(raw_path) > 1024:
+        return None
+    stored_path = Path(raw_path)
+    candidates = [stored_path] if stored_path.is_absolute() else [state_dir / stored_path, advisor_paths.reports_dir() / stored_path]
+    for candidate in candidates:
+        for root in (state_dir / "charts", advisor_paths.reports_dir()):
+            try:
+                relative = candidate.relative_to(root)
+                if not relative.parts or ".." in relative.parts or candidate.suffix.lower() != ".png":
+                    continue
+                descriptor = _open_contained_regular_fd(root, relative)
+            except (OSError, ValueError):
+                continue
+            _chart_hook("fd_opened", descriptor=descriptor)
+            return descriptor
+    return None
+
+
+def _open_contained_regular_fd(root: Path, relative: Path) -> int:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd = os.open(root, directory_flags)
+    try:
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        descriptor = os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+    finally:
+        os.close(current_fd)
+    try:
+        entry_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_size > _MAX_CHART_BYTES:
+            raise ValueError("invalid chart")
+        if os.read(descriptor, 8) != b"\x89PNG\r\n\x1a\n":
+            raise ValueError("invalid chart")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _stream_descriptor(descriptor: int):
+    try:
+        while chunk := os.read(descriptor, 64 * 1024):
+            yield chunk
+    finally:
+        os.close(descriptor)
 
 
 def _safe_chart_path(raw_path: object, state_dir: Path) -> Path | None:
@@ -650,12 +723,12 @@ def _regular_file_within(path: Path, root: Path) -> bool:
             current = current / part
             if stat.S_ISLNK(current.lstat().st_mode):
                 return False
-        return path.suffix.lower() == ".png" and stat.S_ISREG(path.lstat().st_mode)
+        return path.suffix.lower() == ".png" and path.lstat().st_size <= _MAX_CHART_BYTES and stat.S_ISREG(path.lstat().st_mode)
     except (OSError, ValueError):
         return False
 
 
-def _read_report_links() -> list[dict]:
+def _read_report_links(max_items: int = 100) -> list[dict]:
     try:
         archives = list_verified_archives(advisor_paths.reports_dir())
     except (OSError, ValueError, RuntimeError):
@@ -665,7 +738,7 @@ def _read_report_links() -> list[dict]:
             **archive,
             "href": f"/api/reports/{archive['report_date']}/{archive['report_type']}?run_id={archive['run_id']}",
         }
-        for archive in archives[:100]
+        for archive in archives[:max_items]
     ]
 
 
@@ -683,7 +756,12 @@ def _latest_report(today: str, report_type: str, report_links: list[dict]) -> di
 def _report_status(report: dict | None) -> str:
     if report is None:
         return "missing"
-    return str(report["json"].get("quality_status", "unknown"))
+    status = report["json"].get("quality_status")
+    return status if status in {"passed", "blocked"} else "blocked"
+
+
+def _chart_hook(_event: str, **_context) -> None:
+    return None
 
 
 def _finite_number(value: object) -> bool:

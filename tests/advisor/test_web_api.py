@@ -12,6 +12,7 @@ from advisor.reporting.contracts import AdviceItem, ReviewItem
 from advisor.reporting.premarket import write_premarket_report
 from advisor.reporting.review import write_review_report
 from advisor.web.api import create_app
+import advisor.web.api as web_api
 
 
 def test_dev_dependencies_declare_starlette_testclient_transport():
@@ -165,6 +166,36 @@ def test_chart_routes_only_list_and_serve_contained_regular_png_assets(tmp_path)
     assert client.get("/api/charts/../../outside").status_code == 404
 
 
+def test_chart_route_streams_descriptor_pinned_bytes_during_replacement_race(tmp_path, monkeypatch):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    chart_path = tmp_path / "charts" / "race.png"
+    chart_path.parent.mkdir()
+    original = b"\x89PNG\r\n\x1a\noriginal"
+    chart_path.write_bytes(original)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO chart_assets (asset_id, code, chart_type, as_of, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("chart-race", "600519", "kline", "2026-07-11", str(chart_path), "2026-07-11T08:30:00"),
+    )
+    connection.commit()
+    connection.close()
+    called = []
+
+    def replace_after_open(event: str, **_context):
+        if event == "fd_opened":
+            replacement = chart_path.with_name("replacement.png")
+            replacement.write_bytes(b"\x89PNG\r\n\x1a\nreplacement")
+            replacement.replace(chart_path)
+            called.append(event)
+
+    monkeypatch.setattr("advisor.web.api._chart_hook", replace_after_open, raising=False)
+    response = TestClient(create_app(tmp_path)).get("/api/charts/chart-race")
+
+    assert called == ["fd_opened"]
+    assert response.content == original
+
+
 def test_ledger_routes_store_valid_local_transactions_and_reject_oversells(tmp_path):
     client = TestClient(create_app(tmp_path))
     deposit = {
@@ -221,7 +252,26 @@ def test_ledger_import_is_atomic_for_bounded_validated_json_lists(tmp_path):
     assert imported.status_code == 201
     assert imported.json()["ledger"]["positions"][0]["quantity"] == 10
     assert rejected.status_code == 422
-    assert [row["transaction_id"] for row in current.json()["transactions"]] == ["cash-1", "buy-1"]
+    assert [row["transaction_id"] for row in current.json()["transactions"]] == ["buy-1", "cash-1"]
+
+
+def test_ledger_rejects_backdated_sell_using_canonical_replay_order(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    assert client.post(
+        "/api/ledger/import",
+        json=[
+            {"transaction_id": "cash-1", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 1000, "fees": 0},
+            {"transaction_id": "buy-1", "trade_date": "2026-07-11", "transaction_type": "buy", "code": "600519", "quantity": 10, "price": 100, "amount": -1000, "fees": 0},
+        ],
+    ).status_code == 201
+
+    rejected = client.post(
+        "/api/ledger/transactions",
+        json={"transaction_id": "sell-backdated", "trade_date": "2026-07-09", "transaction_type": "sell", "code": "600519", "quantity": 10, "price": 100, "amount": 1000, "fees": 0},
+    )
+
+    assert rejected.status_code == 422
+    assert [row["transaction_id"] for row in client.get("/api/ledger/transactions").json()["transactions"]] == ["cash-1", "buy-1"]
 
 
 def test_ledger_rejects_invalid_signed_cash_and_stock_codes(tmp_path):
@@ -249,6 +299,24 @@ def test_ledger_rejects_invalid_signed_cash_and_stock_codes(tmp_path):
     assert client.post("/api/ledger/transactions", json=invalid_deposit).status_code == 422
     assert client.post("/api/ledger/transactions", json=invalid_trade).status_code == 422
     assert client.get("/api/ledger/transactions").json()["transactions"] == []
+
+
+def test_report_and_ledger_lists_enforce_bounded_limit_and_offset(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    assert client.post(
+        "/api/ledger/import",
+        json=[
+            {"transaction_id": "cash-1", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 1000, "fees": 0},
+            {"transaction_id": "cash-2", "trade_date": "2026-07-11", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 1000, "fees": 0},
+        ],
+    ).status_code == 201
+
+    paged = client.get("/api/ledger/transactions?limit=1&offset=1")
+
+    assert paged.status_code == 200
+    assert [row["transaction_id"] for row in paged.json()["transactions"]] == ["cash-2"]
+    assert client.get("/api/ledger/transactions?limit=101").status_code == 422
+    assert client.get("/api/reports?offset=1001").status_code == 422
 
 
 def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_path, monkeypatch):
@@ -312,7 +380,7 @@ def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_p
 
     assert payload["advice"] == []
     assert payload["advice_status"] == "blocked"
-    assert payload["review"] == {"status": "blocked", "items": []}
+    assert payload["review"] == {"status": "passed", "items": [ReviewItem("review-1", "advice-1", "valid", "fixture review").to_dict()]}
     assert payload["ledger"]["cash"] == 1000.0
     assert payload["flows"] == {
         "information": {"status": "ok", "count": 1},
@@ -325,3 +393,42 @@ def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_p
     assert payload["charts"][0]["asset_id"] == "chart-1"
     assert payload["health"]["collector"] == "running"
     assert "token" not in payload["health"]
+
+
+def test_current_state_ignores_yesterday_quality_failure_for_today_passed_report(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    today = date.today().isoformat()
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "fixture", ["evidence-1"])]
+    write_premarket_report(today, advice, reports_root, quality_results=[QualityResult("market", "blocking", True, "current")])
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    yesterday = "2026-01-01" if today != "2026-01-01" else "2026-01-02"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("yesterday-run", "premarket", yesterday, "failed", "2026-01-01T08:30:00"),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("old-check", "yesterday-run", "old_failure", "blocking", "failed", "{}", "2026-01-01T08:30:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice"] == [advice[0].to_dict()]
+    assert payload["advice_status"] == "passed"
+    assert payload["blocking_quality_checks"] == []
+
+
+def test_current_state_fails_closed_for_malformed_report_quality(tmp_path, monkeypatch):
+    malformed_report = {"json": {"quality_status": "not-valid", "advice": [{"advice_id": "advice-1"}]}}
+    monkeypatch.setattr(web_api, "_read_report_links", lambda: [])
+    monkeypatch.setattr(web_api, "_latest_report", lambda _today, report_type, _links: malformed_report if report_type == "premarket" else None)
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice"] == []
+    assert payload["advice_status"] == "blocked"

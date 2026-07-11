@@ -19,6 +19,10 @@ _REPORT_TYPES = frozenset({"premarket", "review", "failure"})
 _MARKER_NAME_RE = re.compile(
     r"(?P<report_type>premarket|review|failure)(?:\.(?P<run_id>[A-Za-z0-9][A-Za-z0-9_-]{0,63}))?\.complete\.json\Z"
 )
+_MAX_REPORT_MARKER_BYTES = 64 * 1024
+_MAX_REPORT_JSON_BYTES = 2 * 1024 * 1024
+_MAX_REPORT_MARKDOWN_BYTES = 2 * 1024 * 1024
+_MAX_ARCHIVE_CANDIDATES = 500
 _QUALITY_SEVERITIES = frozenset({"blocking", "warning", "info"})
 _NATIVE_DIR_FD_SUPPORT = all(
     function in os.supports_dir_fd for function in (os.open, os.mkdir, os.link, os.stat, os.unlink, os.rmdir)
@@ -334,10 +338,18 @@ def read_verified_archive(
     root_fd, date_fd = _open_existing_report_fds(root, report_date)
     try:
         names = _archive_names(report_type, run_id)
-        _validate_complete_archive_fd(date_fd, names, report_type, report_date, run_id)
+        contents = _read_archive_contents(
+            date_fd,
+            names,
+            marker_limit=_MAX_REPORT_MARKER_BYTES,
+            json_limit=_MAX_REPORT_JSON_BYTES,
+            markdown_limit=_MAX_REPORT_MARKDOWN_BYTES,
+        )
+        _reader_hook("buffers_captured", report_date=report_date, report_type=report_type, run_id=run_id)
+        _validate_complete_archive_contents(contents, names, report_type, report_date, run_id)
         try:
-            payload = json.loads(_read_regular_bytes(date_fd, names["json"]).decode("utf-8"))
-            markdown = _read_regular_bytes(date_fd, names["markdown"]).decode("utf-8")
+            payload = json.loads(contents["json"].decode("utf-8"))
+            markdown = contents["markdown"].decode("utf-8")
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise ValueError("invalid report archive") from error
     except (OSError, ValueError) as error:
@@ -368,7 +380,8 @@ def list_verified_archives(output_dir: Path) -> list[dict]:
         os.close(root_fd)
 
     archives: list[dict] = []
-    for report_date in report_dates:
+    candidate_count = 0
+    for report_date in report_dates[:_MAX_ARCHIVE_CANDIDATES]:
         try:
             _validate_report_date(report_date)
         except ValueError:
@@ -382,10 +395,13 @@ def list_verified_archives(output_dir: Path) -> list[dict]:
                 os.close(root_fd)
         except (OSError, ValueError):
             continue
-        for marker_name in markers:
+        for marker_name in markers[:_MAX_ARCHIVE_CANDIDATES]:
             match = _MARKER_NAME_RE.fullmatch(marker_name)
             if match is None:
                 continue
+            candidate_count += 1
+            if candidate_count > _MAX_ARCHIVE_CANDIDATES:
+                return _sort_archives(archives)
             run_id = match.group("run_id") or "initial"
             try:
                 archive = read_verified_archive(root, report_date, match.group("report_type"), run_id)
@@ -399,6 +415,10 @@ def list_verified_archives(output_dir: Path) -> list[dict]:
                     "quality_status": archive["json"].get("quality_status", "unknown"),
                 }
             )
+    return _sort_archives(archives)
+
+
+def _sort_archives(archives: list[dict]) -> list[dict]:
     return sorted(
         archives,
         key=lambda archive: (archive["report_date"], archive["report_type"], archive["run_id"]),
@@ -473,12 +493,35 @@ def _validate_complete_archive_fd(
     report_date: str,
     run_id: str,
 ) -> dict:
+    contents = _read_archive_contents(date_fd, names)
+    return _validate_complete_archive_contents(contents, names, report_type, report_date, run_id)
+
+
+def _read_archive_contents(
+    date_fd: int,
+    names: dict[str, str],
+    *,
+    marker_limit: int | None = None,
+    json_limit: int | None = None,
+    markdown_limit: int | None = None,
+) -> dict[str, bytes]:
     contents = {}
     for key in ("markdown", "json", "marker"):
         try:
-            contents[key] = _read_regular_bytes(date_fd, names[key])
+            limit = {"marker": marker_limit, "json": json_limit, "markdown": markdown_limit}[key]
+            contents[key] = _read_regular_bytes(date_fd, names[key], max_bytes=limit)
         except FileNotFoundError as error:
             raise ValueError("incomplete report archive") from error
+    return contents
+
+
+def _validate_complete_archive_contents(
+    contents: dict[str, bytes],
+    names: dict[str, str],
+    report_type: str,
+    report_date: str,
+    run_id: str,
+) -> dict:
     try:
         marker = json.loads(contents["marker"].decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
@@ -647,16 +690,23 @@ def _write_exclusive_file(directory_fd: int, name: str, content: bytes) -> None:
         os.close(descriptor)
 
 
-def _read_regular_bytes(directory_fd: int, name: str) -> bytes:
+def _read_regular_bytes(directory_fd: int, name: str, *, max_bytes: int | None = None) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        entry_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(entry_stat.st_mode):
             raise ValueError("archive entry is not a regular file")
+        if max_bytes is not None and entry_stat.st_size > max_bytes:
+            raise ValueError("archive entry exceeds size limit")
         chunks = []
+        total = 0
         while chunk := os.read(descriptor, 64 * 1024):
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise ValueError("archive entry exceeds size limit")
             chunks.append(chunk)
         return b"".join(chunks)
     finally:
@@ -873,6 +923,10 @@ def _json_bytes(value: object) -> bytes:
 
 
 def _publication_hook(_event: str, **_context) -> None:
+    return None
+
+
+def _reader_hook(_event: str, **_context) -> None:
     return None
 
 
