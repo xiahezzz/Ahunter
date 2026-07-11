@@ -13,6 +13,7 @@ from advisor.reporting import contracts
 from advisor.reporting.contracts import AdviceItem, ReviewItem, normalize_quality_results
 from advisor.reporting.premarket import write_premarket_report
 from advisor.reporting.review import write_review_report
+from advisor.reporting.failure import write_failure_report
 
 
 CURSOR_SECRET = b"report-page-test-secret-32-bytes!"
@@ -86,6 +87,75 @@ def test_valid_nonblocking_warning_does_not_block_recommendations():
 
     assert status == "passed"
     assert payload[0]["passed"] is False
+
+
+def test_failure_report_archives_only_bounded_quality_metadata(tmp_path: Path):
+    failures = [
+        QualityResult(
+            "collector_state",
+            "blocking",
+            False,
+            "raw MX analyst advice token=secret-cookie-value " + "x" * 4_000,
+        )
+    ]
+
+    paths = write_failure_report(
+        "2026-07-11",
+        "premarket",
+        failures,
+        tmp_path,
+        run_id="blocked-run",
+    )
+
+    assert paths.markdown_path.name == "failure.blocked-run.md"
+    payload = json.loads(paths.json_path.read_text(encoding="utf-8"))
+    assert payload["report_type"] == "failure"
+    assert payload["attempted_run_type"] == "premarket"
+    assert payload["quality_status"] == "blocked"
+    combined = paths.markdown_path.read_text(encoding="utf-8") + json.dumps(payload)
+    for forbidden in ("advice", "review conclusion", "analyst", "raw MX", "secret-cookie-value"):
+        assert forbidden not in combined
+    assert completion_marker(paths).exists()
+
+
+def test_failure_report_rejects_nonblocking_or_missing_failures(tmp_path: Path):
+    with pytest.raises(ValueError, match="blocking quality"):
+        write_failure_report(
+            "2026-07-11",
+            "review",
+            [QualityResult("optional", "warning", False, "unavailable")],
+            tmp_path,
+            run_id="blocked-run",
+        )
+
+    with pytest.raises(ValueError, match="blocking quality"):
+        write_failure_report(
+            "2026-07-11",
+            "review",
+            [
+                QualityResult("market", "blocking", False, "missing"),
+                QualityResult("malformed", "warning", False, "optional"),
+            ],
+            tmp_path,
+            run_id="blocked-run",
+        )
+
+
+def test_failure_report_is_readable_only_through_verified_archive(tmp_path: Path):
+    paths = write_failure_report(
+        "2026-07-11",
+        "review",
+        [QualityResult("market", "blocking", False, "missing")],
+        tmp_path,
+        run_id="blocked-review",
+    )
+
+    archive = contracts.read_verified_archive(
+        tmp_path, "2026-07-11", "failure", "blocked-review"
+    )
+
+    assert archive["json"] == json.loads(paths.json_path.read_text(encoding="utf-8"))
+    assert archive["json"]["attempted_run_type"] == "review"
 
 
 def test_write_premarket_report_archives_markdown_and_json(tmp_path: Path):

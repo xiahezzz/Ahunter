@@ -830,8 +830,10 @@ def _validate_complete_archive_contents(
 ) -> dict:
     try:
         marker = json.loads(contents["marker"].decode("utf-8"))
+        report_payload = json.loads(contents["json"].decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid completion marker") from error
+    expected_report_time = _expected_report_time(report_type, report_payload)
     expected_files = {
         "json": {"name": names["json"], "sha256": hashlib.sha256(contents["json"]).hexdigest()},
         "markdown": {
@@ -843,7 +845,7 @@ def _validate_complete_archive_contents(
         marker.get(key) != value
         for key, value in {
             "report_date": report_date,
-            "report_time": "08:30" if report_type == "premarket" else "22:30",
+            "report_time": expected_report_time,
             "report_type": report_type,
             "run_id": run_id,
             "files": expected_files,
@@ -854,6 +856,18 @@ def _validate_complete_archive_contents(
     ):
         raise ValueError("completion marker mismatch")
     return marker
+
+
+def _expected_report_time(report_type: str, payload: object) -> str:
+    if report_type == "premarket":
+        return "08:30"
+    if report_type == "review":
+        return "22:30"
+    if isinstance(payload, dict) and payload.get("attempted_run_type") == "premarket":
+        return "08:30"
+    if isinstance(payload, dict) and payload.get("attempted_run_type") == "review":
+        return "22:30"
+    raise ValueError("invalid failure report metadata")
 
 
 def _resolve_report_directory(output_dir: Path, report_date: str) -> Path:

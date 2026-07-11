@@ -1,96 +1,361 @@
+import hashlib
+import json
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from advisor.evidence.mx_adapter import read_mx_events
-from advisor.quality import evaluate_quality, has_blocking_failure
+import pytest
+import yaml
+
+from advisor.evidence.mx_adapter import read_collector_snapshot
+from advisor.evidence.service import persist_evidence
 
 
-def make_events_db(path: Path) -> None:
-    connection = sqlite3.connect(path)
-    connection.executescript(
-        """
-        CREATE TABLE events (
-          event_id TEXT PRIMARY KEY,
-          rid INTEGER NOT NULL,
-          received_at INTEGER NOT NULL,
-          decoded_text TEXT NOT NULL,
-          content_hash TEXT NOT NULL
-        );
-        INSERT INTO events VALUES ('evt-1', 123, 1783728000000, '关注 600519 贵州茅台 放量', 'hash-1');
-        """
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+AS_OF = datetime(2026, 7, 12, 8, 30, tzinfo=SHANGHAI)
+COLLECTOR_SCHEMA = Path(__file__).parents[2] / "src" / "events" / "schema.sql"
+
+
+def _millis(value: datetime) -> int:
+    return int(value.timestamp() * 1000)
+
+
+@pytest.fixture
+def write_allowed_rids():
+    def write(tmp_path: Path, values: list[object], *, content: str | None = None) -> Path:
+        path = tmp_path / "allowed-rids.yaml"
+        if content is None:
+            content = yaml.safe_dump({"allowed_rids": values}, sort_keys=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    return write
+
+
+@pytest.fixture
+def create_collector_db():
+    def create(
+        tmp_path: Path,
+        *,
+        future_event: bool = False,
+        problems: bool = False,
+    ) -> tuple[Path, str]:
+        path = tmp_path / "events.sqlite"
+        connection = sqlite3.connect(path)
+        connection.executescript(COLLECTOR_SCHEMA.read_text(encoding="utf-8"))
+        received = _millis(AS_OF - timedelta(minutes=20))
+        future = _millis(AS_OF + timedelta(minutes=1))
+        connection.execute("INSERT INTO ingest_runs VALUES (?, ?)", ("collector-run", received))
+        hashes = {
+            "evt-authorized-1": hashlib.sha256(b"accepted-1").hexdigest(),
+            "evt-authorized-2": hashlib.sha256(b"accepted-2").hexdigest(),
+            "evt-other": hashlib.sha256(b"not-authorized").hexdigest(),
+        }
+        rows = [
+            ("evt-authorized-1", 123, received - 1_000, "关注 600519 " + "A" * 2_000),
+            ("evt-authorized-2", 123, future if future_event else received, "观察 000001"),
+            ("evt-other", 999, received, "private non-allowlisted content"),
+        ]
+        for event_id, rid, received_at, text in rows:
+            connection.execute(
+                """
+                INSERT INTO events (
+                  event_id, schema_version, rid, source_message_id, oid, received_at,
+                  source_created_at, raw_payload_hash, raw_payload, raw_payload_expires_at,
+                  decoded_text, parsed_content_json, content_hash, ingest_run_id
+                ) VALUES (?, 1, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, '{}', ?, 'collector-run')
+                """,
+                (
+                    event_id,
+                    rid,
+                    received_at,
+                    received_at - 500,
+                    hashlib.sha256((event_id + "-raw").encode()).hexdigest(),
+                    "raw-secret-" + event_id,
+                    received_at + 30 * 86_400_000,
+                    text,
+                    hashes[event_id],
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO media (
+              event_id, rid, source_url, url_hash, content_hash, content_type, local_path, downloaded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "evt-authorized-2",
+                123,
+                "https://secret.invalid/image?token=hidden",
+                "b" * 64,
+                "c" * 64,
+                "image/jpeg",
+                "data/events/media/accepted.jpg",
+                received,
+            ),
+        )
+        bucket = received - (received % 3_600_000)
+        connection.executemany(
+            "INSERT INTO ingest_counters (bucket_start, kind, count) VALUES (?, ?, ?)",
+            [(bucket, "accepted", 3), (bucket, "ignored", 4)],
+        )
+        if problems:
+            connection.execute(
+                "INSERT INTO media_jobs VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL)",
+                ("evt-authorized-1", 123, "https://secret.invalid/pending", "d" * 64, received),
+            )
+            connection.execute(
+                "INSERT INTO media_jobs VALUES (?, ?, ?, ?, 'failed', 1, ?, 'timeout')",
+                ("evt-authorized-2", 123, "https://secret.invalid/failed", "e" * 64, received),
+            )
+            connection.execute(
+                "INSERT INTO decode_failures VALUES (?, 'DecodeError', ?, 1)",
+                ("f" * 64, bucket),
+            )
+        connection.commit()
+        connection.close()
+        return path, hashes["evt-authorized-2"]
+
+    return create
+
+
+def test_empty_allowed_rids_returns_inactive_blocking_snapshot(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    allowed = write_allowed_rids(tmp_path, [])
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+
+    assert snapshot.events == ()
+    assert snapshot.quality.blocking_failure
+    assert "inactive" in snapshot.quality.details
+
+
+def test_only_allowlisted_accepted_rows_become_bounded_evidence(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, expected_hash = create_collector_db(tmp_path)
+    allowed = write_allowed_rids(tmp_path, [123])
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF, limit=1)
+
+    assert [event.rid for event in snapshot.events] == [123]
+    assert snapshot.events[0].content_hash == expected_hash
+    assert len(snapshot.events[0].summary) <= 800
+    serialized = json.dumps(snapshot.events[0].to_dict())
+    for forbidden in ("raw_payload", "source_url", "private non-allowlisted", "token=hidden"):
+        assert forbidden not in serialized
+    assert snapshot.events[0].evidence_id == hashlib.sha256(
+        f"a-hunter:evidence:v1\0mx\0evt-authorized-2\0{expected_hash}".encode()
+    ).hexdigest()
+    assert snapshot.events[0].media[0].local_path == "data/events/media/accepted.jpg"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [[0], [-1], [True], ["123"], [123, 123]],
+)
+def test_invalid_allowed_rids_fail_closed(tmp_path, create_collector_db, write_allowed_rids, values):
+    db, _ = create_collector_db(tmp_path)
+    allowed = write_allowed_rids(tmp_path, values)
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+
+    assert snapshot.events == ()
+    assert snapshot.quality.blocking_failure
+
+
+def test_malformed_yaml_fails_closed(tmp_path, create_collector_db, write_allowed_rids):
+    db, _ = create_collector_db(tmp_path)
+    allowed = write_allowed_rids(tmp_path, [], content="allowed_rids: [123\n")
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+
+    assert snapshot.events == ()
+    assert snapshot.quality.blocking_failure
+
+
+@pytest.mark.parametrize("target", ["database", "config"])
+def test_symlinked_inputs_are_rejected(
+    tmp_path, create_collector_db, write_allowed_rids, target
+):
+    db, _ = create_collector_db(tmp_path)
+    allowed = write_allowed_rids(tmp_path, [123])
+    original = db if target == "database" else allowed
+    link = tmp_path / f"linked-{original.name}"
+    link.symlink_to(original)
+
+    with pytest.raises(ValueError, match="symlink"):
+        read_collector_snapshot(link if target == "database" else db, link if target == "config" else allowed, as_of=AS_OF)
+
+
+def test_missing_real_collector_schema_fails_closed(tmp_path, write_allowed_rids):
+    db = tmp_path / "events.sqlite"
+    sqlite3.connect(db).execute("CREATE TABLE events (event_id TEXT)").connection.close()
+    allowed = write_allowed_rids(tmp_path, [123])
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+
+    assert snapshot.events == ()
+    assert snapshot.quality.blocking_failure
+    assert "schema" in snapshot.quality.details
+
+
+def test_future_collector_timestamp_is_excluded_and_blocks(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path, future_event=True)
+    allowed = write_allowed_rids(tmp_path, [123])
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+
+    assert [event.source_id for event in snapshot.events] == ["evt-authorized-1"]
+    assert snapshot.quality.blocking_failure
+    assert "future" in snapshot.quality.details
+
+
+def test_pending_failed_media_and_decode_failures_block_without_exposing_payloads(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path, problems=True)
+    allowed = write_allowed_rids(tmp_path, [123])
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+
+    assert snapshot.quality.blocking_failure
+    assert "pending" in snapshot.quality.details
+    assert "secret.invalid" not in snapshot.quality.details
+
+
+def test_ambiguous_counters_fail_closed(tmp_path, create_collector_db, write_allowed_rids):
+    db, _ = create_collector_db(tmp_path)
+    connection = sqlite3.connect(db)
+    connection.execute("UPDATE ingest_counters SET count = 2 WHERE kind = 'accepted'")
+    connection.commit()
+    connection.close()
+    allowed = write_allowed_rids(tmp_path, [123])
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+
+    assert snapshot.quality.blocking_failure
+    assert "counter" in snapshot.quality.details
+
+
+def test_sensitive_values_in_decoded_summary_are_not_exposed(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "UPDATE events SET decoded_text = '关注 600519 token=super-secret-value' WHERE event_id = 'evt-authorized-2'"
     )
+    connection.commit()
     connection.close()
 
+    snapshot = read_collector_snapshot(db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF, limit=1)
 
-def test_read_mx_events_maps_accepted_collector_rows(tmp_path: Path):
-    db_path = tmp_path / "events.sqlite"
-    make_events_db(db_path)
-    events = read_mx_events(db_path)
-    assert len(events) == 1
-    assert events[0].source_type == "mx"
-    assert events[0].source_id == "evt-1"
-    assert events[0].code == "600519"
-    assert "贵州茅台" in events[0].summary
+    assert "super-secret-value" not in json.dumps(snapshot.events[0].to_dict())
+    assert "[redacted]" in snapshot.events[0].summary
 
 
-def test_quality_blocks_when_required_history_missing(tmp_path: Path):
-    db_path = tmp_path / "advisor.sqlite"
-    connection = sqlite3.connect(db_path)
+def _advisor_evidence_tables(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
-        CREATE TABLE market_daily (code TEXT, trade_date TEXT);
-        CREATE TABLE ledger_transactions (transaction_id TEXT);
+        CREATE TABLE events_normalized (
+          evidence_source_id TEXT PRIMARY KEY, source_type TEXT NOT NULL, source_id TEXT NOT NULL,
+          code TEXT, as_of TEXT NOT NULL, summary TEXT NOT NULL, raw_ref_json TEXT NOT NULL,
+          quality_status TEXT NOT NULL DEFAULT 'passed'
+        );
+        CREATE TABLE evidence (
+          evidence_id TEXT PRIMARY KEY, run_id TEXT, code TEXT, as_of TEXT NOT NULL,
+          source_type TEXT NOT NULL, source_id TEXT NOT NULL, summary TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.5, facts_json TEXT NOT NULL DEFAULT '[]',
+          inferences_json TEXT NOT NULL DEFAULT '[]', conflicts_json TEXT NOT NULL DEFAULT '[]',
+          quality_flags_json TEXT NOT NULL DEFAULT '[]'
+        );
         """
     )
-    assert has_blocking_failure(
-        connection,
-        required_codes=["600519"],
-        as_of="2026-07-11T08:30:00+08:00",
+
+
+def test_persist_evidence_is_idempotent_bounded_and_excludes_future(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path, future_event=True)
+    snapshot = read_collector_snapshot(db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF)
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+
+    first = persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+    second = persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    assert first == second
+    assert len(first) == 1
+    assert connection.execute("SELECT count(*) FROM events_normalized").fetchone()[0] == 1
+    assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 1
+    normalized = connection.execute("SELECT summary, raw_ref_json FROM events_normalized").fetchone()
+    assert len(normalized[0]) <= 800
+    assert "raw-secret" not in normalized[1]
+    assert "source_url" not in normalized[1]
+
+
+def test_persist_evidence_rolls_back_both_tables_on_failure(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    snapshot = read_collector_snapshot(db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF)
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    connection.execute(
+        "CREATE TRIGGER reject_evidence BEFORE INSERT ON evidence BEGIN SELECT RAISE(ABORT, 'reject'); END"
     )
 
+    with pytest.raises(sqlite3.IntegrityError):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
 
-def make_quality_db(path: Path, rows: list[tuple[str, str]]) -> sqlite3.Connection:
-    connection = sqlite3.connect(path)
-    connection.executescript(
+    assert connection.execute("SELECT count(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 0
+
+
+def test_persist_evidence_preserves_caller_owned_transaction(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    snapshot = read_collector_snapshot(db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF)
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    connection.execute("CREATE TABLE caller_work (value TEXT)")
+    connection.execute("BEGIN")
+    connection.execute("INSERT INTO caller_work VALUES ('uncommitted')")
+
+    persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+    connection.rollback()
+
+    assert connection.execute("SELECT count(*) FROM caller_work").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 0
+
+
+def test_persist_evidence_rejects_conflicting_existing_identity(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    snapshot = read_collector_snapshot(db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF, limit=1)
+    event = snapshot.events[0]
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    connection.execute(
         """
-        CREATE TABLE market_daily (code TEXT, trade_date TEXT);
-        CREATE TABLE ledger_transactions (transaction_id TEXT);
-        """
+        INSERT INTO events_normalized (
+          evidence_source_id, source_type, source_id, code, as_of, summary, raw_ref_json
+        ) VALUES (?, 'mx', 'different-source', NULL, ?, 'tampered', '{}')
+        """,
+        (event.evidence_id, event.received_at.isoformat()),
     )
-    connection.executemany(
-        "INSERT INTO market_daily (code, trade_date) VALUES (?, ?)",
-        rows,
-    )
-    return connection
+    connection.commit()
 
+    with pytest.raises(ValueError, match="conflicting normalized evidence"):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
 
-def test_quality_blocks_when_only_recent_market_row_exists(tmp_path: Path):
-    connection = make_quality_db(
-        tmp_path / "advisor.sqlite",
-        [("600519", "2026-07-10")],
-    )
-
-    results = evaluate_quality(
-        connection,
-        required_codes=["600519"],
-        as_of="2026-07-11T08:30:00+08:00",
-    )
-
-    assert results[0].blocking_failure is True
-    assert results[0].passed is False
-
-
-def test_quality_passes_with_recent_and_three_year_boundary_rows(tmp_path: Path):
-    connection = make_quality_db(
-        tmp_path / "advisor.sqlite",
-        [("600519", "2023-07-11"), ("600519", "2026-07-10")],
-    )
-
-    results = evaluate_quality(
-        connection,
-        required_codes=["600519"],
-        as_of="2026-07-11T08:30:00+08:00",
-    )
-
-    assert results[0].blocking_failure is False
-    assert results[0].passed is True
+    assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 0
