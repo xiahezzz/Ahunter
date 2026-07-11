@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 import os
 import sqlite3
 import tomllib
@@ -67,6 +68,7 @@ def test_current_state_degrades_explicitly_when_local_state_is_missing(tmp_path)
     }
     assert payload["blocking_quality_checks"] == []
     assert payload["reports"] == []
+    assert payload["report_list"]["status"] == "ok"
     assert payload["profiles"] == []
     assert payload["charts"] == []
 
@@ -100,6 +102,54 @@ def test_report_routes_list_and_serve_only_verified_archives(tmp_path, monkeypat
     assert "08:30 Premarket Advice" in report.json()["markdown"]
     assert client.get("/api/reports/../premarket").status_code == 404
     assert client.get("/api/reports/2026-07-11/unknown").status_code == 404
+
+
+def test_report_cursor_cannot_be_replayed_after_app_restart(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    for report_date in ("2026-07-10", "2026-07-11"):
+        write_premarket_report(
+            report_date,
+            [],
+            reports_root,
+            quality_results=[QualityResult("market_data", "blocking", True, "current")],
+        )
+    first = TestClient(create_app(tmp_path)).get(
+        "/api/reports?start_date=2026-07-10&end_date=2026-07-11&limit=1"
+    ).json()
+
+    response = TestClient(create_app(tmp_path)).get(
+        "/api/reports",
+        params={
+            "start_date": "2026-07-10",
+            "end_date": "2026-07-11",
+            "limit": 1,
+            "cursor": first["next_cursor"],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "report listing unavailable"}
+
+
+def test_current_state_uses_bounded_report_page_and_degrades_on_overflow(tmp_path, monkeypatch):
+    calls = []
+
+    def overflowing_page(*args, **kwargs):
+        calls.append(kwargs)
+        raise ValueError("archive candidate limit exceeded")
+
+    monkeypatch.setattr(web_api, "page_verified_archives", overflowing_page)
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert len(calls) == 1
+    assert calls[0]["limit"] <= 20
+    assert calls[0]["start_date"] is not None
+    assert calls[0]["end_date"] is not None
+    assert len(calls[0]["cursor_secret"]) >= 32
+    assert payload["reports"] == []
+    assert payload["report_list"] == {"status": "degraded", "truncated": True}
 
 
 def test_profile_routes_read_structured_profiles_and_reject_malformed_data(tmp_path):
@@ -139,6 +189,28 @@ def test_profile_routes_read_structured_profiles_and_reject_malformed_data(tmp_p
     assert client.get("/api/profiles/600519").status_code == 404
     assert client.get("/api/profiles").json()["profiles"] == []
     assert client.get("/api/profiles/../../etc").status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("payload", "constant", "bound"),
+    [
+        ({"value": "x" * 32}, "_MAX_PROFILE_JSON_BYTES", 16),
+        ({"a": {"b": {"c": 1}}}, "_MAX_PROFILE_JSON_DEPTH", 2),
+        ({"a": 1, "b": 2, "c": 3}, "_MAX_PROFILE_JSON_ITEMS", 2),
+        ({"value": "too-long"}, "_MAX_PROFILE_STRING_LENGTH", 4),
+    ],
+)
+def test_profile_json_fields_enforce_bytes_depth_items_and_string_bounds(monkeypatch, payload, constant, bound):
+    monkeypatch.setattr(web_api, constant, bound, raising=False)
+
+    with pytest.raises(ValueError, match="invalid stored json"):
+        web_api._load_json_field(json.dumps(payload), dict)
+
+
+@pytest.mark.parametrize("stored", ["[" * 2000 + "]" * 2000, '"\ud800"'])
+def test_profile_json_fields_reject_parser_depth_and_encoding_failures(stored):
+    with pytest.raises(ValueError, match="invalid stored json"):
+        web_api._load_json_field(stored, list if stored.startswith("[") else str)
 
 
 def test_chart_routes_only_list_and_serve_contained_regular_png_assets(tmp_path):
@@ -262,6 +334,25 @@ def test_ledger_routes_store_valid_local_transactions_and_reject_oversells(tmp_p
     ]
     assert client.post("/api/ledger/transactions", json=buy).status_code == 409
     assert client.post("/api/ledger/transactions", json=oversell).status_code == 422
+
+
+@pytest.mark.parametrize("transaction_id", ["../escape", "x" * 129])
+def test_ledger_transaction_ids_are_bounded_and_path_neutral(tmp_path, transaction_id):
+    response = TestClient(create_app(tmp_path)).post(
+        "/api/ledger/transactions",
+        json={
+            "transaction_id": transaction_id,
+            "trade_date": "2026-07-11",
+            "transaction_type": "cash_deposit",
+            "quantity": 0,
+            "price": 0,
+            "amount": 100,
+            "fees": 0,
+        },
+    )
+
+    assert response.status_code == 422
+    assert not (tmp_path / "advisor.sqlite").exists()
 
 
 def test_ledger_import_is_atomic_for_bounded_validated_json_lists(tmp_path):
@@ -537,10 +628,223 @@ def test_newer_timestamped_current_day_failure_run_blocks_passed_archive(tmp_pat
 
 def test_current_state_fails_closed_for_malformed_report_quality(tmp_path, monkeypatch):
     malformed_report = {"json": {"quality_status": "not-valid", "advice": [{"advice_id": "advice-1"}]}}
-    monkeypatch.setattr(web_api, "_read_report_links", lambda: [])
+    monkeypatch.setattr(web_api, "_read_report_links", lambda _today, _secret: ([], {"status": "ok", "truncated": False}))
     monkeypatch.setattr(web_api, "_read_today_report", lambda _today, report_type: malformed_report if report_type == "premarket" else None)
 
     payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
 
     assert payload["advice"] == []
     assert payload["advice_status"] == "blocked"
+
+
+def test_current_quality_resolver_applies_utc_rollover_blocking_check(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "must stay private", ["evidence-1"])]
+    write_premarket_report(
+        "2026-07-12",
+        advice,
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "current")],
+    )
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("utc-run", "premarket", "2026-07-11T16:30:00Z", "passed", "2026-07-11T16:30:00Z"),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("utc-check", "utc-run", "market_stale", "blocking", "failed", "{}", "2026-07-11T16:31:00Z"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice"] == []
+    assert payload["advice_status"] == "blocked"
+    assert [check["check_name"] for check in payload["blocking_quality_checks"]] == ["market_stale"]
+
+
+def test_current_quality_resolver_orders_conflicting_offsets_by_shanghai_instant(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("passed-local", "premarket", "2026-07-12T09:30:00+08:00", "passed", "2026-07-12T09:30:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("passed-check", "passed-local", "market", "blocking", "passed", "{}", "2026-07-12T09:31:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("failure-z", "failure", "2026-07-12T02:00:00Z", "failed", "2026-07-12T02:00:00Z"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice_status"] == "blocked"
+
+
+@pytest.mark.parametrize("field", ["as_of", "started_at"])
+def test_current_quality_resolver_fails_closed_for_malformed_competing_run(tmp_path, monkeypatch, field):
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    values = {
+        "as_of": "2026-07-12T09:00:00+08:00",
+        "started_at": "2026-07-12T09:00:00+08:00",
+    }
+    values[field] = "2026-07-12garbage"
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("malformed-run", "premarket", values["as_of"], "passed", values["started_at"]),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice_status"] == "blocked"
+
+
+def test_current_quality_resolver_fails_closed_on_candidate_overflow(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    monkeypatch.setattr(web_api, "_MAX_CURRENT_RUN_CANDIDATES", 1)
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    for index in range(2):
+        connection.execute(
+            "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+            (f"run-{index}", "premarket", "2026-07-12", "passed", f"2026-07-12T0{index + 8}:00:00+08:00"),
+        )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice_status"] == "blocked"
+
+
+def test_current_quality_resolver_rejects_malformed_check_details(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "must stay private", ["evidence-1"])]
+    write_premarket_report(
+        "2026-07-12",
+        advice,
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "current")],
+    )
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("passed-run", "premarket", "2026-07-12", "passed", "2026-07-12T08:30:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("bad-check", "passed-run", "market", "blocking", "passed", "not-json", "2026-07-12T08:31:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice"] == []
+    assert payload["advice_status"] == "blocked"
+
+
+def test_current_report_content_is_withheld_when_active_quality_is_unsafe(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "must stay private", ["evidence-1"])]
+    write_premarket_report(
+        "2026-07-12",
+        advice,
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "current")],
+    )
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("blocked-run", "premarket", "2026-07-12T08:30:00+08:00", "blocked", "2026-07-12T08:30:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    response = TestClient(create_app(tmp_path)).get("/api/reports/2026-07-12/premarket?run_id=initial")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "current report quality unavailable"}
+    assert "must stay private" not in response.text
+
+
+def test_present_unreadable_database_fails_closed_for_current_report_content(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "must stay private", ["evidence-1"])]
+    write_premarket_report(
+        "2026-07-12",
+        advice,
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "current")],
+    )
+    outside = tmp_path / "outside.sqlite"
+    outside.write_bytes(b"not a database")
+    (tmp_path / "advisor.sqlite").symlink_to(outside)
+    client = TestClient(create_app(tmp_path))
+
+    state = client.get("/api/current-state")
+    report = client.get("/api/reports/2026-07-12/premarket?run_id=initial")
+
+    assert state.json()["advice"] == []
+    assert state.json()["advice_status"] == "blocked"
+    assert report.status_code == 503
+    assert "must stay private" not in report.text
+
+
+def test_absent_database_can_rely_on_verified_passed_current_report(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "verified archive", ["evidence-1"])]
+    write_premarket_report(
+        "2026-07-12",
+        advice,
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "current")],
+    )
+    client = TestClient(create_app(tmp_path))
+
+    state = client.get("/api/current-state")
+    report = client.get("/api/reports/2026-07-12/premarket?run_id=initial")
+
+    assert state.json()["advice"] == [advice[0].to_dict()]
+    assert state.json()["advice_status"] == "passed"
+    assert report.status_code == 200
+
+
+def test_report_content_route_rejects_failure_archives(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+
+    response = TestClient(create_app(tmp_path)).get("/api/reports/2026-07-11/failure?run_id=initial")
+
+    assert response.status_code == 404

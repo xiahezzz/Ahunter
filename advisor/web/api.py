@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 from advisor import paths as advisor_paths
 from advisor.db.migrate import migrate_database
 from advisor.ledger.model import LedgerTransaction, apply_transactions
-from advisor.reporting.contracts import list_verified_archives, page_verified_archives, read_active_verified_archive, read_verified_archive
+from advisor.reporting.contracts import page_verified_archives, read_active_verified_archive, read_verified_archive
 
 
 _COMPONENTS = ("collector", "market_updater", "advisor_scheduler", "frontend", "api")
@@ -27,11 +27,20 @@ _MAX_HEALTH_BYTES = 64 * 1024
 _CODE_RE = re.compile(r"(?:[0368]\d{5}|(?:SH|SZ|BJ)\d{6})\Z")
 _ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+_TRANSACTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_IMPORT_TRANSACTIONS = 500
 _LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
 _MAX_LEDGER_REPLAY_ROWS = 10_000
 _MAX_CHART_BYTES = 5 * 1024 * 1024
 _MAX_CURRENT_RUN_CANDIDATES = 100
+_MAX_CURRENT_QUALITY_CHECKS = 100
+_MAX_QUALITY_DETAILS_BYTES = 64 * 1024
+_MAX_CURRENT_REPORT_LINKS = 20
+_CURRENT_REPORT_LOOKBACK_DAYS = 30
+_MAX_PROFILE_JSON_BYTES = 64 * 1024
+_MAX_PROFILE_JSON_DEPTH = 8
+_MAX_PROFILE_JSON_ITEMS = 500
+_MAX_PROFILE_STRING_LENGTH = 4096
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -47,7 +56,7 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/current-state")
     def current_state() -> dict:
-        return _current_state(resolved_state_dir)
+        return _current_state(resolved_state_dir, report_cursor_secret)
 
     @app.get("/api/reports")
     def reports(
@@ -57,18 +66,47 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
         end_date: str | None = None,
     ) -> dict:
         try:
-            page = page_verified_archives(advisor_paths.reports_dir(), limit=limit, cursor=cursor, start_date=start_date, end_date=end_date, cursor_secret=report_cursor_secret)
+            page = page_verified_archives(
+                advisor_paths.reports_dir(),
+                limit=limit,
+                cursor=cursor,
+                start_date=start_date,
+                end_date=end_date,
+                cursor_secret=report_cursor_secret,
+            )
         except ValueError:
             raise HTTPException(status_code=503, detail="report listing unavailable") from None
-        page["reports"] = [{**item, "href": f"/api/reports/{item['report_date']}/{item['report_type']}?run_id={item['run_id']}"} for item in page["items"]]
+        page["reports"] = [
+            {
+                **item,
+                "href": f"/api/reports/{item['report_date']}/{item['report_type']}?run_id={item['run_id']}",
+            }
+            for item in page["items"]
+        ]
         return page
 
     @app.get("/api/reports/{report_date}/{report_type}")
     def report(report_date: str, report_type: str, run_id: str = "initial") -> dict:
+        if report_type not in {"premarket", "review"}:
+            raise HTTPException(status_code=404, detail="report not found")
         try:
             archive = read_verified_archive(advisor_paths.reports_dir(), report_date, report_type, run_id)
         except (OSError, ValueError, RuntimeError):
             raise HTTPException(status_code=404, detail="report not found") from None
+        if report_date == _shanghai_today().isoformat():
+            db_path = resolved_state_dir / "advisor.sqlite"
+            connection = _read_connection(db_path)
+            try:
+                quality = _resolve_current_run_quality(
+                    connection,
+                    report_date,
+                    database_present=_database_entry_present(db_path),
+                )
+            finally:
+                if connection is not None:
+                    connection.close()
+            if not quality["safe"]:
+                raise HTTPException(status_code=503, detail="current report quality unavailable")
         return archive
 
     @app.get("/api/profiles")
@@ -189,35 +227,36 @@ def _load_health_snapshot(path: Path) -> dict:
 app = create_app()
 
 
-def _current_state(state_dir: Path) -> dict:
+def _current_state(state_dir: Path, report_cursor_secret: bytes) -> dict:
     today = _shanghai_today().isoformat()
     health = _health_payload(state_dir)
-    connection = _read_connection(state_dir / "advisor.sqlite")
+    db_path = state_dir / "advisor.sqlite"
+    connection = _read_connection(db_path)
     try:
         try:
             ledger = _read_ledger_state(connection)
         except _LedgerCapacityError:
             ledger = {**_empty_ledger_state(), "status": "degraded"}
         flows = _read_flows(connection)
-        premarket_quality = _read_current_run_quality(connection, today, "premarket")
-        review_quality = _read_current_run_quality(connection, today, "review")
-        run_guard_safe = _current_day_run_guard(connection, today)
+        current_quality = _resolve_current_run_quality(
+            connection,
+            today,
+            database_present=_database_entry_present(db_path),
+        )
         profiles = _read_profile_links(connection)
         charts = _read_chart_links(connection, state_dir)
     finally:
         if connection is not None:
             connection.close()
 
-    reports = _read_report_links()
+    reports, report_list = _read_report_links(today, report_cursor_secret)
     premarket = _read_today_report(today, "premarket")
     review = _read_today_report(today, "review")
     premarket_status = _report_status(premarket)
     review_status = _report_status(review)
-    premarket_blocked = not run_guard_safe or not premarket_quality["safe"] or premarket_status == "blocked"
-    review_blocked = not run_guard_safe or not review_quality["safe"] or review_status == "blocked"
-    checks = premarket_quality["blocking_checks"] + [
-        check for check in review_quality["blocking_checks"] if check not in premarket_quality["blocking_checks"]
-    ]
+    premarket_blocked = not current_quality["safe"] or premarket_status == "blocked"
+    review_blocked = not current_quality["safe"] or review_status == "blocked"
+    checks = current_quality["blocking_checks"]
     return {
         "today": today,
         "advice": [] if premarket_blocked else premarket["json"].get("advice", []) if premarket else [],
@@ -230,6 +269,7 @@ def _current_state(state_dir: Path) -> dict:
         "flows": flows,
         "blocking_quality_checks": checks,
         "reports": reports,
+        "report_list": report_list,
         "profiles": profiles,
         "charts": charts,
         "health": health,
@@ -245,6 +285,16 @@ def _read_connection(db_path: Path) -> sqlite3.Connection | None:
         return connection
     except sqlite3.Error:
         return None
+
+
+def _database_entry_present(db_path: Path) -> bool:
+    try:
+        db_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def _read_ledger_state(connection: sqlite3.Connection | None) -> dict:
@@ -557,60 +607,11 @@ def _flow_status(connection: sqlite3.Connection | None, table: str) -> dict:
     return {"status": "ok", "count": int(count)}
 
 
-def _read_current_run_quality(connection: sqlite3.Connection | None, as_of: str, run_type: str) -> dict:
+def _resolve_current_run_quality(
+    connection: sqlite3.Connection | None, today: str, *, database_present: bool
+) -> dict:
     if connection is None:
-        return {"safe": True, "blocking_checks": []}
-    try:
-        run = connection.execute(
-            """
-            SELECT run_id, run_type, status
-            FROM advisor_runs
-            WHERE substr(as_of, 1, 10) = ? AND run_type = ?
-                ORDER BY started_at DESC, run_id DESC
-                LIMIT 50
-                """,
-                (as_of, run_type),
-        ).fetchone()
-    except sqlite3.Error:
-        return {"safe": False, "blocking_checks": []}
-    if run is None:
-        return {"safe": True, "blocking_checks": []}
-    try:
-        rows = connection.execute(
-            """
-            SELECT check_name, severity, status, created_at
-            FROM data_quality_checks
-            WHERE run_id = ?
-            ORDER BY created_at DESC, check_name ASC
-            LIMIT 50
-            """,
-            (run["run_id"],),
-        ).fetchall()
-    except sqlite3.Error:
-        return {"safe": False, "blocking_checks": []}
-    if not rows:
-        return {"safe": False, "blocking_checks": []}
-    checks = [dict(row) for row in rows]
-    if not all(
-        isinstance(check["check_name"], str)
-        and bool(check["check_name"])
-        and check["severity"] in {"blocking", "warning", "info"}
-        and check["status"] in {"passed", "failed"}
-        and isinstance(check["created_at"], str)
-        for check in checks
-    ):
-        return {"safe": False, "blocking_checks": []}
-    return {
-        "safe": run["run_type"] == run_type
-        and run["status"] == "passed"
-        and not any(check["severity"] == "blocking" and check["status"] == "failed" for check in checks),
-        "blocking_checks": [check for check in checks if check["severity"] == "blocking" and check["status"] == "failed"],
-    }
-
-
-def _current_day_run_guard(connection: sqlite3.Connection | None, today: str) -> bool:
-    if connection is None:
-        return True
+        return {"safe": not database_present, "blocking_checks": [], "active_run": None}
     try:
         parsed_today = date.fromisoformat(today)
         prefixes = tuple((parsed_today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1))
@@ -624,25 +625,71 @@ def _current_day_run_guard(connection: sqlite3.Connection | None, today: str) ->
             """,
             (*prefixes, _MAX_CURRENT_RUN_CANDIDATES + 1),
         ).fetchall()
-    except sqlite3.Error:
-        return False
+    except (sqlite3.Error, ValueError):
+        return {"safe": False, "blocking_checks": [], "active_run": None}
     if len(rows) > _MAX_CURRENT_RUN_CANDIDATES:
-        return False
-    candidates = []
+        return {"safe": False, "blocking_checks": [], "active_run": None}
+    candidates: list[tuple[datetime, str, sqlite3.Row]] = []
     for row in rows:
         try:
             as_of = _parse_shanghai_datetime(row["as_of"])
             started = _parse_shanghai_datetime(row["started_at"])
-        except ValueError:
-            return False
+        except (KeyError, ValueError):
+            return {"safe": False, "blocking_checks": [], "active_run": None}
+        if (
+            not isinstance(row["run_id"], str)
+            or not row["run_id"]
+            or row["run_type"] not in {"premarket", "review", "failure"}
+            or row["status"] not in {"passed", "failed", "blocked", "running"}
+        ):
+            return {"safe": False, "blocking_checks": [], "active_run": None}
         if as_of.date().isoformat() == today:
-            if row["status"] not in {"passed", "failed", "blocked", "running"}:
-                return False
             candidates.append((started, row["run_id"], row))
     if not candidates:
-        return True
+        return {"safe": True, "blocking_checks": [], "active_run": None}
     latest = max(candidates, key=lambda item: (item[0], item[1]))[2]
-    return latest["status"] == "passed"
+    try:
+        check_rows = connection.execute(
+            """
+            SELECT check_name, severity, status, details_json, created_at
+            FROM data_quality_checks
+            WHERE run_id = ?
+            ORDER BY created_at DESC, check_name ASC
+            LIMIT ?
+            """,
+            (latest["run_id"], _MAX_CURRENT_QUALITY_CHECKS + 1),
+        ).fetchall()
+    except sqlite3.Error:
+        return {"safe": False, "blocking_checks": [], "active_run": dict(latest)}
+    if len(check_rows) > _MAX_CURRENT_QUALITY_CHECKS:
+        return {"safe": False, "blocking_checks": [], "active_run": dict(latest)}
+    checks = [dict(row) for row in check_rows]
+    try:
+        valid_checks = bool(checks) and all(
+            isinstance(check["check_name"], str)
+            and 0 < len(check["check_name"]) <= 128
+            and check["severity"] in {"blocking", "warning", "info"}
+            and check["status"] in {"passed", "failed"}
+            and bool(_parse_shanghai_datetime(check["created_at"]))
+            and _valid_quality_details(check["details_json"])
+            for check in checks
+        )
+    except (KeyError, ValueError):
+        valid_checks = False
+    blocking = (
+        [
+            {key: check[key] for key in ("check_name", "severity", "status", "created_at")}
+            for check in checks
+            if check.get("severity") == "blocking" and check.get("status") == "failed"
+        ]
+        if valid_checks
+        else []
+    )
+    return {
+        "safe": latest["status"] == "passed" and valid_checks and not blocking,
+        "blocking_checks": blocking,
+        "active_run": dict(latest),
+    }
 
 
 def _parse_shanghai_datetime(value: object) -> datetime:
@@ -664,13 +711,19 @@ def _shanghai_today() -> date:
     return datetime.now(_SHANGHAI).date()
 
 
-def _is_current_run_date(value: object, today: str) -> bool:
-    if not isinstance(value, str) or len(value) < 10:
+def _valid_quality_details(value: object) -> bool:
+    if not isinstance(value, str):
         return False
     try:
-        return date.fromisoformat(value[:10]).isoformat() == today
-    except ValueError:
+        if len(value.encode("utf-8")) > _MAX_QUALITY_DETAILS_BYTES:
+            return False
+        payload = json.loads(value)
+        if not isinstance(payload, dict):
+            return False
+        _validate_profile_json_value(payload)
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError):
         return False
+    return True
 
 
 def _read_profile_links(connection: sqlite3.Connection | None) -> list[dict]:
@@ -748,12 +801,48 @@ def _load_json_field(value: object, expected_type: type) -> object:
     if not isinstance(value, str):
         raise ValueError("invalid stored json")
     try:
+        if len(value.encode("utf-8")) > _MAX_PROFILE_JSON_BYTES:
+            raise ValueError("invalid stored json")
         payload = json.loads(value)
-    except json.JSONDecodeError as error:
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError("invalid stored json") from error
     if not isinstance(payload, expected_type):
         raise ValueError("invalid stored json")
+    _validate_profile_json_value(payload)
     return payload
+
+
+def _validate_profile_json_value(payload: object) -> None:
+    item_count = 0
+
+    def visit(value: object, depth: int) -> None:
+        nonlocal item_count
+        item_count += 1
+        if item_count > _MAX_PROFILE_JSON_ITEMS or depth > _MAX_PROFILE_JSON_DEPTH:
+            raise ValueError("invalid stored json")
+        if isinstance(value, str):
+            if len(value) > _MAX_PROFILE_STRING_LENGTH:
+                raise ValueError("invalid stored json")
+            return
+        if value is None or isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not math.isfinite(float(value)):
+                raise ValueError("invalid stored json")
+            return
+        if isinstance(value, list):
+            for item in value:
+                visit(item, depth + 1)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str) or len(key) > _MAX_PROFILE_STRING_LENGTH:
+                    raise ValueError("invalid stored json")
+                visit(item, depth + 1)
+            return
+        raise ValueError("invalid stored json")
+
+    visit(payload, 0)
 
 
 def _read_chart_links(connection: sqlite3.Connection | None, state_dir: Path) -> list[dict]:
@@ -873,34 +962,32 @@ def _regular_file_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_report_links(max_items: int = 100, *, start_date: str | None = None, end_date: str | None = None) -> list[dict]:
+def _read_report_links(today: str, cursor_secret: bytes) -> tuple[list[dict], dict]:
+    end = date.fromisoformat(today)
+    start = end - timedelta(days=_CURRENT_REPORT_LOOKBACK_DAYS)
     try:
-        archives = list_verified_archives(advisor_paths.reports_dir(), start_date=start_date, end_date=end_date)
-    except (OSError, RuntimeError):
-        return []
-    return [
+        page = page_verified_archives(
+            advisor_paths.reports_dir(),
+            start_date=start.isoformat(),
+            end_date=end.isoformat(),
+            limit=_MAX_CURRENT_REPORT_LINKS,
+            cursor_secret=cursor_secret,
+        )
+    except (OSError, ValueError, RuntimeError):
+        return [], {"status": "degraded", "truncated": True}
+    links = [
         {
             **archive,
             "href": f"/api/reports/{archive['report_date']}/{archive['report_type']}?run_id={archive['run_id']}",
         }
-        for archive in archives[:max_items]
+        for archive in page["items"]
     ]
-
-
-def _latest_report(today: str, report_type: str, report_links: list[dict]) -> dict | None:
-    candidates = [link for link in report_links if link["report_date"] == today and link["report_type"] == report_type]
-    if not candidates:
-        return None
+    return links, {"status": "ok", "truncated": page["truncated"]}
 
 
 def _read_today_report(today: str, report_type: str) -> dict | None:
     try:
         return read_active_verified_archive(advisor_paths.reports_dir(), today, report_type)
-    except (OSError, ValueError, RuntimeError):
-        return None
-    candidate = candidates[0]
-    try:
-        return read_verified_archive(advisor_paths.reports_dir(), today, report_type, candidate["run_id"])
     except (OSError, ValueError, RuntimeError):
         return None
 
@@ -921,7 +1008,7 @@ def _finite_number(value: object) -> bool:
 
 
 def _validate_ledger_transaction(transaction: LedgerTransaction) -> None:
-    if not isinstance(transaction.transaction_id, str) or not transaction.transaction_id:
+    if not isinstance(transaction.transaction_id, str) or not _TRANSACTION_ID_RE.fullmatch(transaction.transaction_id):
         raise ValueError("invalid transaction")
     try:
         if date.fromisoformat(transaction.trade_date).isoformat() != transaction.trade_date:
