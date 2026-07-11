@@ -1,0 +1,1 @@
+"""Local user-trade ledger."""

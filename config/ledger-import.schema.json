@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "A Hunter Ledger CSV Row",
+  "type": "object",
+  "required": ["transaction_id", "trade_date", "transaction_type", "code", "quantity", "price", "amount", "fees"],
+  "properties": {
+    "transaction_id": { "type": "string" },
+    "trade_date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+    "transaction_type": { "type": "string", "enum": ["cash_deposit", "cash_withdrawal", "buy", "sell", "fee", "tax"] },
+    "code": { "type": "string" },
+    "quantity": { "type": "integer" },
+    "price": { "type": "number" },
+    "amount": { "type": "number" },
+    "fees": { "type": "number" }
+  }
+}
