@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 import tomllib
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -75,14 +75,29 @@ def test_current_state_degrades_explicitly_when_local_state_is_missing(tmp_path)
 
 def test_report_routes_list_and_serve_only_verified_archives(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
+    state_dir = tmp_path / "state"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
     write_premarket_report(
         "2026-07-11",
         [],
         reports_root,
         quality_results=[QualityResult("market_data", "blocking", True, "current")],
     )
-    client = TestClient(create_app(tmp_path / "state"))
+    db_path = state_dir / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("current-run", "premarket", "2026-07-12", "passed", "2026-07-12T08:30:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("current-check", "current-run", "market", "blocking", "passed", "{}", "2026-07-12T08:31:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+    client = TestClient(create_app(state_dir))
 
     listing = client.get("/api/reports")
     report = client.get("/api/reports/2026-07-11/premarket?run_id=initial")
@@ -130,6 +145,69 @@ def test_report_cursor_cannot_be_replayed_after_app_restart(tmp_path, monkeypatc
 
     assert response.status_code == 503
     assert response.json() == {"detail": "report listing unavailable"}
+
+
+def test_report_cursor_returns_explicit_stale_error_after_archive_addition(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    for report_date in ("2026-07-09", "2026-07-11"):
+        write_premarket_report(
+            report_date,
+            [],
+            reports_root,
+            quality_results=[QualityResult("market_data", "blocking", True, "current")],
+        )
+    client = TestClient(create_app(tmp_path))
+    first = client.get(
+        "/api/reports?start_date=2026-07-09&end_date=2026-07-11&limit=1"
+    ).json()
+    write_premarket_report(
+        "2026-07-10",
+        [],
+        reports_root,
+        quality_results=[QualityResult("market_data", "blocking", True, "current")],
+    )
+
+    response = client.get(
+        "/api/reports",
+        params={
+            "start_date": "2026-07-09",
+            "end_date": "2026-07-11",
+            "limit": 1,
+            "cursor": first["next_cursor"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "report cursor stale"}
+
+
+def test_report_api_listing_contains_no_failure_links(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    paths = write_premarket_report(
+        "2026-07-11",
+        [],
+        reports_root,
+        quality_results=[QualityResult("market_data", "blocking", True, "current")],
+    )
+    marker_path = paths.json_path.with_name("premarket.complete.json")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    paths.markdown_path.replace(paths.markdown_path.with_name("failure.md"))
+    paths.json_path.replace(paths.json_path.with_name("failure.json"))
+    marker["report_time"] = "22:30"
+    marker["report_type"] = "failure"
+    marker["files"]["markdown"]["name"] = "failure.md"
+    marker["files"]["json"]["name"] = "failure.json"
+    marker_path.unlink()
+    marker_path.with_name("failure.complete.json").write_text(json.dumps(marker), encoding="utf-8")
+
+    payload = TestClient(create_app(tmp_path)).get(
+        "/api/reports?start_date=2026-07-11&end_date=2026-07-11"
+    ).json()
+
+    assert payload["items"] == []
+    assert payload["reports"] == []
 
 
 def test_current_state_uses_bounded_report_page_and_degrades_on_overflow(tmp_path, monkeypatch):
@@ -213,6 +291,40 @@ def test_profile_json_fields_reject_parser_depth_and_encoding_failures(stored):
         web_api._load_json_field(stored, list if stored.startswith("[") else str)
 
 
+@pytest.mark.parametrize(
+    ("table", "field", "value"),
+    [
+        ("securities", "name", "n" * 257),
+        ("securities", "industry", "i" * 257),
+        ("stock_profiles", "updated_at", "2026-07-11T08:30:00" + "x" * 64),
+    ],
+)
+def test_profile_routes_exclude_unbounded_db_scalars(tmp_path, table, field, value):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO securities (code, name, exchange, industry, concepts_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("600519", "Moutai", "SSE", "Beverages", "[]", "2026-07-11T08:00:00+08:00", "2026-07-11T08:00:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO stock_profiles (code, updated_at) VALUES (?, ?)",
+        ("600519", "2026-07-11T08:30:00+08:00"),
+    )
+    connection.execute(f"UPDATE {table} SET {field} = ? WHERE code = ?", (value, "600519"))
+    connection.commit()
+    connection.close()
+    client = TestClient(create_app(tmp_path))
+
+    assert client.get("/api/profiles").json()["profiles"] == []
+    assert client.get("/api/profiles/600519").status_code == 404
+
+
+def test_profile_json_rejects_huge_integer_without_overflow():
+    with pytest.raises(ValueError, match="invalid stored json"):
+        web_api._load_json_field('{"value":' + "9" * 100 + "}", dict)
+
+
 def test_chart_routes_only_list_and_serve_contained_regular_png_assets(tmp_path):
     db_path = tmp_path / "advisor.sqlite"
     migrate_database(db_path)
@@ -241,6 +353,38 @@ def test_chart_routes_only_list_and_serve_contained_regular_png_assets(tmp_path)
     chart_path.symlink_to(tmp_path / "outside.png")
     assert client.get("/api/charts/chart-1").status_code == 404
     assert client.get("/api/charts/../../outside").status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("code", "x" * 200),
+        ("chart_type", "x" * 65),
+        ("as_of", "2026-07-11T08:30:00" + "x" * 64),
+    ],
+)
+def test_chart_listing_excludes_unbounded_db_metadata(tmp_path, field, value):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    chart_path = tmp_path / "charts" / "bounded.png"
+    chart_path.parent.mkdir()
+    chart_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+    row = {
+        "asset_id": "chart-1",
+        "code": "600519",
+        "chart_type": "kline",
+        "as_of": "2026-07-11",
+    }
+    row[field] = value
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO chart_assets (asset_id, code, chart_type, as_of, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (row["asset_id"], row["code"], row["chart_type"], row["as_of"], str(chart_path), "2026-07-11T08:30:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    assert TestClient(create_app(tmp_path)).get("/api/charts").json()["charts"] == []
 
 
 def test_chart_route_streams_descriptor_pinned_bytes_during_replacement_race(tmp_path, monkeypatch):
@@ -353,6 +497,69 @@ def test_ledger_transaction_ids_are_bounded_and_path_neutral(tmp_path, transacti
 
     assert response.status_code == 422
     assert not (tmp_path / "advisor.sqlite").exists()
+
+
+def test_ledger_read_excludes_unbounded_stored_account_id(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    account_id = "a" * 65
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES (?, ?, ?)",
+        (account_id, account_id, "2026-07-11T08:00:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, transaction_type, quantity, price, amount, fees, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("cash-1", account_id, "2026-07-11", "cash_deposit", 0, 0, 100, 0, "manual", "2026-07-11T08:30:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/ledger/transactions").json()
+
+    assert payload["transactions"] == []
+    assert payload["ledger"] == web_api._empty_ledger_state()
+
+
+def test_ledger_writes_shanghai_aware_created_at(tmp_path):
+    response = TestClient(create_app(tmp_path)).post(
+        "/api/ledger/transactions",
+        json={
+            "transaction_id": "cash-1",
+            "trade_date": "2026-07-11",
+            "transaction_type": "cash_deposit",
+            "quantity": 0,
+            "price": 0,
+            "amount": 100,
+            "fees": 0,
+        },
+    )
+    connection = sqlite3.connect(tmp_path / "advisor.sqlite")
+    account_created_at = connection.execute("SELECT created_at FROM ledger_accounts").fetchone()[0]
+    transaction_created_at = connection.execute("SELECT created_at FROM ledger_transactions").fetchone()[0]
+    connection.close()
+
+    assert response.status_code == 201
+    for stored in (account_created_at, transaction_created_at):
+        parsed = datetime.fromisoformat(stored)
+        assert parsed.utcoffset() == timedelta(hours=8)
+
+
+def test_ledger_rejects_huge_json_integer_without_overflow(tmp_path):
+    response = TestClient(create_app(tmp_path)).post(
+        "/api/ledger/transactions",
+        json={
+            "transaction_id": "cash-1",
+            "trade_date": "2026-07-11",
+            "transaction_type": "cash_deposit",
+            "quantity": 0,
+            "price": 0,
+            "amount": 10**100,
+            "fees": 0,
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_ledger_import_is_atomic_for_bounded_validated_json_lists(tmp_path):
@@ -573,6 +780,14 @@ def test_current_state_ignores_yesterday_quality_failure_for_today_passed_report
         "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("old-check", "yesterday-run", "old_failure", "blocking", "failed", "{}", "2026-01-01T08:30:00"),
     )
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("today-run", "premarket", today, "passed", f"{today}T08:30:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("today-check", "today-run", "market", "blocking", "passed", "{}", f"{today}T08:31:00+08:00"),
+    )
     connection.commit()
     connection.close()
 
@@ -717,6 +932,24 @@ def test_current_quality_resolver_fails_closed_for_malformed_competing_run(tmp_p
     assert payload["advice_status"] == "blocked"
 
 
+def test_current_quality_resolver_discovers_malformed_as_of_by_current_started_at(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("malformed-as-of", "premarket", "not-a-date", "passed", "2026-07-12T09:00:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice"] == []
+    assert payload["advice_status"] == "blocked"
+
+
 def test_current_quality_resolver_fails_closed_on_candidate_overflow(tmp_path, monkeypatch):
     monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
     monkeypatch.setattr(web_api, "_MAX_CURRENT_RUN_CANDIDATES", 1)
@@ -820,7 +1053,7 @@ def test_present_unreadable_database_fails_closed_for_current_report_content(tmp
     assert "must stay private" not in report.text
 
 
-def test_absent_database_can_rely_on_verified_passed_current_report(tmp_path, monkeypatch):
+def test_absent_database_cannot_authorize_verified_current_report(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
     monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
@@ -836,9 +1069,38 @@ def test_absent_database_can_rely_on_verified_passed_current_report(tmp_path, mo
     state = client.get("/api/current-state")
     report = client.get("/api/reports/2026-07-12/premarket?run_id=initial")
 
-    assert state.json()["advice"] == [advice[0].to_dict()]
-    assert state.json()["advice_status"] == "passed"
-    assert report.status_code == 200
+    assert state.json()["advice"] == []
+    assert state.json()["advice_status"] == "blocked"
+    assert report.status_code == 503
+    assert "verified archive" not in report.text
+
+
+def test_current_failure_blocks_historical_report_content(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "historical conclusion", ["evidence-1"])]
+    write_premarket_report(
+        "2026-07-11",
+        advice,
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "historical")],
+    )
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("current-failure", "failure", "2026-07-12", "failed", "2026-07-12T09:00:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    response = TestClient(create_app(tmp_path)).get("/api/reports/2026-07-11/premarket?run_id=initial")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "current report quality unavailable"}
+    assert "historical conclusion" not in response.text
 
 
 def test_report_content_route_rejects_failure_archives(tmp_path, monkeypatch):

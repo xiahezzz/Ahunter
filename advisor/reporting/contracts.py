@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import re
 import stat
-import time
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -29,6 +28,8 @@ _MAX_REPORT_JSON_BYTES = 2 * 1024 * 1024
 _MAX_REPORT_MARKDOWN_BYTES = 2 * 1024 * 1024
 _MAX_ARCHIVE_CANDIDATES = 500
 _MAX_INVALID_PAGE_CANDIDATES = 16
+_MAX_PAGE_WORK_UNITS = 2_500
+_MAX_PAGE_ARCHIVE_CANDIDATES = 500
 _MIN_CURSOR_SECRET_BYTES = 32
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _QUALITY_SEVERITIES = frozenset({"blocking", "warning", "info"})
@@ -39,6 +40,10 @@ _NATIVE_LINK_NOFOLLOW_SUPPORT = os.link in os.supports_follow_symlinks
 
 
 class ArchiveListingLimitError(ValueError):
+    pass
+
+
+class StaleArchiveCursorError(ValueError):
     pass
 
 
@@ -343,6 +348,24 @@ def read_verified_archive(
     *,
     marker_mtime_cutoff_ns: int | None = None,
 ) -> dict:
+    archive, _snapshot_identity = read_verified_archive_with_identity(
+        output_dir,
+        report_date,
+        report_type,
+        run_id,
+        marker_mtime_cutoff_ns=marker_mtime_cutoff_ns,
+    )
+    return archive
+
+
+def read_verified_archive_with_identity(
+    output_dir: Path,
+    report_date: str,
+    report_type: str,
+    run_id: str = "initial",
+    *,
+    marker_mtime_cutoff_ns: int | None = None,
+) -> tuple[dict, str]:
     """Read an immutable report archive only after its completion marker verifies it."""
     _require_filesystem_capabilities()
     _validate_report_date(report_date)
@@ -358,6 +381,7 @@ def read_verified_archive(
     root_fd, date_fd = _open_existing_report_fds(root, report_date)
     try:
         names = _archive_names(report_type, run_id)
+        snapshot_hasher = hashlib.sha256()
         contents = _read_archive_contents(
             date_fd,
             names,
@@ -365,6 +389,7 @@ def read_verified_archive(
             json_limit=_MAX_REPORT_JSON_BYTES,
             markdown_limit=_MAX_REPORT_MARKDOWN_BYTES,
             marker_mtime_cutoff_ns=marker_mtime_cutoff_ns,
+            snapshot_hasher=snapshot_hasher,
         )
         _reader_hook("buffers_captured", report_date=report_date, report_type=report_type, run_id=run_id)
         _validate_complete_archive_contents(contents, names, report_type, report_date, run_id)
@@ -381,13 +406,16 @@ def read_verified_archive(
 
     if not isinstance(payload, dict):
         raise ValueError("invalid report archive")
-    return {
-        "report_date": report_date,
-        "report_type": report_type,
-        "run_id": run_id,
-        "json": payload,
-        "markdown": markdown,
-    }
+    return (
+        {
+            "report_date": report_date,
+            "report_type": report_type,
+            "run_id": run_id,
+            "json": payload,
+            "markdown": markdown,
+        },
+        snapshot_hasher.hexdigest(),
+    )
 
 
 def list_verified_archives(output_dir: Path, *, start_date: str | None = None, end_date: str | None = None) -> list[dict]:
@@ -445,20 +473,32 @@ def page_verified_archives(
     end = _parse_report_date(end_date) if end_date else today
     if start > end or (end - start).days > 365:
         raise ValueError("invalid report date window")
-    if cursor:
-        after, snapshot_cutoff_ns = _decode_report_cursor(cursor, cursor_secret, start.isoformat(), end.isoformat())
-    else:
-        after = None
-        snapshot_cutoff_ns = time.time_ns()
+    after, expected_snapshot = (
+        _decode_report_cursor(cursor, cursor_secret, start.isoformat(), end.isoformat())
+        if cursor
+        else (None, None)
+    )
     root = _validated_root_path(output_dir)
-    items: list[dict] = []
+    snapshot_items: list[dict] = []
     verified = 0
     invalid = 0
+    work_units = 0
+    archive_candidates = 0
     for report_date in _report_date_window(start.isoformat(), end.isoformat()):
         try:
             root_fd, date_fd = _open_existing_report_fds(root, report_date)
             try:
-                markers = _bounded_directory_entries(date_fd, _MAX_ARCHIVE_CANDIDATES)
+                remaining_work = _MAX_PAGE_WORK_UNITS - work_units
+                if remaining_work < 0:
+                    raise ArchiveListingLimitError("archive page work limit exceeded")
+                entry_limit = min(_MAX_ARCHIVE_CANDIDATES, remaining_work)
+                limit_error = (
+                    "archive page work limit exceeded"
+                    if remaining_work <= _MAX_ARCHIVE_CANDIDATES
+                    else "archive candidate limit exceeded"
+                )
+                markers = _bounded_directory_entries(date_fd, entry_limit, limit_error=limit_error)
+                work_units += len(markers)
             finally:
                 os.close(date_fd)
                 os.close(root_fd)
@@ -467,23 +507,20 @@ def page_verified_archives(
         except (OSError, ValueError):
             continue
         candidates = []
-        for marker, modified_ns in markers:
-            if modified_ns > snapshot_cutoff_ns:
-                continue
+        for marker, _modified_ns in markers:
             match = _MARKER_NAME_RE.fullmatch(marker)
-            if match:
+            if match and match.group("report_type") in {"premarket", "review"}:
                 candidates.append((match.group("report_type"), match.group("run_id") or "initial"))
         for report_type, run_id in sorted(candidates, reverse=True):
-            key = (report_date, report_type, run_id)
-            if after is not None and key >= after:
-                continue
+            archive_candidates += 1
+            if archive_candidates > _MAX_PAGE_ARCHIVE_CANDIDATES:
+                raise ArchiveListingLimitError("archive page work limit exceeded")
+            if work_units >= _MAX_PAGE_WORK_UNITS:
+                raise ArchiveListingLimitError("archive page work limit exceeded")
+            work_units += 1
             try:
-                archive = read_verified_archive(
-                    root,
-                    report_date,
-                    report_type,
-                    run_id,
-                    marker_mtime_cutoff_ns=snapshot_cutoff_ns,
+                archive, snapshot_identity = read_verified_archive_with_identity(
+                    root, report_date, report_type, run_id
                 )
             except ValueError:
                 invalid += 1
@@ -491,43 +528,66 @@ def page_verified_archives(
                     raise ArchiveListingLimitError("invalid archive candidate limit exceeded")
                 continue
             verified += 1
-            if len(items) == limit:
-                return {
-                    "items": items,
-                    "next_cursor": _encode_report_cursor(
-                        items[-1], cursor_secret, start.isoformat(), end.isoformat(), snapshot_cutoff_ns
-                    ),
-                    "truncated": True,
-                    "requested_start_date": start.isoformat(),
-                    "requested_end_date": end.isoformat(),
-                    "verified_candidate_count": verified,
-                }
-            items.append(
+            snapshot_items.append(
                 {
                     "report_date": report_date,
                     "report_type": report_type,
                     "run_id": run_id,
                     "quality_status": archive["json"].get("quality_status", "unknown"),
+                    "_snapshot_identity": snapshot_identity,
                 }
             )
+    snapshot_items = _sort_archives(snapshot_items)
+    snapshot_digest = _report_snapshot_digest(snapshot_items)
+    if expected_snapshot is not None and not hmac.compare_digest(expected_snapshot, snapshot_digest):
+        raise StaleArchiveCursorError("stale report cursor")
+    available = [
+        item
+        for item in snapshot_items
+        if after is None or (item["report_date"], item["report_type"], item["run_id"]) < after
+    ]
+    page_items = [
+        {key: value for key, value in item.items() if key != "_snapshot_identity"}
+        for item in available[:limit]
+    ]
+    truncated = len(available) > limit
+    next_cursor = (
+        _encode_report_cursor(
+            page_items[-1],
+            cursor_secret,
+            start.isoformat(),
+            end.isoformat(),
+            snapshot_digest,
+        )
+        if truncated
+        else None
+    )
     return {
-        "items": items,
-        "next_cursor": None,
-        "truncated": False,
+        "items": page_items,
+        "next_cursor": next_cursor,
+        "truncated": truncated,
         "requested_start_date": start.isoformat(),
         "requested_end_date": end.isoformat(),
         "verified_candidate_count": verified,
     }
 
 
-def _encode_report_cursor(item: dict, secret: bytes, start_date: str, end_date: str, snapshot_cutoff_ns: int) -> str:
+def _report_snapshot_digest(items: list[dict]) -> str:
+    manifest = [
+        [item["report_date"], item["report_type"], item["run_id"], item["_snapshot_identity"]]
+        for item in items
+    ]
+    return hashlib.sha256(json.dumps(manifest, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _encode_report_cursor(item: dict, secret: bytes, start_date: str, end_date: str, snapshot_digest: str) -> str:
     payload = json.dumps(
         {
-            "v": 2,
+            "v": 3,
             "s": start_date,
             "e": end_date,
             "k": [item["report_date"], item["report_type"], item["run_id"]],
-            "c": snapshot_cutoff_ns,
+            "g": snapshot_digest,
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -537,7 +597,7 @@ def _encode_report_cursor(item: dict, secret: bytes, start_date: str, end_date: 
 
 def _decode_report_cursor(
     cursor: str, secret: bytes, start_date: str, end_date: str
-) -> tuple[tuple[str, str, str], int]:
+) -> tuple[tuple[str, str, str], str]:
     if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
         raise ValueError("invalid report cursor")
     try:
@@ -546,16 +606,18 @@ def _decode_report_cursor(
         if not hmac.compare_digest(signature, hmac.digest(secret, payload, "sha256")):
             raise ValueError("invalid report cursor")
         values = json.loads(payload)
-        if values.get("v") != 2 or values.get("s") != start_date or values.get("e") != end_date:
+        if values.get("v") != 3 or values.get("s") != start_date or values.get("e") != end_date:
             raise ValueError("invalid report cursor")
         report_date, report_type, run_id = values["k"]
-        snapshot_cutoff_ns = values["c"]
-        if not isinstance(snapshot_cutoff_ns, int) or isinstance(snapshot_cutoff_ns, bool) or not 0 < snapshot_cutoff_ns <= time.time_ns():
+        snapshot_digest = values["g"]
+        if not isinstance(snapshot_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_digest):
             raise ValueError("invalid report cursor")
         _validate_report_date(report_date)
         _validate_report_type(report_type)
+        if report_type not in {"premarket", "review"}:
+            raise ValueError("invalid report cursor")
         _validate_run_id(run_id)
-        return (report_date, report_type, run_id), snapshot_cutoff_ns
+        return (report_date, report_type, run_id), snapshot_digest
     except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid report cursor") from error
 
@@ -628,7 +690,12 @@ def _bounded_directory_names(directory_fd: int, limit: int, *, reverse: bool = F
     return sorted(names, reverse=reverse)
 
 
-def _bounded_directory_entries(directory_fd: int, limit: int) -> list[tuple[str, int]]:
+def _bounded_directory_entries(
+    directory_fd: int,
+    limit: int,
+    *,
+    limit_error: str = "archive candidate limit exceeded",
+) -> list[tuple[str, int]]:
     entries_with_mtime: list[tuple[str, int]] = []
     with os.scandir(os.dup(directory_fd)) as entries:
         while len(entries_with_mtime) <= limit:
@@ -639,7 +706,7 @@ def _bounded_directory_entries(directory_fd: int, limit: int) -> list[tuple[str,
             entry_stat = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
             entries_with_mtime.append((entry.name, entry_stat.st_mtime_ns))
     if len(entries_with_mtime) > limit:
-        raise ArchiveListingLimitError("archive candidate limit exceeded")
+        raise ArchiveListingLimitError(limit_error)
     return sorted(entries_with_mtime, key=lambda item: item[0])
 
 
@@ -735,6 +802,7 @@ def _read_archive_contents(
     json_limit: int | None = None,
     markdown_limit: int | None = None,
     marker_mtime_cutoff_ns: int | None = None,
+    snapshot_hasher=None,
 ) -> dict[str, bytes]:
     contents = {}
     for key in ("markdown", "json", "marker"):
@@ -745,6 +813,8 @@ def _read_archive_contents(
                 names[key],
                 max_bytes=limit,
                 mtime_cutoff_ns=marker_mtime_cutoff_ns if key == "marker" else None,
+                identity_hasher=snapshot_hasher,
+                identity_label=f"{key}:{names[key]}",
             )
         except FileNotFoundError as error:
             raise ValueError("incomplete report archive") from error
@@ -932,6 +1002,8 @@ def _read_regular_bytes(
     *,
     max_bytes: int | None = None,
     mtime_cutoff_ns: int | None = None,
+    identity_hasher=None,
+    identity_label: str | None = None,
 ) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -952,9 +1024,32 @@ def _read_regular_bytes(
             if max_bytes is not None and total > max_bytes:
                 raise ValueError("archive entry exceeds size limit")
             chunks.append(chunk)
-        return b"".join(chunks)
+        content = b"".join(chunks)
+        final_stat = os.fstat(descriptor)
+        stat_identity = _stable_file_identity(entry_stat)
+        if stat_identity != _stable_file_identity(final_stat):
+            raise ValueError("archive entry changed during read")
+        if identity_hasher is not None:
+            identity_hasher.update(
+                json.dumps([identity_label, *stat_identity], separators=(",", ":")).encode("utf-8")
+            )
+            identity_hasher.update(hashlib.sha256(content).digest())
+        return content
     finally:
         os.close(descriptor)
+
+
+def _stable_file_identity(entry_stat) -> tuple[int, ...]:
+    return (
+        entry_stat.st_dev,
+        entry_stat.st_ino,
+        stat.S_IMODE(entry_stat.st_mode),
+        entry_stat.st_uid,
+        entry_stat.st_gid,
+        entry_stat.st_size,
+        entry_stat.st_mtime_ns,
+        entry_stat.st_ctime_ns,
+    )
 
 
 def _entry_exists(directory_fd: int, name: str) -> bool:

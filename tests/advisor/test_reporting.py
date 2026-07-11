@@ -40,6 +40,21 @@ def completion_marker(paths) -> Path:
     return paths.json_path.with_name(f"{paths.json_path.stem}.complete.json")
 
 
+def convert_archive_to_failure(paths) -> None:
+    marker_path = completion_marker(paths)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    failure_markdown = paths.markdown_path.with_name("failure.md")
+    failure_json = paths.json_path.with_name("failure.json")
+    paths.markdown_path.replace(failure_markdown)
+    paths.json_path.replace(failure_json)
+    marker["report_time"] = "22:30"
+    marker["report_type"] = "failure"
+    marker["files"]["markdown"]["name"] = failure_markdown.name
+    marker["files"]["json"]["name"] = failure_json.name
+    marker_path.unlink()
+    marker_path.with_name("failure.complete.json").write_text(json.dumps(marker), encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     "result",
     [
@@ -219,6 +234,20 @@ def test_verified_archive_page_uses_cursor_without_duplicate_items(tmp_path: Pat
     assert first["verified_candidate_count"] <= 2
 
 
+def test_verified_archive_page_excludes_failure_archives(tmp_path: Path):
+    failure_paths = write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
+    convert_archive_to_failure(failure_paths)
+
+    page = contracts.page_verified_archives(
+        tmp_path,
+        start_date="2026-07-11",
+        end_date="2026-07-11",
+        cursor_secret=CURSOR_SECRET,
+    )
+
+    assert page["items"] == []
+
+
 @pytest.mark.parametrize("secret", [None, b"", b"too-short"])
 def test_verified_archive_page_requires_explicit_strong_cursor_secret(tmp_path: Path, secret):
     write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
@@ -232,7 +261,7 @@ def test_verified_archive_page_requires_explicit_strong_cursor_secret(tmp_path: 
         )
 
 
-def test_verified_archive_cursor_snapshot_excludes_archives_published_between_pages(tmp_path: Path):
+def test_verified_archive_cursor_rejects_archive_addition_as_stale(tmp_path: Path):
     write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
     write_premarket_report("2026-07-09", [], tmp_path, quality_results=passing_quality())
     first = contracts.page_verified_archives(
@@ -244,20 +273,18 @@ def test_verified_archive_cursor_snapshot_excludes_archives_published_between_pa
     )
 
     write_premarket_report("2026-07-10", [], tmp_path, quality_results=passing_quality())
-    second = contracts.page_verified_archives(
-        tmp_path,
-        start_date="2026-07-09",
-        end_date="2026-07-11",
-        limit=2,
-        cursor=first["next_cursor"],
-        cursor_secret=CURSOR_SECRET,
-    )
-
-    assert [item["report_date"] for item in first["items"] + second["items"]] == ["2026-07-11", "2026-07-09"]
-    assert second["next_cursor"] is None
+    with pytest.raises(ValueError, match="stale report cursor"):
+        contracts.page_verified_archives(
+            tmp_path,
+            start_date="2026-07-09",
+            end_date="2026-07-11",
+            limit=2,
+            cursor=first["next_cursor"],
+            cursor_secret=CURSOR_SECRET,
+        )
 
 
-def test_verified_archive_cursor_checks_cutoff_on_exact_marker_descriptor(tmp_path: Path, monkeypatch):
+def test_verified_archive_cursor_rejects_exact_marker_replacement_as_stale(tmp_path: Path, monkeypatch):
     write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
     older_paths = write_premarket_report("2026-07-09", [], tmp_path, quality_results=passing_quality())
     first = contracts.page_verified_archives(
@@ -269,7 +296,7 @@ def test_verified_archive_cursor_checks_cutoff_on_exact_marker_descriptor(tmp_pa
     )
     marker = completion_marker(older_paths)
     marker_bytes = marker.read_bytes()
-    real_reader = contracts.read_verified_archive
+    real_reader = contracts.read_verified_archive_with_identity
     replaced = False
 
     def replace_before_open(*args, **kwargs):
@@ -281,18 +308,40 @@ def test_verified_archive_cursor_checks_cutoff_on_exact_marker_descriptor(tmp_pa
             replaced = True
         return real_reader(*args, **kwargs)
 
-    monkeypatch.setattr(contracts, "read_verified_archive", replace_before_open)
-    second = contracts.page_verified_archives(
+    monkeypatch.setattr(contracts, "read_verified_archive_with_identity", replace_before_open)
+    with pytest.raises(ValueError, match="stale report cursor"):
+        contracts.page_verified_archives(
+            tmp_path,
+            start_date="2026-07-09",
+            end_date="2026-07-11",
+            limit=1,
+            cursor=first["next_cursor"],
+            cursor_secret=CURSOR_SECRET,
+        )
+    assert replaced is True
+
+
+def test_verified_archive_cursor_rejects_archive_deletion_as_stale(tmp_path: Path):
+    write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
+    older_paths = write_premarket_report("2026-07-09", [], tmp_path, quality_results=passing_quality())
+    first = contracts.page_verified_archives(
         tmp_path,
         start_date="2026-07-09",
         end_date="2026-07-11",
         limit=1,
-        cursor=first["next_cursor"],
         cursor_secret=CURSOR_SECRET,
     )
+    completion_marker(older_paths).unlink()
 
-    assert replaced is True
-    assert second["items"] == []
+    with pytest.raises(ValueError, match="stale report cursor"):
+        contracts.page_verified_archives(
+            tmp_path,
+            start_date="2026-07-09",
+            end_date="2026-07-11",
+            limit=1,
+            cursor=first["next_cursor"],
+            cursor_secret=CURSOR_SECRET,
+        )
 
 
 def test_verified_archive_cursor_rejects_tampering_and_cross_window_replay(tmp_path: Path):
@@ -328,17 +377,17 @@ def test_verified_archive_cursor_rejects_tampering_and_cross_window_replay(tmp_p
         )
 
 
-def test_verified_archive_page_verification_work_is_bounded_by_page_size(tmp_path: Path, monkeypatch):
+def test_verified_archive_page_verifies_complete_bounded_snapshot(tmp_path: Path, monkeypatch):
     for day in range(1, 11):
         write_premarket_report(f"2026-07-{day:02d}", [], tmp_path, quality_results=passing_quality())
-    real_reader = contracts.read_verified_archive
+    real_reader = contracts.read_verified_archive_with_identity
     calls = []
 
     def tracking_reader(*args, **kwargs):
         calls.append((args[1], args[2], args[3]))
         return real_reader(*args, **kwargs)
 
-    monkeypatch.setattr(contracts, "read_verified_archive", tracking_reader)
+    monkeypatch.setattr(contracts, "read_verified_archive_with_identity", tracking_reader)
     page = contracts.page_verified_archives(
         tmp_path,
         start_date="2026-07-01",
@@ -348,8 +397,9 @@ def test_verified_archive_page_verification_work_is_bounded_by_page_size(tmp_pat
     )
 
     assert len(page["items"]) == 2
-    assert len(calls) <= 3
-    assert page["verified_candidate_count"] <= 3
+    assert len(calls) == 10
+    assert len(calls) <= contracts._MAX_PAGE_ARCHIVE_CANDIDATES
+    assert page["verified_candidate_count"] == 10
 
 
 def test_verified_archive_page_fails_closed_at_global_invalid_candidate_budget(tmp_path: Path, monkeypatch):
@@ -357,14 +407,14 @@ def test_verified_archive_page_fails_closed_at_global_invalid_candidate_budget(t
     date_dir.mkdir()
     for index in range(contracts._MAX_INVALID_PAGE_CANDIDATES + 5):
         (date_dir / f"premarket.bad-{index}.complete.json").write_text("{}", encoding="utf-8")
-    real_reader = contracts.read_verified_archive
+    real_reader = contracts.read_verified_archive_with_identity
     calls = []
 
     def tracking_reader(*args, **kwargs):
         calls.append(args[3])
         return real_reader(*args, **kwargs)
 
-    monkeypatch.setattr(contracts, "read_verified_archive", tracking_reader)
+    monkeypatch.setattr(contracts, "read_verified_archive_with_identity", tracking_reader)
 
     with pytest.raises(contracts.ArchiveListingLimitError, match="invalid archive candidate limit exceeded"):
         contracts.page_verified_archives(
@@ -375,6 +425,48 @@ def test_verified_archive_page_fails_closed_at_global_invalid_candidate_budget(t
             cursor_secret=CURSOR_SECRET,
         )
     assert len(calls) == contracts._MAX_INVALID_PAGE_CANDIDATES + 1
+
+
+def test_verified_archive_page_enforces_aggregate_directory_budget_across_dates(tmp_path: Path, monkeypatch):
+    for report_date in ("2026-07-09", "2026-07-10", "2026-07-11"):
+        write_premarket_report(report_date, [], tmp_path, quality_results=passing_quality())
+    monkeypatch.setattr(contracts, "_MAX_PAGE_WORK_UNITS", 4)
+    original_scandir = contracts.os.scandir
+    advances = 0
+
+    def tracking_scandir(directory):
+        context = original_scandir(directory)
+
+        class TrackingIterator:
+            def __enter__(self):
+                self.iterator = context.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return context.__exit__(*args)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                nonlocal advances
+                entry = next(self.iterator)
+                advances += 1
+                return entry
+
+        return TrackingIterator()
+
+    monkeypatch.setattr(contracts.os, "scandir", tracking_scandir)
+
+    with pytest.raises(contracts.ArchiveListingLimitError, match="archive page work limit exceeded"):
+        contracts.page_verified_archives(
+            tmp_path,
+            start_date="2026-07-09",
+            end_date="2026-07-11",
+            limit=1,
+            cursor_secret=CURSOR_SECRET,
+        )
+    assert advances <= contracts._MAX_PAGE_WORK_UNITS + 1
 
 
 def test_write_review_report_links_to_morning_advice(tmp_path: Path):

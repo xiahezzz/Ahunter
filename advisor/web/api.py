@@ -18,7 +18,12 @@ from fastapi.responses import StreamingResponse
 from advisor import paths as advisor_paths
 from advisor.db.migrate import migrate_database
 from advisor.ledger.model import LedgerTransaction, apply_transactions
-from advisor.reporting.contracts import page_verified_archives, read_active_verified_archive, read_verified_archive
+from advisor.reporting.contracts import (
+    StaleArchiveCursorError,
+    page_verified_archives,
+    read_active_verified_archive,
+    read_verified_archive,
+)
 
 
 _COMPONENTS = ("collector", "market_updater", "advisor_scheduler", "frontend", "api")
@@ -28,6 +33,7 @@ _CODE_RE = re.compile(r"(?:[0368]\d{5}|(?:SH|SZ|BJ)\d{6})\Z")
 _ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _TRANSACTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_CHART_TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _MAX_IMPORT_TRANSACTIONS = 500
 _LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
 _MAX_LEDGER_REPLAY_ROWS = 10_000
@@ -41,6 +47,10 @@ _MAX_PROFILE_JSON_BYTES = 64 * 1024
 _MAX_PROFILE_JSON_DEPTH = 8
 _MAX_PROFILE_JSON_ITEMS = 500
 _MAX_PROFILE_STRING_LENGTH = 4096
+_MAX_DB_NAME_LENGTH = 256
+_MAX_DB_INDUSTRY_LENGTH = 256
+_MAX_DB_TIMESTAMP_LENGTH = 64
+_MAX_SQLITE_INTEGER = 2**63 - 1
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -74,6 +84,8 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
                 end_date=end_date,
                 cursor_secret=report_cursor_secret,
             )
+        except StaleArchiveCursorError:
+            raise HTTPException(status_code=409, detail="report cursor stale") from None
         except ValueError:
             raise HTTPException(status_code=503, detail="report listing unavailable") from None
         page["reports"] = [
@@ -93,20 +105,19 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
             archive = read_verified_archive(advisor_paths.reports_dir(), report_date, report_type, run_id)
         except (OSError, ValueError, RuntimeError):
             raise HTTPException(status_code=404, detail="report not found") from None
-        if report_date == _shanghai_today().isoformat():
-            db_path = resolved_state_dir / "advisor.sqlite"
-            connection = _read_connection(db_path)
-            try:
-                quality = _resolve_current_run_quality(
-                    connection,
-                    report_date,
-                    database_present=_database_entry_present(db_path),
-                )
-            finally:
-                if connection is not None:
-                    connection.close()
-            if not quality["safe"]:
-                raise HTTPException(status_code=503, detail="current report quality unavailable")
+        db_path = resolved_state_dir / "advisor.sqlite"
+        connection = _read_connection(db_path)
+        try:
+            quality = _resolve_current_run_quality(
+                connection,
+                _shanghai_today().isoformat(),
+                database_present=_database_entry_present(db_path),
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+        if not quality["safe"]:
+            raise HTTPException(status_code=503, detail="current report quality unavailable")
         return archive
 
     @app.get("/api/profiles")
@@ -254,8 +265,17 @@ def _current_state(state_dir: Path, report_cursor_secret: bytes) -> dict:
     review = _read_today_report(today, "review")
     premarket_status = _report_status(premarket)
     review_status = _report_status(review)
-    premarket_blocked = not current_quality["safe"] or premarket_status == "blocked"
-    review_blocked = not current_quality["safe"] or review_status == "blocked"
+    quality_blocks_empty_state = current_quality["available"] and not current_quality["safe"]
+    premarket_blocked = (
+        premarket_status == "blocked"
+        or quality_blocks_empty_state
+        or (premarket is not None and not current_quality["safe"])
+    )
+    review_blocked = (
+        review_status == "blocked"
+        or quality_blocks_empty_state
+        or (review is not None and not current_quality["safe"])
+    )
     checks = current_quality["blocking_checks"]
     return {
         "today": today,
@@ -326,6 +346,8 @@ def _read_ledger_records(connection: sqlite3.Connection | None, *, limit: int | 
     records = []
     for row in rows:
         try:
+            if not _valid_account_id(row["account_id"]):
+                raise ValueError("invalid account")
             _ledger_transaction_from_row(row)
         except ValueError:
             return []
@@ -416,7 +438,7 @@ def _write_ledger_transactions(
             raise _LedgerConflictError("duplicate transaction id")
         _validate_candidate_ledger_state(existing_rows, transactions)
         for account_id, transaction in transactions:
-            now = datetime.now().isoformat()
+            now = datetime.now(_SHANGHAI).isoformat()
             connection.execute(
                 "INSERT OR IGNORE INTO ledger_accounts (account_id, name, currency, created_at) VALUES (?, ?, 'CNY', ?)",
                 (account_id, account_id, now),
@@ -482,6 +504,8 @@ def _validate_candidate_ledger_state(
     grouped: dict[str, list[LedgerTransaction]] = defaultdict(list)
     for row in existing_rows:
         try:
+            if not _valid_account_id(row["account_id"]):
+                raise ValueError("invalid account")
             grouped[row["account_id"]].append(_ledger_transaction_from_row(row))
         except ValueError as error:
             raise _LedgerConflictError("ledger state is invalid") from error
@@ -498,6 +522,8 @@ def _derive_ledger_state(rows: list[sqlite3.Row], connection: sqlite3.Connection
     transactions_by_account: dict[str, list[LedgerTransaction]] = defaultdict(list)
     for row in rows:
         try:
+            if not _valid_account_id(row["account_id"]):
+                raise ValueError("invalid account")
             transaction = _ledger_transaction_from_row(row)
         except ValueError:
             return _empty_ledger_state()
@@ -512,6 +538,8 @@ def _derive_ledger_state(rows: list[sqlite3.Row], connection: sqlite3.Connection
             state = apply_transactions(transactions_by_account[account_id])
         except ValueError:
             return _empty_ledger_state()
+        if not all(_finite_number(value) for value in (state.cash, state.realized_pnl, *state.cost_basis.values())):
+            return _empty_ledger_state()
         accounts.append(
             {
                 "account_id": account_id,
@@ -521,6 +549,8 @@ def _derive_ledger_state(rows: list[sqlite3.Row], connection: sqlite3.Connection
         )
         cash += state.cash
         realized_pnl += state.realized_pnl
+        if not _finite_number(cash) or not _finite_number(realized_pnl):
+            return _empty_ledger_state()
         for code, quantity in state.positions.items():
             item = positions.setdefault(code, {"code": code, "quantity": 0, "cost_basis": 0.0})
             item["quantity"] += quantity
@@ -532,7 +562,12 @@ def _derive_ledger_state(rows: list[sqlite3.Row], connection: sqlite3.Connection
     for code in sorted(positions):
         item = positions[code]
         close = closes.get(code)
-        market_value = float(item["quantity"]) * close if close is not None else None
+        try:
+            market_value = float(item["quantity"]) * close if close is not None else None
+        except OverflowError:
+            return _empty_ledger_state()
+        if market_value is not None and not _finite_number(market_value):
+            return _empty_ledger_state()
         item["market_price"] = close
         item["market_value"] = market_value
         item["unrealized_pnl"] = market_value - float(item["cost_basis"]) if market_value is not None else 0.0
@@ -611,7 +646,7 @@ def _resolve_current_run_quality(
     connection: sqlite3.Connection | None, today: str, *, database_present: bool
 ) -> dict:
     if connection is None:
-        return {"safe": not database_present, "blocking_checks": [], "active_run": None}
+        return {"safe": False, "available": database_present, "blocking_checks": [], "active_run": None}
     try:
         parsed_today = date.fromisoformat(today)
         prefixes = tuple((parsed_today + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1))
@@ -619,34 +654,35 @@ def _resolve_current_run_quality(
             """
             SELECT run_id, run_type, as_of, status, started_at
             FROM advisor_runs
-            WHERE substr(as_of, 1, 10) IN (?, ?, ?)
+            WHERE (substr(as_of, 1, 10) IN (?, ?, ?)
+               OR substr(started_at, 1, 10) IN (?, ?, ?))
               AND run_type IN ('premarket', 'review', 'failure')
             LIMIT ?
             """,
-            (*prefixes, _MAX_CURRENT_RUN_CANDIDATES + 1),
+            (*prefixes, *prefixes, _MAX_CURRENT_RUN_CANDIDATES + 1),
         ).fetchall()
     except (sqlite3.Error, ValueError):
-        return {"safe": False, "blocking_checks": [], "active_run": None}
+        return {"safe": False, "available": True, "blocking_checks": [], "active_run": None}
     if len(rows) > _MAX_CURRENT_RUN_CANDIDATES:
-        return {"safe": False, "blocking_checks": [], "active_run": None}
+        return {"safe": False, "available": True, "blocking_checks": [], "active_run": None}
     candidates: list[tuple[datetime, str, sqlite3.Row]] = []
     for row in rows:
         try:
             as_of = _parse_shanghai_datetime(row["as_of"])
             started = _parse_shanghai_datetime(row["started_at"])
         except (KeyError, ValueError):
-            return {"safe": False, "blocking_checks": [], "active_run": None}
+            return {"safe": False, "available": True, "blocking_checks": [], "active_run": None}
         if (
             not isinstance(row["run_id"], str)
             or not row["run_id"]
             or row["run_type"] not in {"premarket", "review", "failure"}
             or row["status"] not in {"passed", "failed", "blocked", "running"}
         ):
-            return {"safe": False, "blocking_checks": [], "active_run": None}
+            return {"safe": False, "available": True, "blocking_checks": [], "active_run": None}
         if as_of.date().isoformat() == today:
             candidates.append((started, row["run_id"], row))
     if not candidates:
-        return {"safe": True, "blocking_checks": [], "active_run": None}
+        return {"safe": False, "available": True, "blocking_checks": [], "active_run": None}
     latest = max(candidates, key=lambda item: (item[0], item[1]))[2]
     try:
         check_rows = connection.execute(
@@ -660,9 +696,9 @@ def _resolve_current_run_quality(
             (latest["run_id"], _MAX_CURRENT_QUALITY_CHECKS + 1),
         ).fetchall()
     except sqlite3.Error:
-        return {"safe": False, "blocking_checks": [], "active_run": dict(latest)}
+        return {"safe": False, "available": True, "blocking_checks": [], "active_run": dict(latest)}
     if len(check_rows) > _MAX_CURRENT_QUALITY_CHECKS:
-        return {"safe": False, "blocking_checks": [], "active_run": dict(latest)}
+        return {"safe": False, "available": True, "blocking_checks": [], "active_run": dict(latest)}
     checks = [dict(row) for row in check_rows]
     try:
         valid_checks = bool(checks) and all(
@@ -686,7 +722,8 @@ def _resolve_current_run_quality(
         else []
     )
     return {
-        "safe": latest["status"] == "passed" and valid_checks and not blocking,
+        "safe": latest["run_type"] != "failure" and latest["status"] == "passed" and valid_checks and not blocking,
+        "available": True,
         "blocking_checks": blocking,
         "active_run": dict(latest),
     }
@@ -743,9 +780,14 @@ def _read_profile_links(connection: sqlite3.Connection | None) -> list[dict]:
         return []
     profiles = []
     for row in rows:
-        if not _CODE_RE.fullmatch(row["code"]) or _read_profile(connection, row["code"]) is None:
+        if not isinstance(row["code"], str) or not _CODE_RE.fullmatch(row["code"]):
             continue
-        profiles.append({"code": row["code"], "name": row["name"] or row["code"], "href": f"/api/profiles/{row['code']}"})
+        profile = _read_profile(connection, row["code"])
+        if profile is None:
+            continue
+        profiles.append(
+            {"code": row["code"], "name": profile["name"], "href": f"/api/profiles/{row['code']}"}
+        )
     return profiles
 
 
@@ -769,6 +811,14 @@ def _read_profile(connection: sqlite3.Connection | None, code: str) -> dict | No
     if row is None:
         return None
     try:
+        name = row["name"] or row["code"]
+        if not _bounded_db_string(name, _MAX_DB_NAME_LENGTH):
+            raise ValueError("invalid profile scalar")
+        industry = row["industry"]
+        if industry is not None and not _bounded_db_string(industry, _MAX_DB_INDUSTRY_LENGTH):
+            raise ValueError("invalid profile scalar")
+        if not _valid_db_timestamp(row["updated_at"]):
+            raise ValueError("invalid profile scalar")
         thesis = _load_json_field(row["thesis_json"], dict)
         information_flow = _load_json_field(row["information_flow_json"], list)
         capital_flow = _load_json_field(row["capital_flow_json"], list)
@@ -784,8 +834,8 @@ def _read_profile(connection: sqlite3.Connection | None, code: str) -> dict | No
         return None
     return {
         "code": row["code"],
-        "name": row["name"] or row["code"],
-        "industry": row["industry"],
+        "name": name,
+        "industry": industry,
         "thesis": thesis,
         "information_flow": information_flow,
         "capital_flow": capital_flow,
@@ -827,7 +877,7 @@ def _validate_profile_json_value(payload: object) -> None:
         if value is None or isinstance(value, bool):
             return
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if not math.isfinite(float(value)):
+            if not _finite_number(value):
                 raise ValueError("invalid stored json")
             return
         if isinstance(value, list):
@@ -859,17 +909,29 @@ def _read_chart_links(connection: sqlite3.Connection | None, state_dir: Path) ->
         ).fetchall()
     except sqlite3.Error:
         return []
-    return [
-        {
-            "asset_id": row["asset_id"],
-            "code": row["code"],
-            "chart_type": row["chart_type"],
-            "as_of": row["as_of"],
-            "href": f"/api/charts/{row['asset_id']}",
-        }
-        for row in rows
-        if _ASSET_ID_RE.fullmatch(row["asset_id"]) and _safe_chart_path(row["path"], state_dir) is not None
-    ]
+    charts = []
+    for row in rows:
+        if not (
+            isinstance(row["asset_id"], str)
+            and _ASSET_ID_RE.fullmatch(row["asset_id"])
+            and isinstance(row["code"], str)
+            and _CODE_RE.fullmatch(row["code"])
+            and isinstance(row["chart_type"], str)
+            and _CHART_TYPE_RE.fullmatch(row["chart_type"])
+            and _valid_db_timestamp(row["as_of"])
+            and _safe_chart_path(row["path"], state_dir) is not None
+        ):
+            continue
+        charts.append(
+            {
+                "asset_id": row["asset_id"],
+                "code": row["code"],
+                "chart_type": row["chart_type"],
+                "as_of": row["as_of"],
+                "href": f"/api/charts/{row['asset_id']}",
+            }
+        )
+    return charts
 
 
 def _open_chart_descriptor(connection: sqlite3.Connection | None, state_dir: Path, asset_id: str) -> int | None:
@@ -1004,7 +1066,37 @@ def _chart_hook(_event: str, **_context) -> None:
 
 
 def _finite_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    if isinstance(value, int) and not -_MAX_SQLITE_INTEGER <= value <= _MAX_SQLITE_INTEGER:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _bounded_db_string(value: object, max_length: int) -> bool:
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= max_length * 4
+    except UnicodeError:
+        return False
+
+
+def _valid_db_timestamp(value: object) -> bool:
+    if not _bounded_db_string(value, _MAX_DB_TIMESTAMP_LENGTH):
+        return False
+    try:
+        _parse_shanghai_datetime(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_account_id(value: object) -> bool:
+    return isinstance(value, str) and bool(_ACCOUNT_ID_RE.fullmatch(value))
 
 
 def _validate_ledger_transaction(transaction: LedgerTransaction) -> None:
@@ -1017,7 +1109,11 @@ def _validate_ledger_transaction(transaction: LedgerTransaction) -> None:
         raise ValueError("invalid trade date") from error
     if transaction.transaction_type not in {"cash_deposit", "cash_withdrawal", "buy", "sell", "fee", "tax"}:
         raise ValueError("invalid transaction type")
-    if not isinstance(transaction.quantity, int) or isinstance(transaction.quantity, bool) or transaction.quantity < 0:
+    if (
+        not isinstance(transaction.quantity, int)
+        or isinstance(transaction.quantity, bool)
+        or not 0 <= transaction.quantity <= _MAX_SQLITE_INTEGER
+    ):
         raise ValueError("invalid quantity")
     if not all(_finite_number(value) for value in (transaction.price, transaction.amount, transaction.fees)):
         raise ValueError("invalid numeric amount")
