@@ -9,9 +9,11 @@ from advisor.reporting.contracts import (
     ReviewItem,
     atomic_write_pair,
     ensure_archive_is_new,
+    load_premarket_link,
     normalize_context,
     normalize_quality_results,
     report_paths,
+    validate_run_id,
     validate_unique_ids,
 )
 from advisor.reporting.premarket import DISCLAIMER
@@ -28,27 +30,41 @@ def write_review_report(
     run_id: str | None = None,
     rerun_reason: str | None = None,
     supersedes: str | None = None,
+    premarket_run_id: str = "initial",
 ) -> ReportPaths:
-    validate_unique_ids(morning_advice, "advice_id")
-    validate_unique_ids(review_items, "review_id")
-    advice_by_id = {item.advice_id: item for item in morning_advice}
-    for item in review_items:
-        if item.advice_id not in advice_by_id:
-            raise ValueError(f"orphan advice_id: {item.advice_id}")
     quality_status, quality_payload = normalize_quality_results(quality_results)
-    context_payload = normalize_context(context)
     paths, resolved_run_id, supersession = report_paths(
         output_dir,
+        report_date,
         "review",
         run_id=run_id,
         rerun_reason=rerun_reason,
         supersedes=supersedes,
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    validate_run_id(premarket_run_id)
     ensure_archive_is_new(paths)
-    published_advice = morning_advice if quality_status == "passed" else []
-    published_reviews = review_items if quality_status == "passed" else []
-    published_context = context_payload if quality_status == "passed" else {}
+    if quality_status == "passed":
+        validate_unique_ids(morning_advice, "advice_id")
+        validate_unique_ids(review_items, "review_id")
+        advice_by_id = {item.advice_id: item for item in morning_advice}
+        for item in review_items:
+            if item.advice_id not in advice_by_id:
+                raise ValueError(f"orphan advice_id: {item.advice_id}")
+        published_advice = morning_advice
+        published_reviews = review_items
+        published_context = normalize_context(context)
+        linked_premarket = load_premarket_link(
+            paths.json_path.parent,
+            report_date,
+            premarket_run_id,
+            morning_advice,
+        )
+    else:
+        advice_by_id = {}
+        published_advice = []
+        published_reviews = []
+        published_context = {}
+        linked_premarket = None
     lines = [
         f"# {report_date} 22:30 Daily Review",
         "",
@@ -101,6 +117,7 @@ def write_review_report(
         json.dumps(
             {
                 "context": published_context,
+                "linked_premarket": linked_premarket,
                 "morning_advice": [item.to_dict() for item in published_advice],
                 "morning_advice_ids": [item.advice_id for item in published_advice],
                 "quality_results": quality_payload,

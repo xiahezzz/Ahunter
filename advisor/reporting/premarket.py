@@ -29,20 +29,23 @@ def write_premarket_report(
     rerun_reason: str | None = None,
     supersedes: str | None = None,
 ) -> ReportPaths:
-    validate_unique_ids(advice_items, "advice_id")
     quality_status, quality_payload = normalize_quality_results(quality_results)
-    context_payload = normalize_context(context)
     paths, resolved_run_id, supersession = report_paths(
         output_dir,
+        report_date,
         "premarket",
         run_id=run_id,
         rerun_reason=rerun_reason,
         supersedes=supersedes,
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
     ensure_archive_is_new(paths)
-    published_advice = advice_items if quality_status == "passed" else []
-    published_context = context_payload if quality_status == "passed" else {}
+    if quality_status == "passed":
+        validate_unique_ids(advice_items, "advice_id")
+        published_advice = advice_items
+        published_context = normalize_context(context)
+    else:
+        published_advice = []
+        published_context = {}
     lines = [
         f"# {report_date} 08:30 Premarket Advice",
         "",
