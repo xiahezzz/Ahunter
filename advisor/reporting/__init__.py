@@ -1,0 +1,1 @@
+"""Daily advisor report generation."""
