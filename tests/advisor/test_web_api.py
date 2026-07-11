@@ -371,6 +371,23 @@ def test_ledger_replay_cap_returns_degraded_error_without_unbounded_history(tmp_
     assert response.json()["detail"] == "ledger history exceeds replay limit"
 
 
+def test_ledger_capacity_crossing_rejects_before_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "_MAX_LEDGER_REPLAY_ROWS", 1)
+    client = TestClient(create_app(tmp_path))
+    first = {"transaction_id": "cash-1", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 1, "fees": 0}
+    second = {"transaction_id": "cash-2", "trade_date": "2026-07-11", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 1, "fees": 0}
+
+    assert client.post("/api/ledger/transactions", json=first).status_code == 201
+    rejected = client.post("/api/ledger/transactions", json=second)
+    database = sqlite3.connect(tmp_path / "advisor.sqlite")
+    count = database.execute("SELECT COUNT(*) FROM ledger_transactions").fetchone()[0]
+    database.close()
+
+    assert rejected.status_code == 503
+    assert rejected.json()["detail"] == "ledger history exceeds replay limit"
+    assert count == 1
+
+
 def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
@@ -432,7 +449,7 @@ def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_p
 
     assert payload["advice"] == []
     assert payload["advice_status"] == "blocked"
-    assert payload["review"] == {"status": "passed", "items": [ReviewItem("review-1", "advice-1", "valid", "fixture review").to_dict()]}
+    assert payload["review"] == {"status": "blocked", "items": []}
     assert payload["ledger"]["cash"] == 1000.0
     assert payload["flows"] == {
         "information": {"status": "ok", "count": 1},
@@ -497,10 +514,31 @@ def test_current_blocked_run_without_checks_fails_closed(tmp_path, monkeypatch):
     assert payload["advice_status"] == "blocked"
 
 
+def test_newer_timestamped_current_day_failure_run_blocks_passed_archive(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    today = date.today().isoformat()
+    advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "fixture", ["evidence-1"])]
+    write_premarket_report(today, advice, reports_root, quality_results=[QualityResult("market", "blocking", True, "current")])
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute("INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)", ("passed-run", "premarket", f"{today}T08:30:00", "passed", f"{today}T08:30:00"))
+    connection.execute("INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", ("passed-check", "passed-run", "market", "blocking", "passed", "{}", f"{today}T08:30:00"))
+    connection.execute("INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)", ("failure-run", "failure", f"{today}T09:00:00", "failed", f"{today}T09:00:00"))
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice"] == []
+    assert payload["advice_status"] == "blocked"
+
+
 def test_current_state_fails_closed_for_malformed_report_quality(tmp_path, monkeypatch):
     malformed_report = {"json": {"quality_status": "not-valid", "advice": [{"advice_id": "advice-1"}]}}
     monkeypatch.setattr(web_api, "_read_report_links", lambda: [])
-    monkeypatch.setattr(web_api, "_latest_report", lambda _today, report_type, _links: malformed_report if report_type == "premarket" else None)
+    monkeypatch.setattr(web_api, "_read_today_report", lambda _today, report_type: malformed_report if report_type == "premarket" else None)
 
     payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
 

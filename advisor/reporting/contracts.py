@@ -1,6 +1,6 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, timedelta
 import fcntl
 import hashlib
 import json
@@ -28,6 +28,10 @@ _NATIVE_DIR_FD_SUPPORT = all(
     function in os.supports_dir_fd for function in (os.open, os.mkdir, os.link, os.stat, os.unlink, os.rmdir)
 )
 _NATIVE_LINK_NOFOLLOW_SUPPORT = os.link in os.supports_follow_symlinks
+
+
+class ArchiveListingLimitError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -369,23 +373,12 @@ def read_verified_archive(
     }
 
 
-def list_verified_archives(output_dir: Path) -> list[dict]:
+def list_verified_archives(output_dir: Path, *, start_date: str | None = None, end_date: str | None = None) -> list[dict]:
     """Return metadata for complete, immutable report archives without writing to disk."""
     _require_filesystem_capabilities()
     root = _validated_root_path(output_dir)
-    root_fd = _open_existing_root_fd(root)
-    try:
-        report_dates = _bounded_directory_names(root_fd, _MAX_ARCHIVE_CANDIDATES, reverse=True)
-    finally:
-        os.close(root_fd)
-
     archives: list[dict] = []
-    candidate_count = 0
-    for report_date in report_dates[:_MAX_ARCHIVE_CANDIDATES]:
-        try:
-            _validate_report_date(report_date)
-        except ValueError:
-            continue
+    for report_date in _report_date_window(start_date, end_date):
         try:
             root_fd, date_fd = _open_existing_report_fds(root, report_date)
             try:
@@ -393,15 +386,14 @@ def list_verified_archives(output_dir: Path) -> list[dict]:
             finally:
                 os.close(date_fd)
                 os.close(root_fd)
+        except ArchiveListingLimitError:
+            raise
         except (OSError, ValueError):
             continue
-        for marker_name in markers[:_MAX_ARCHIVE_CANDIDATES]:
+        for marker_name in markers:
             match = _MARKER_NAME_RE.fullmatch(marker_name)
             if match is None:
                 continue
-            candidate_count += 1
-            if candidate_count > _MAX_ARCHIVE_CANDIDATES:
-                return _sort_archives(archives)
             run_id = match.group("run_id") or "initial"
             try:
                 archive = read_verified_archive(root, report_date, match.group("report_type"), run_id)
@@ -429,12 +421,27 @@ def _sort_archives(archives: list[dict]) -> list[dict]:
 def _bounded_directory_names(directory_fd: int, limit: int, *, reverse: bool = False) -> list[str]:
     names: list[str] = []
     with os.scandir(os.dup(directory_fd)) as entries:
-        while len(names) < limit:
+        while len(names) <= limit:
             try:
                 names.append(next(entries).name)
             except StopIteration:
                 break
+    if len(names) > limit:
+        raise ArchiveListingLimitError("archive candidate limit exceeded")
     return sorted(names, reverse=reverse)
+
+
+def _report_date_window(start_date: str | None, end_date: str | None) -> list[str]:
+    end = date.today() if end_date is None else _parse_report_date(end_date)
+    start = end - timedelta(days=365) if start_date is None else _parse_report_date(start_date)
+    if start > end or (end - start).days > 365:
+        raise ValueError("invalid report date window")
+    return [(end - timedelta(days=offset)).isoformat() for offset in range((end - start).days + 1)]
+
+
+def _parse_report_date(value: str) -> date:
+    _validate_report_date(value)
+    return date.fromisoformat(value)
 
 
 def _validate_predecessor_archive(

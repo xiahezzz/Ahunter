@@ -143,9 +143,8 @@ def test_list_verified_archives_bounds_candidate_verification(tmp_path: Path, mo
     write_review_report("2026-07-11", [], [], tmp_path, quality_results=passing_quality())
     monkeypatch.setattr(contracts, "_MAX_ARCHIVE_CANDIDATES", 1)
 
-    archives = contracts.list_verified_archives(tmp_path)
-
-    assert len(archives) == 1
+    with pytest.raises(ValueError, match="archive candidate limit exceeded"):
+        contracts.list_verified_archives(tmp_path)
 
 
 def test_list_verified_archives_stops_scandir_before_unbounded_materialization(tmp_path: Path, monkeypatch):
@@ -176,10 +175,19 @@ def test_list_verified_archives_stops_scandir_before_unbounded_materialization(t
         return TrackingIterator()
 
     monkeypatch.setattr(contracts.os, "scandir", tracking_scandir)
-    archives = contracts.list_verified_archives(tmp_path)
-
-    assert len(archives) == 1
+    with pytest.raises(ValueError, match="archive candidate limit exceeded"):
+        contracts.list_verified_archives(tmp_path)
     assert len(advances) == 2
+
+
+def test_list_verified_archives_uses_deterministic_date_window_without_root_enumeration(tmp_path: Path, monkeypatch):
+    write_premarket_report("2026-07-10", [], tmp_path, quality_results=passing_quality())
+    write_premarket_report("2026-07-11", [], tmp_path, quality_results=passing_quality())
+    monkeypatch.setattr(contracts.os, "listdir", lambda *_args: (_ for _ in ()).throw(AssertionError("root enumeration")))
+
+    archives = contracts.list_verified_archives(tmp_path, start_date="2026-07-10", end_date="2026-07-11")
+
+    assert [archive["report_date"] for archive in archives] == ["2026-07-11", "2026-07-10"]
 
 
 def test_write_review_report_links_to_morning_advice(tmp_path: Path):

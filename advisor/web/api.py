@@ -45,8 +45,17 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
         return _current_state(resolved_state_dir)
 
     @app.get("/api/reports")
-    def reports(limit: int = Query(default=50, ge=1, le=100), offset: int = Query(default=0, ge=0, le=1000)) -> dict:
-        return {"reports": _read_report_links(max_items=offset + limit)[offset : offset + limit]}
+    def reports(
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0, le=1000),
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        try:
+            links = _read_report_links(max_items=offset + limit, start_date=start_date, end_date=end_date)
+        except ValueError:
+            raise HTTPException(status_code=503, detail="report listing unavailable") from None
+        return {"reports": links[offset : offset + limit]}
 
     @app.get("/api/reports/{report_date}/{report_type}")
     def report(report_date: str, report_type: str, run_id: str = "initial") -> dict:
@@ -123,6 +132,8 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
             return _write_ledger_transactions(resolved_state_dir, [(account_id, transaction)], "manual")
         except _LedgerValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
+        except _LedgerCapacityError:
+            raise HTTPException(status_code=503, detail="ledger history exceeds replay limit") from None
         except _LedgerConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
 
@@ -135,6 +146,8 @@ def create_app(state_dir: Path | None = None) -> FastAPI:
             return _write_ledger_transactions(resolved_state_dir, transactions, "import")
         except _LedgerValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
+        except _LedgerCapacityError:
+            raise HTTPException(status_code=503, detail="ledger history exceeds replay limit") from None
         except _LedgerConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
 
@@ -182,6 +195,7 @@ def _current_state(state_dir: Path) -> dict:
         flows = _read_flows(connection)
         premarket_quality = _read_current_run_quality(connection, today, "premarket")
         review_quality = _read_current_run_quality(connection, today, "review")
+        run_guard_safe = _current_day_run_guard(connection, today)
         profiles = _read_profile_links(connection)
         charts = _read_chart_links(connection, state_dir)
     finally:
@@ -189,12 +203,12 @@ def _current_state(state_dir: Path) -> dict:
             connection.close()
 
     reports = _read_report_links()
-    premarket = _latest_report(today, "premarket", reports)
-    review = _latest_report(today, "review", reports)
+    premarket = _read_today_report(today, "premarket")
+    review = _read_today_report(today, "review")
     premarket_status = _report_status(premarket)
     review_status = _report_status(review)
-    premarket_blocked = not premarket_quality["safe"] or premarket_status == "blocked"
-    review_blocked = not review_quality["safe"] or review_status == "blocked"
+    premarket_blocked = not run_guard_safe or not premarket_quality["safe"] or premarket_status == "blocked"
+    review_blocked = not run_guard_safe or not review_quality["safe"] or review_status == "blocked"
     checks = premarket_quality["blocking_checks"] + [
         check for check in review_quality["blocking_checks"] if check not in premarket_quality["blocking_checks"]
     ]
@@ -339,6 +353,8 @@ def _write_ledger_transactions(
         raise _LedgerConflictError("ledger unavailable") from error
     try:
         existing_rows = _read_capped_ledger_history(connection)
+        if len(existing_rows) + len(transactions) > _MAX_LEDGER_REPLAY_ROWS:
+            raise _LedgerCapacityError("ledger history exceeds replay limit")
         existing_ids = {row["transaction_id"] for row in existing_rows}
         if existing_ids.intersection(transaction_ids):
             raise _LedgerConflictError("duplicate transaction id")
@@ -376,9 +392,9 @@ def _write_ledger_transactions(
     except _LedgerConflictError:
         connection.rollback()
         raise
-    except _LedgerCapacityError as error:
+    except _LedgerCapacityError:
         connection.rollback()
-        raise _LedgerConflictError("ledger history exceeds replay limit") from error
+        raise
     except (sqlite3.Error, ValueError) as error:
         connection.rollback()
         raise _LedgerValidationError("invalid transaction") from error
@@ -527,7 +543,7 @@ def _read_current_run_quality(connection: sqlite3.Connection | None, as_of: str,
             """
             SELECT run_id, run_type, status
             FROM advisor_runs
-            WHERE as_of = ? AND run_type = ?
+            WHERE substr(as_of, 1, 10) = ? AND run_type = ?
                 ORDER BY started_at DESC, run_id DESC
                 LIMIT 50
                 """,
@@ -568,6 +584,40 @@ def _read_current_run_quality(connection: sqlite3.Connection | None, as_of: str,
         and not any(check["severity"] == "blocking" and check["status"] == "failed" for check in checks),
         "blocking_checks": [check for check in checks if check["severity"] == "blocking" and check["status"] == "failed"],
     }
+
+
+def _current_day_run_guard(connection: sqlite3.Connection | None, today: str) -> bool:
+    if connection is None:
+        return True
+    try:
+        rows = connection.execute(
+            """
+            SELECT run_id, run_type, as_of, status, started_at
+            FROM advisor_runs
+            WHERE substr(as_of, 1, 10) = ?
+              AND run_type IN ('premarket', 'review', 'failure')
+            ORDER BY started_at DESC, run_id DESC
+            LIMIT 50
+            """,
+            (today,),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    for row in rows:
+        if not _is_current_run_date(row["as_of"], today) or row["run_type"] not in {"premarket", "review", "failure"}:
+            return False
+        if row["status"] != "passed":
+            return False
+    return True
+
+
+def _is_current_run_date(value: object, today: str) -> bool:
+    if not isinstance(value, str) or len(value) < 10:
+        return False
+    try:
+        return date.fromisoformat(value[:10]).isoformat() == today
+    except ValueError:
+        return False
 
 
 def _read_profile_links(connection: sqlite3.Connection | None) -> list[dict]:
@@ -770,10 +820,10 @@ def _regular_file_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_report_links(max_items: int = 100) -> list[dict]:
+def _read_report_links(max_items: int = 100, *, start_date: str | None = None, end_date: str | None = None) -> list[dict]:
     try:
-        archives = list_verified_archives(advisor_paths.reports_dir())
-    except (OSError, ValueError, RuntimeError):
+        archives = list_verified_archives(advisor_paths.reports_dir(), start_date=start_date, end_date=end_date)
+    except (OSError, RuntimeError):
         return []
     return [
         {
@@ -787,6 +837,13 @@ def _read_report_links(max_items: int = 100) -> list[dict]:
 def _latest_report(today: str, report_type: str, report_links: list[dict]) -> dict | None:
     candidates = [link for link in report_links if link["report_date"] == today and link["report_type"] == report_type]
     if not candidates:
+        return None
+
+
+def _read_today_report(today: str, report_type: str) -> dict | None:
+    try:
+        return read_verified_archive(advisor_paths.reports_dir(), today, report_type, "initial")
+    except (OSError, ValueError, RuntimeError):
         return None
     candidate = candidates[0]
     try:
