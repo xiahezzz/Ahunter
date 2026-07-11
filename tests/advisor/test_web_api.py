@@ -1,5 +1,7 @@
 import sqlite3
+import tomllib
 from datetime import date, datetime
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -10,6 +12,12 @@ from advisor.reporting.contracts import AdviceItem, ReviewItem
 from advisor.reporting.premarket import write_premarket_report
 from advisor.reporting.review import write_review_report
 from advisor.web.api import create_app
+
+
+def test_dev_dependencies_declare_starlette_testclient_transport():
+    project = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert any(requirement.startswith("httpx2>=") and "<3" in requirement for requirement in project["project"]["optional-dependencies"]["dev"])
 
 
 def test_health_endpoint_reports_service_and_known_component_statuses(tmp_path):
