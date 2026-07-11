@@ -754,7 +754,14 @@ def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_p
         "capital": {"status": "ok", "count": 0},
         "analyst": {"status": "ok", "count": 1},
     }
-    assert payload["blocking_quality_checks"] == [{"check_name": "market_stale", "severity": "blocking", "status": "failed", "created_at": now}]
+    assert payload["blocking_quality_checks"] == [
+        {
+            "check_name": "market_stale",
+            "severity": "blocking",
+            "status": "failed",
+            "created_at": web_api._parse_shanghai_datetime(now).isoformat(),
+        }
+    ]
     assert payload["reports"][0]["report_date"] == today
     assert payload["profiles"] == [{"code": "600519", "name": "Moutai", "href": "/api/profiles/600519"}]
     assert payload["charts"][0]["asset_id"] == "chart-1"
@@ -998,6 +1005,68 @@ def test_current_quality_resolver_rejects_malformed_check_details(tmp_path, monk
 
     assert payload["advice"] == []
     assert payload["advice_status"] == "blocked"
+
+
+@pytest.mark.parametrize("field", ["as_of", "started_at", "created_at"])
+def test_current_quality_resolver_rejects_oversized_parseable_timestamp(tmp_path, monkeypatch, field):
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    oversized = "2026-07-12T08:30:00." + "1" * 100_000 + "+08:00"
+    run_values = {
+        "as_of": "2026-07-12T08:30:00+08:00",
+        "started_at": "2026-07-12T08:30:00+08:00",
+    }
+    check_created_at = "2026-07-12T08:31:00+08:00"
+    if field == "created_at":
+        check_created_at = oversized
+    else:
+        run_values[field] = oversized
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("oversized-run", "premarket", run_values["as_of"], "passed", run_values["started_at"]),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("oversized-check", "oversized-run", "market", "blocking", "failed", "{}", check_created_at),
+    )
+    connection.commit()
+    connection.close()
+
+    response = TestClient(create_app(tmp_path)).get("/api/current-state")
+
+    assert response.json()["advice_status"] == "blocked"
+    assert response.json()["blocking_quality_checks"] == []
+    assert "1" * 1000 not in response.text
+
+
+def test_current_quality_normalizes_exposed_check_timestamp_to_shanghai(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("failed-check-run", "premarket", "2026-07-12", "passed", "2026-07-12T08:30:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("failed-check", "failed-check-run", "market", "blocking", "failed", "{}", "2026-07-12T00:31:00Z"),
+    )
+    connection.commit()
+    connection.close()
+
+    checks = TestClient(create_app(tmp_path)).get("/api/current-state").json()["blocking_quality_checks"]
+
+    assert checks == [
+        {
+            "check_name": "market",
+            "severity": "blocking",
+            "status": "failed",
+            "created_at": "2026-07-12T08:31:00+08:00",
+        }
+    ]
 
 
 def test_current_report_content_is_withheld_when_active_quality_is_unsafe(tmp_path, monkeypatch):

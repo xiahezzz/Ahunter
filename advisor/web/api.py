@@ -700,22 +700,34 @@ def _resolve_current_run_quality(
     if len(check_rows) > _MAX_CURRENT_QUALITY_CHECKS:
         return {"safe": False, "available": True, "blocking_checks": [], "active_run": dict(latest)}
     checks = [dict(row) for row in check_rows]
+    normalized_checks = []
     try:
-        valid_checks = bool(checks) and all(
-            isinstance(check["check_name"], str)
-            and 0 < len(check["check_name"]) <= 128
-            and check["severity"] in {"blocking", "warning", "info"}
-            and check["status"] in {"passed", "failed"}
-            and bool(_parse_shanghai_datetime(check["created_at"]))
-            and _valid_quality_details(check["details_json"])
-            for check in checks
-        )
+        valid_checks = bool(checks)
+        for check in checks:
+            created_at = _parse_shanghai_datetime(check["created_at"])
+            if not (
+                isinstance(check["check_name"], str)
+                and 0 < len(check["check_name"]) <= 128
+                and check["severity"] in {"blocking", "warning", "info"}
+                and check["status"] in {"passed", "failed"}
+                and _valid_quality_details(check["details_json"])
+            ):
+                valid_checks = False
+                break
+            normalized_checks.append(
+                {
+                    "check_name": check["check_name"],
+                    "severity": check["severity"],
+                    "status": check["status"],
+                    "created_at": created_at.isoformat(),
+                }
+            )
     except (KeyError, ValueError):
         valid_checks = False
     blocking = (
         [
-            {key: check[key] for key in ("check_name", "severity", "status", "created_at")}
-            for check in checks
+            check
+            for check in normalized_checks
             if check.get("severity") == "blocking" and check.get("status") == "failed"
         ]
         if valid_checks
@@ -730,7 +742,7 @@ def _resolve_current_run_quality(
 
 
 def _parse_shanghai_datetime(value: object) -> datetime:
-    if not isinstance(value, str) or not value:
+    if not _bounded_timestamp_string(value):
         raise ValueError("invalid run timestamp")
     if len(value) == 10:
         try:
@@ -1081,6 +1093,15 @@ def _bounded_db_string(value: object, max_length: int) -> bool:
         return False
     try:
         return len(value.encode("utf-8")) <= max_length * 4
+    except UnicodeError:
+        return False
+
+
+def _bounded_timestamp_string(value: object) -> bool:
+    if not isinstance(value, str) or not value or len(value) > _MAX_DB_TIMESTAMP_LENGTH:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= _MAX_DB_TIMESTAMP_LENGTH
     except UnicodeError:
         return False
 
