@@ -245,10 +245,11 @@ def _current_state(state_dir: Path, report_cursor_secret: bytes) -> dict:
     connection = _read_connection(db_path)
     try:
         try:
-            ledger = _read_ledger_state(connection)
+            ledger = _read_current_ledger_state(connection)
         except _LedgerCapacityError:
             ledger = {**_empty_ledger_state(), "status": "degraded"}
         flows = _read_flows(connection)
+        last_successful_data_update = _last_successful_data_update(connection)
         current_quality = _resolve_current_run_quality(
             connection,
             today,
@@ -279,6 +280,7 @@ def _current_state(state_dir: Path, report_cursor_secret: bytes) -> dict:
     checks = current_quality["blocking_checks"]
     return {
         "today": today,
+        "last_successful_data_update": last_successful_data_update,
         "advice": [] if premarket_blocked else premarket["json"].get("advice", []) if premarket else [],
         "advice_status": "blocked" if premarket_blocked else premarket_status,
         "review": {
@@ -325,6 +327,44 @@ def _read_ledger_state(connection: sqlite3.Connection | None) -> dict:
     except sqlite3.Error:
         return _empty_ledger_state()
     return _derive_ledger_state(rows, connection)
+
+
+def _read_current_ledger_state(connection: sqlite3.Connection | None) -> dict:
+    if connection is None:
+        return {**_empty_ledger_state(), "status": "unknown"}
+    try:
+        rows = _read_capped_ledger_history(connection)
+    except sqlite3.Error:
+        return {**_empty_ledger_state(), "status": "degraded"}
+    state = _derive_ledger_state(rows, connection)
+    if rows and state == _empty_ledger_state():
+        return {**state, "status": "degraded"}
+    return {**state, "status": "ok"}
+
+
+def _last_successful_data_update(connection: sqlite3.Connection | None) -> str | None:
+    if connection is None:
+        return None
+    queries = (
+        "SELECT MAX(fetched_at) FROM market_daily WHERE quality_status = 'passed'",
+        "SELECT MAX(as_of) FROM events_normalized WHERE quality_status = 'passed'",
+        """
+        SELECT MAX(analyst_outputs.as_of)
+        FROM analyst_outputs
+        JOIN advisor_runs ON advisor_runs.run_id = analyst_outputs.run_id
+        WHERE advisor_runs.status = 'passed'
+        """,
+        "SELECT MAX(created_at) FROM ledger_transactions",
+    )
+    candidates = []
+    for query in queries:
+        try:
+            value = connection.execute(query).fetchone()[0]
+            if value is not None:
+                candidates.append(_parse_shanghai_datetime(value))
+        except (sqlite3.Error, ValueError, TypeError):
+            continue
+    return max(candidates).isoformat() if candidates else None
 
 
 def _read_ledger_records(connection: sqlite3.Connection | None, *, limit: int | None = None, offset: int = 0) -> list[dict]:

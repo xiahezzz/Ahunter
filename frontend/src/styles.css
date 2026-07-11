@@ -137,6 +137,20 @@ h2 {
   margin-top: 14px;
 }
 
+.stale-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 12px;
+  border: 1px solid #d7a24b;
+  border-radius: 6px;
+  padding: 10px 14px;
+  color: #744b0d;
+  background: #fff8e8;
+  font-size: 12px;
+}
+
 .panel,
 .ledger-form,
 .import-form {

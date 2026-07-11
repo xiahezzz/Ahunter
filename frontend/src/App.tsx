@@ -36,6 +36,7 @@ type ProfileLink = { code: string; name: string; href: string };
 type ChartLink = { asset_id: string; code: string; chart_type: string; as_of: string; href: string };
 type CurrentState = {
   today: string;
+  last_successful_data_update: string | null;
   advice_status: string;
   advice: Advice[];
   review: { status: string; items: unknown[] };
@@ -79,6 +80,11 @@ const A_SHARE_CODE = /^[0368]\d{5}$/;
 const ASSET_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const REPORT_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function isBoundedTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 64 && ISO_TIMESTAMP.test(value) && Number.isFinite(Date.parse(value));
+}
 
 function isReportLink(value: unknown): value is ReportLink {
   if (!isRecord(value) ||
@@ -123,6 +129,7 @@ function parseCurrentState(value: unknown): CurrentState {
   const reportList = value.report_list;
   if (
     typeof value.today !== "string" ||
+    (value.last_successful_data_update !== null && !isBoundedTimestamp(value.last_successful_data_update)) ||
     typeof value.advice_status !== "string" ||
     !["passed", "blocked", "missing"].includes(value.advice_status) ||
     !Array.isArray(value.advice) ||
@@ -190,6 +197,7 @@ function parseCurrentState(value: unknown): CurrentState {
     !validPositions ||
     !validChecks ||
     !adviceFieldsAgree ||
+    (reportList.status === "degraded" && value.reports.length !== 0) ||
     !value.reports.every(isReportLink) ||
     !value.profiles.every(isProfileLink) ||
     !value.charts.every(isChartLink) ||
@@ -359,12 +367,13 @@ function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   const loadState = useCallback(async (signal?: AbortSignal) => {
-    setError(null);
     setIsRefreshing(true);
     try {
       const result = await fetch("/api/current-state", { signal });
       if (!result.ok) throw new Error(`请求失败 (${result.status})`);
-      setState(parseCurrentState(await result.json()));
+      const nextState = parseCurrentState(await result.json());
+      setState(nextState);
+      setError(null);
       return true;
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === "AbortError") return false;
@@ -384,24 +393,27 @@ function App() {
   if (!state && !error) return <main className="center-state" aria-live="polite">正在读取当前状态…</main>;
   if (!state) return <main className="center-state" role="alert"><strong>当前状态读取失败</strong><span>{error}</span><button type="button" onClick={() => void loadState()} disabled={isRefreshing}><RefreshCw size={16} />{isRefreshing ? "正在重试" : "重试读取"}</button></main>;
 
-  const ledgerAvailable = state.ledger.status !== "degraded" && state.ledger.status !== "unknown";
+  const snapshotCurrent = error === null;
+  const ledgerAvailable = snapshotCurrent && state.ledger.status === "ok";
   const knownValues = ledgerAvailable
     ? state.ledger.positions.flatMap((position) => position.market_value === null ? [] : [position.market_value])
     : [];
   const exposure = ledgerAvailable && knownValues.length === state.ledger.positions.length
     ? knownValues.reduce((sum, value) => sum + value, 0)
     : null;
-  const adviceAvailable = state.advice_status === "passed" && state.blocking_quality_checks.length === 0;
-  const reports = state.reports;
-  const profiles = state.profiles;
-  const charts = state.charts;
+  const adviceAvailable = snapshotCurrent && state.advice_status === "passed" && state.blocking_quality_checks.length === 0;
+  const reports = snapshotCurrent && state.report_list.status === "ok" ? state.reports : [];
+  const profiles = snapshotCurrent ? state.profiles : [];
+  const charts = snapshotCurrent ? state.charts : [];
 
   return (
     <main className="shell">
       <header className="topbar">
         <div><p className="eyebrow">本地投顾运行台</p><h1>A Hunter Advisor</h1></div>
-        <div className="topbar-meta"><span>{state.today}</span><span className={statusClass(state.advice_status)}>建议 {statusLabel(state.advice_status)}</span><span className={statusClass(state.report_list.status)}>报告 {statusLabel(state.report_list.status)}</span><button type="button" className="icon-button" aria-label="刷新当前状态" title="刷新当前状态" onClick={() => void loadState()} disabled={isRefreshing}><RefreshCw className={isRefreshing ? "spin" : undefined} size={17} /></button></div>
+        <div className="topbar-meta"><span>{snapshotCurrent ? state.today : "日期 暂不可确认"}</span><span>{snapshotCurrent ? `最近数据更新 ${state.last_successful_data_update ?? "暂无数据"}` : "最近数据更新 暂不可确认"}</span><span className={statusClass(snapshotCurrent ? state.report_list.status : "unknown")}>报告 {snapshotCurrent ? statusLabel(state.report_list.status) : "刷新失败"}</span><button type="button" className="icon-button" aria-label="刷新当前状态" title="刷新当前状态" onClick={() => void loadState()} disabled={isRefreshing}><RefreshCw className={isRefreshing ? "spin" : undefined} size={17} /></button></div>
       </header>
+
+      {!snapshotCurrent && <section className="stale-banner" role="alert"><strong>状态刷新失败，先前快照已停用</strong><span>请刷新成功后再查看建议、账户指标和资源链接</span></section>}
 
       <section className="summary-grid" aria-label="投资概览">
         <article className="panel ledger-summary">
@@ -415,16 +427,16 @@ function App() {
             </dl>
           ) : (
             <p className="unavailable-message">
-              {state.ledger.status === "degraded" ? "账户数据已降级" : "账户数据状态未知"}
+              {!snapshotCurrent ? "账户数据不可用" : state.ledger.status === "degraded" ? "账户数据已降级" : "账户数据状态未知"}
             </p>
           )}
         </article>
         <article className="panel advice-summary">
           <h2><TrendingUp size={18} />08:30 建议</h2>
-          <span className={`status-badge ${statusClass(state.advice_status)}`}>{statusLabel(state.advice_status)}</span>
+          <span className={`status-badge ${statusClass(snapshotCurrent ? state.advice_status : "unknown")}`}>{snapshotCurrent ? statusLabel(state.advice_status) : "不可用"}</span>
           {!adviceAvailable ? (
             <p className={state.advice_status === "blocked" ? "blocked-message" : "unavailable-message"}>
-              {state.advice_status === "blocked" ? "建议已阻断" : "建议不可用"}
+              {snapshotCurrent && state.advice_status === "blocked" ? "建议已阻断" : "建议不可用"}
             </p>
           ) : state.advice.length === 0 ? (
             <p className="empty">暂无建议</p>
@@ -435,7 +447,7 @@ function App() {
       </section>
 
       <section className="flow-grid" aria-label="三流状态">
-        {([["信息流", state.flows.information], ["资金流", state.flows.capital], ["分析流", state.flows.analyst]] as const).map(([label, flow]) => <div className="flow-item" key={label}><span>{label}</span><strong className={statusClass(flow.status)}>{statusLabel(flow.status)}</strong><small>{flow.count} 条</small></div>)}
+        {([["信息流", state.flows.information], ["资金流", state.flows.capital], ["分析流", state.flows.analyst]] as const).map(([label, flow]) => <div className="flow-item" key={label}><span>{label}</span><strong className={statusClass(snapshotCurrent ? flow.status : "unknown")}>{snapshotCurrent ? statusLabel(flow.status) : "不可用"}</strong><small>{snapshotCurrent && flow.status === "ok" ? `${flow.count} 条` : "暂无数据"}</small></div>)}
       </section>
 
       <section className="main-grid">
@@ -449,8 +461,8 @@ function App() {
             <div className="table-wrap"><table><thead><tr><th>代码</th><th>数量</th><th>成本</th><th>现价</th><th>市值</th><th>浮动盈亏</th></tr></thead><tbody>{state.ledger.positions.map((position) => <tr key={position.code}><td>{position.code}</td><td>{position.quantity}</td><td>{CNY.format(position.cost_basis)}</td><td>{position.market_price === null ? "暂无数据" : CNY.format(position.market_price)}</td><td>{position.market_value === null ? "暂无数据" : CNY.format(position.market_value)}</td><td>{CNY.format(position.unrealized_pnl)}</td></tr>)}</tbody></table></div>
           )}
         </article>
-        <article className="panel quality-panel"><h2><ShieldAlert size={18} />质量检查</h2>{state.blocking_quality_checks.length === 0 ? <p className="healthy">无阻断项</p> : <ul className="plain-list">{state.blocking_quality_checks.map((check) => <li key={`${check.check_name}-${check.created_at}`}><strong>{check.check_name}</strong><span>{statusLabel(check.status)}</span><small>{check.created_at}</small></li>)}</ul>}</article>
-        <article className="panel health-panel"><h2><HeartPulse size={18} />进程健康</h2><dl className="status-list">{Object.entries(state.health).filter(([name]) => !["status", "service"].includes(name)).map(([name, status]) => <div key={name}><dt>{name}</dt><dd className={statusClass(status)}>{statusLabel(status)}</dd></div>)}</dl></article>
+        <article className="panel quality-panel"><h2><ShieldAlert size={18} />质量检查</h2>{!snapshotCurrent ? <p className="unavailable-message">质量状态不可用</p> : state.blocking_quality_checks.length === 0 ? <p className="healthy">无阻断项</p> : <ul className="plain-list">{state.blocking_quality_checks.map((check) => <li key={`${check.check_name}-${check.created_at}`}><strong>{check.check_name}</strong><span>{statusLabel(check.status)}</span><small>{check.created_at}</small></li>)}</ul>}</article>
+        <article className="panel health-panel"><h2><HeartPulse size={18} />进程健康</h2>{!snapshotCurrent ? <p className="unavailable-message">进程状态不可用</p> : <dl className="status-list">{Object.entries(state.health).filter(([name]) => !["status", "service"].includes(name)).map(([name, status]) => <div key={name}><dt>{name}</dt><dd className={statusClass(status)}>{statusLabel(status)}</dd></div>)}</dl>}</article>
       </section>
 
       <section className="resources">

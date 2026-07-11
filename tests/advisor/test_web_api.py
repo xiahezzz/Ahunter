@@ -51,7 +51,8 @@ def test_current_state_degrades_explicitly_when_local_state_is_missing(tmp_path)
 
     assert response.status_code == 200
     payload = response.json()
-    assert {"today", "advice", "review", "ledger", "flows", "blocking_quality_checks", "reports", "profiles", "charts", "health"} <= payload.keys()
+    assert {"today", "last_successful_data_update", "advice", "review", "ledger", "flows", "blocking_quality_checks", "reports", "profiles", "charts", "health"} <= payload.keys()
+    assert payload["last_successful_data_update"] is None
     assert payload["advice"] == []
     assert payload["review"] == {"status": "missing", "items": []}
     assert payload["ledger"] == {
@@ -60,6 +61,7 @@ def test_current_state_degrades_explicitly_when_local_state_is_missing(tmp_path)
         "realized_pnl": 0.0,
         "unrealized_pnl": 0.0,
         "accounts": [],
+        "status": "unknown",
     }
     assert payload["flows"] == {
         "information": {"status": "unknown", "count": 0},
@@ -734,21 +736,27 @@ def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_p
         "INSERT INTO chart_assets (asset_id, code, chart_type, as_of, path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         ("chart-1", "600519", "kline", today, str(chart_path), now),
     )
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES (?, ?, ?)",
+        ("default", "default", now),
+    )
+    connection.execute(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, transaction_type, quantity, price, amount, fees, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("cash-1", "default", today, "cash_deposit", 0, 0, 1000, 0, "manual", now),
+    )
     connection.commit()
     connection.close()
     (tmp_path / "health.json").write_text('{"components":{"collector":"running","token":"secret"}}', encoding="utf-8")
     client = TestClient(create_app(tmp_path))
-    client.post(
-        "/api/ledger/transactions",
-        json={"transaction_id": "cash-1", "trade_date": today, "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 1000, "fees": 0},
-    )
 
     payload = client.get("/api/current-state").json()
 
     assert payload["advice"] == []
     assert payload["advice_status"] == "blocked"
     assert payload["review"] == {"status": "blocked", "items": []}
+    assert payload["ledger"]["status"] == "ok"
     assert payload["ledger"]["cash"] == 1000.0
+    assert payload["last_successful_data_update"] == web_api._parse_shanghai_datetime(now).isoformat()
     assert payload["flows"] == {
         "information": {"status": "ok", "count": 1},
         "capital": {"status": "ok", "count": 0},

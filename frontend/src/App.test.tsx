@@ -5,6 +5,7 @@ import App from "./App";
 
 const currentState = {
   today: "2026-07-12",
+  last_successful_data_update: "2026-07-12T08:32:00+08:00",
   advice_status: "passed",
   advice: [
     {
@@ -18,6 +19,7 @@ const currentState = {
   ],
   review: { status: "passed", items: [] },
   ledger: {
+    status: "ok",
     cash: 89995,
     positions: [
       {
@@ -98,6 +100,7 @@ describe("advisor dashboard", () => {
 
     expect(screen.getByText("正在读取当前状态…")).toBeInTheDocument();
     expect(await screen.findByText("2026-07-12")).toBeInTheDocument();
+    expect(screen.getByText("最近数据更新 2026-07-12T08:32:00+08:00")).toBeInTheDocument();
     expect(screen.getByText("¥89,995.00")).toBeInTheDocument();
     expect(screen.getAllByText("600519").length).toBeGreaterThan(0);
     expect(screen.getByText("等待量价确认")).toBeInTheDocument();
@@ -167,6 +170,33 @@ describe("advisor dashboard", () => {
     },
   );
 
+  it("withholds ledger metrics when ledger status is omitted", async () => {
+    const ledger = { ...currentState.ledger } as Partial<typeof currentState.ledger>;
+    delete ledger.status;
+    mockFetch(response({ ...currentState, ledger }));
+    render(<App />);
+
+    expect(await screen.findByText("账户数据状态未知")).toBeInTheDocument();
+    expect(screen.queryByText("¥89,995.00")).not.toBeInTheDocument();
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  });
+
+  it.each(["unknown", "degraded"])("withholds flow counts when flow status is %s", async (flowStatus) => {
+    mockFetch(response({
+      ...currentState,
+      flows: {
+        ...currentState.flows,
+        capital: { status: flowStatus, count: 2 },
+      },
+    }));
+    render(<App />);
+
+    const flows = await screen.findByRole("region", { name: "三流状态" });
+    const capital = within(flows).getByText("资金流").parentElement as HTMLElement;
+    expect(within(capital).getByText("暂无数据")).toBeInTheDocument();
+    expect(within(capital).queryByText("2 条")).not.toBeInTheDocument();
+  });
+
   it.each([
     ["missing advice containing items", { advice_status: "missing" }],
     [
@@ -223,6 +253,59 @@ describe("advisor dashboard", () => {
 
     expect(await screen.findByText("2026-07-12")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed after refresh failure while retaining a stale snapshot", async () => {
+    mockFetch(response(currentState), new Error("refresh offline"));
+    render(<App />);
+    await screen.findByText("等待量价确认");
+
+    await userEvent.click(screen.getByRole("button", { name: "刷新当前状态" }));
+
+    expect(await screen.findByText("状态刷新失败，先前快照已停用")).toBeInTheDocument();
+    expect(screen.queryByText("等待量价确认")).not.toBeInTheDocument();
+    expect(screen.queryByText("¥89,995.00")).not.toBeInTheDocument();
+    expect(screen.queryByText("4 条")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(screen.getByText("请刷新成功后再查看建议、账户指标和资源链接")).toBeInTheDocument();
+  });
+
+  it("keeps a stale snapshot suppressed until a retry succeeds", async () => {
+    let finishRetry: (result: Response) => void = () => undefined;
+    const retry = new Promise<Response>((resolve) => { finishRetry = resolve; });
+    let requestNumber = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      requestNumber += 1;
+      if (requestNumber === 1) return response(currentState);
+      if (requestNumber === 2) throw new Error("refresh offline");
+      return retry;
+    });
+    render(<App />);
+    await screen.findByText("等待量价确认");
+    await userEvent.click(screen.getByRole("button", { name: "刷新当前状态" }));
+    await screen.findByText("状态刷新失败，先前快照已停用");
+
+    await userEvent.click(screen.getByRole("button", { name: "刷新当前状态" }));
+
+    expect(screen.queryByText("等待量价确认")).not.toBeInTheDocument();
+    expect(screen.getByText("状态刷新失败，先前快照已停用")).toBeInTheDocument();
+    finishRetry(response(currentState));
+    expect(await screen.findByText("等待量价确认")).toBeInTheDocument();
+  });
+
+  it("rejects degraded report listings that contain report links", async () => {
+    mockFetch(response({ ...currentState, report_list: { status: "degraded" }, reports: currentState.reports }));
+    render(<App />);
+
+    expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it("renders an explicit unavailable last successful update", async () => {
+    mockFetch(response({ ...currentState, last_successful_data_update: null }));
+    render(<App />);
+
+    expect(await screen.findByText("最近数据更新 暂无数据")).toBeInTheDocument();
   });
 
   it("submits a manual ledger transaction and refreshes current state", async () => {
