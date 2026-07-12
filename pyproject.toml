@@ -27,6 +27,7 @@ advisor-scheduled-premarket = "advisor.scheduler.premarket:main"
 advisor-report-premarket = "advisor.reporting.premarket:main"
 advisor-report-review = "advisor.reporting.review:main"
 advisor-launchd-render = "advisor.scheduler.launchd:main"
+advisor-launchd-manage = "advisor.scheduler.launchd:manage_main"
 
 [tool.setuptools.packages.find]
 include = ["advisor*"]
