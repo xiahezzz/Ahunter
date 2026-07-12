@@ -8,9 +8,13 @@ Implementation commit: `2226252`
 
 Archive consistency implementation commit: `280469b`
 
+Premarket linkage implementation commit: `9d326aa`
+
 Required commit subject: `fix: complete coordinator review paths`
 
 Archive consistency commit subject: `fix: hide orphan report archives`
+
+Premarket linkage commit subject: `fix: require archived premarket linkage`
 
 ## Summary
 
@@ -23,6 +27,9 @@ Archive consistency commit subject: `fix: hide orphan report archives`
 - Report list, detail, and current-state reads now require an exact `report_archive` path match joined to a `passed` advisor run. Failure archives are eligible only when joined to a `blocked` run.
 - Marker-verified archives left behind by a rolled-back database transaction remain immutable but are not exposed as completed reports.
 - Retrying the same immutable report run ID after such a failure raises `FileExistsError`; the retry's advisor run is committed as `failed`, making the required new report run ID explicit.
+- Review now requires the exact selected premarket filesystem archive to have one matching `report_archive` row joined to a `passed` premarket `advisor_runs` row.
+- The stored Markdown and JSON paths must normalize to the selected archive paths without resolving or trusting symlinks, and every archived advice item must belong to that one linked database run.
+- Orphan premarket archives and archives combining advice from multiple passed premarket runs fail closed before any review rows are written.
 
 ## TDD Evidence
 
@@ -68,7 +75,72 @@ After adding database-backed API eligibility, the same regression passed:
 1 passed in 1.29s
 ```
 
+The premarket linkage regressions then failed before implementation because both an orphan archive and a mixed-run archive were accepted:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_review_rejects_selected_premarket_archive_without_archive_row tests/advisor/test_coordinator.py::test_review_rejects_archive_with_advice_from_multiple_premarket_runs -q
+FF                                                                       [100%]
+2 failed in 1.32s
+```
+
+After requiring the archive row and single linked advice run, the targeted regressions and selected-archive control passed:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_review_rejects_selected_premarket_archive_without_archive_row tests/advisor/test_coordinator.py::test_review_rejects_archive_with_advice_from_multiple_premarket_runs tests/advisor/test_coordinator.py::test_review_uses_exact_selected_premarket_archive -q
+...                                                                      [100%]
+3 passed in 1.26s
+```
+
 ## Verification
+
+Premarket linkage required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py tests/advisor/test_web_api.py tests/advisor/test_reporting.py tests/advisor/test_quality_gate.py tests/advisor/test_astock_adapter.py tests/advisor/test_profiles.py tests/advisor/test_kline_chart.py -q
+........................................................................ [ 32%]
+........................................................................ [ 64%]
+........................................................................ [ 97%]
+......                                                                   [100%]
+222 passed in 4.03s
+```
+
+Premarket linkage complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 18%]
+........................................................................ [ 36%]
+........................................................................ [ 55%]
+........................................................................ [ 73%]
+........................................................................ [ 92%]
+..............................                                           [100%]
+390 passed in 5.78s
+```
+
+Premarket linkage offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+suites 0
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 515.186834
+```
+
+Premarket linkage static check:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, Chrome operation, or MX page operation was performed.
+
+Previous Task 16 archive consistency verification is retained below.
 
 Archive consistency required focused suite:
 
@@ -185,8 +257,15 @@ Archive consistency follow-up:
 - `tests/advisor/test_web_api.py`
 - `.superpowers/sdd/task-16-report.md`
 
+Premarket linkage follow-up:
+
+- `advisor/coordinator.py`
+- `tests/advisor/test_coordinator.py`
+- `.superpowers/sdd/task-16-report.md`
+
 ## Concerns
 
 - Report files remain immutable and cannot participate in the SQLite transaction. Orphans are now hidden by DB-backed API eligibility, but reclaiming their filenames requires a distinct versioned report run ID; same-ID retries fail and are recorded as failed runs.
 - Profile Markdown and chart image generation are filesystem projections. Their database metadata is rolled back on report failure, while already-written projection files may remain for a later successful run to replace.
+- API report listing still slices the filesystem archive page before filtering against database eligibility. Correct eligible-only pagination requires changing the reporting contract's cursor snapshot semantics outside this follow-up's allowed scope; orphan files can still consume list limits and affect pagination metadata even though they are not exposed.
 - Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched and excluded from both commits.
