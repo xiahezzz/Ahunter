@@ -16,3 +16,5 @@ Task 12: complete (commits 7ccffc9..4ca7e04, review clean after dashboard fail-c
 Task 14: complete (commits 4ca7e04..7f04281, review clean after operational DB alignment and storage path containment fixes; live Sina availability deferred to deployment check)
 
 Task 15: complete (commits 7f04281..10bd8f0, review clean after MX authorization provenance, sensitive ID filtering, and independently computed calendar authority fixes; minor: weekday-only calendar precision risk remains for holidays/makeup sessions)
+
+Task 16: complete (commits c0d6317..665d036, review clean after coordinator operating contract, review linkage, report visibility, consistency, CLI, profile, chart, and bounded API fixes; live browser screenshot QA skipped per user instruction)
