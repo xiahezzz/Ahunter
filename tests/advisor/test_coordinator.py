@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from types import SimpleNamespace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8,6 +9,7 @@ import yaml
 import pytest
 
 from advisor import paths as advisor_paths
+from advisor import coordinator as coordinator_module
 from advisor.agents.astock_adapter import (
     ANALYST_ROLES,
     AnalystOutput,
@@ -18,6 +20,10 @@ from advisor.coordinator import run_premarket, run_review
 from advisor.evidence.mx_adapter import CollectorSnapshot
 from advisor.evidence.service import EvidenceRecord
 from advisor.quality import QualityGateResult, QualityResult
+from advisor.reporting import premarket as premarket_reporting
+from advisor.reporting import review as review_reporting
+from advisor.reporting.contracts import AdviceItem
+from advisor.reporting.premarket import write_premarket_report
 
 
 AS_OF = datetime(2026, 7, 12, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -130,6 +136,47 @@ def query_all(db_path: Path, sql: str):
     return rows
 
 
+def seed_premarket_report(
+    paths: dict,
+    *,
+    database_run_id: str,
+    report_run_id: str,
+    advice: list[AdviceItem],
+    supersedes: str | None = None,
+) -> None:
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at, finished_at) "
+        "VALUES (?, 'premarket', ?, 'passed', ?, ?)",
+        (database_run_id, AS_OF.isoformat(), AS_OF.isoformat(), AS_OF.isoformat()),
+    )
+    for item in advice:
+        connection.execute(
+            "INSERT OR IGNORE INTO securities (code, name, exchange, created_at, updated_at) "
+            "VALUES (?, ?, 'SSE', ?, ?)",
+            (item.code, item.code, AS_OF.isoformat(), AS_OF.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO advice (advice_id, run_id, code, action, confidence, rationale, "
+            "evidence_ids_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                item.advice_id, database_run_id, item.code, item.action, item.confidence,
+                item.rationale, json.dumps(item.evidence_ids), AS_OF.isoformat(),
+            ),
+        )
+    connection.commit()
+    connection.close()
+    write_premarket_report(
+        "2026-07-12",
+        advice,
+        paths["output_dir"],
+        quality_results=(QualityResult("fixture", "blocking", True, "ready"),),
+        run_id=None if report_run_id == "initial" else report_run_id,
+        rerun_reason=None if report_run_id == "initial" else "updated candidates",
+        supersedes=supersedes,
+    )
+
+
 def test_premarket_happy_path_persists_complete_projection(tmp_path: Path):
     paths = coordinator_paths(tmp_path)
     from advisor.db.migrate import migrate_database
@@ -212,12 +259,206 @@ def test_review_links_morning_advice_and_persists_review(tmp_path: Path):
 
     assert morning.status == result.status == "passed"
     advice_id = query_all(paths["db_path"], "SELECT advice_id FROM advice")[0][0]
-    assert query_all(paths["db_path"], "SELECT advice_id, outcome FROM reviews") == [(advice_id, "reviewed")]
+    assert query_all(paths["db_path"], "SELECT advice_id, outcome FROM reviews") == [(advice_id, "followed_strength")]
     payload = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))
     assert payload["linked_premarket"]["run_id"] == "initial"
     assert payload["reviews"][0]["advice_id"] == advice_id
+    assert "11.5000" in payload["reviews"][0]["review_text"]
+    assert "10.5000" in payload["reviews"][0]["review_text"]
+    assert "no ledger transactions" in payload["reviews"][0]["review_text"]
     assert query_all(paths["db_path"], "SELECT report_type FROM report_archive ORDER BY created_at") == [("premarket",), ("review",)]
     assert query_all(paths["db_path"], "SELECT COUNT(*) FROM stock_profile_history")[0][0] >= 2
+
+
+@pytest.mark.parametrize("module", [premarket_reporting, review_reporting])
+def test_declared_report_cli_entrypoint_has_minimal_argparse_path(module):
+    assert hasattr(module, "main")
+    with pytest.raises(SystemExit) as exit_info:
+        module.main(["--help"])
+    assert exit_info.value.code == 0
+
+
+def test_premarket_cli_invokes_injected_coordinator(tmp_path: Path):
+    calls = {}
+    snapshot = collector()
+
+    def snapshot_reader(events_db, allowed_rids_path, *, as_of):
+        calls["snapshot"] = (events_db, allowed_rids_path, as_of)
+        return snapshot
+
+    def coordinator(**kwargs):
+        calls["coordinator"] = kwargs
+        return SimpleNamespace(
+            run_id="cli-run", status="passed", warnings=(),
+            report_paths=SimpleNamespace(
+                markdown_path=tmp_path / "premarket.md",
+                json_path=tmp_path / "premarket.json",
+            ),
+        )
+
+    premarket_reporting.main(
+        [
+            "--as-of", AS_OF.isoformat(), "--report-date", "2026-07-12",
+            "--codes", CODE, "--events-db", str(tmp_path / "events.sqlite"),
+            "--allowed-rids", str(tmp_path / "allowed.yaml"),
+            "--output-dir", str(tmp_path / "reports"),
+        ],
+        coordinator=coordinator,
+        snapshot_reader=snapshot_reader,
+    )
+
+    assert calls["snapshot"][2] == AS_OF
+    assert calls["coordinator"]["collector_snapshot"] is snapshot
+    assert calls["coordinator"]["candidate_codes"] == (CODE,)
+
+
+def test_review_uses_exact_selected_premarket_archive(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    initial = AdviceItem("initial-advice", CODE, "watch", 0.5, "initial", [])
+    rerun = AdviceItem("rerun-advice", "000001", "watch", 0.5, "rerun", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[initial]
+    )
+    seed_premarket_report(
+        paths, database_run_id="morning-rerun", report_run_id="rerun1", advice=[rerun],
+        supersedes="initial",
+    )
+
+    result = run_review(
+        collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+        report_date="2026-07-12", candidate_codes=(CODE,), premarket_run_id="initial",
+        quality_evaluator=passed_quality, **paths,
+    )
+
+    assert result.status == "passed"
+    assert query_all(paths["db_path"], "SELECT advice_id FROM reviews") == [("initial-advice",)]
+
+
+def test_review_rolls_back_rows_when_selected_archive_linkage_fails(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    advice = AdviceItem("initial-advice", CODE, "watch", 0.5, "initial", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[advice]
+    )
+    history_before = query_all(paths["db_path"], "SELECT COUNT(*) FROM stock_profile_history")
+    profile_before = query_all(paths["db_path"], "SELECT * FROM stock_profiles")
+
+    with pytest.raises(ValueError, match="premarket archive not found"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE,),
+            premarket_run_id="missing", quality_evaluator=passed_quality, **paths,
+        )
+
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM stock_profile_history") == history_before
+    assert query_all(paths["db_path"], "SELECT * FROM stock_profiles") == profile_before
+
+
+def test_review_rolls_back_all_projection_rows_when_report_write_fails(
+    tmp_path: Path, monkeypatch
+):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    advice = AdviceItem("initial-advice", CODE, "watch", 0.5, "initial", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[advice]
+    )
+
+    def fail_report_write(*_args, **_kwargs):
+        raise OSError("fixture report write failure")
+
+    monkeypatch.setattr(coordinator_module, "write_review_report", fail_report_write)
+    with pytest.raises(OSError, match="fixture report write failure"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE,),
+            quality_evaluator=passed_quality, **paths,
+        )
+
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM stock_profiles") == [(0,)]
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM stock_profile_history") == [(0,)]
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM chart_assets") == [(0,)]
+    assert query_all(
+        paths["db_path"],
+        "SELECT status FROM advisor_runs WHERE run_type = 'review'",
+    ) == [("failed",)]
+
+
+def test_review_blocks_when_archive_advice_scope_differs_from_quality_scope(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    advice = [
+        AdviceItem("advice-1", CODE, "watch", 0.5, "first", []),
+        AdviceItem("advice-2", "000001", "watch", 0.5, "second", []),
+    ]
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=advice
+    )
+
+    result = run_review(
+        collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, **paths,
+    )
+
+    assert result.status == "blocked"
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM stock_profile_history") == [(0,)]
+
+
+def test_review_outcome_uses_decline_and_same_day_ledger_activity(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    advice = AdviceItem("initial-advice", CODE, "watch", 0.5, "initial", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[advice]
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.executemany(
+        "INSERT INTO market_daily (code, trade_date, open, high, low, close, volume, amount, "
+        "source, fetched_at, as_of_date, content_hash, quality_status) "
+        "VALUES (?, ?, 10, 10, 9, ?, 100, 1000, 'fixture', ?, ?, ?, 'passed')",
+        [
+            (CODE, "2026-07-11", 10.0, AS_OF.isoformat(), "2026-07-11", "prior"),
+            (CODE, "2026-07-12", 9.0, AS_OF.isoformat(), "2026-07-12", "latest"),
+        ],
+    )
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('a1', 'fixture', ?)",
+        (AS_OF.isoformat(),),
+    )
+    connection.execute(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, "
+        "transaction_type, code, quantity, price, amount, fees, source, created_at) "
+        "VALUES ('t1', 'a1', '2026-07-12', 'buy', ?, 1, 9, 9, 0, 'fixture', ?)",
+        (CODE, AS_OF.isoformat()),
+    )
+    connection.commit()
+    connection.close()
+
+    result = run_review(
+        collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, **paths,
+    )
+
+    payload = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))
+    assert payload["reviews"][0]["outcome"] == "risk_review"
+    assert "9.0000" in payload["reviews"][0]["review_text"]
+    assert "10.0000" in payload["reviews"][0]["review_text"]
+    assert "1 ledger transaction" in payload["reviews"][0]["review_text"]
 
 
 def test_coordinator_resolves_configured_storage_without_tushare(tmp_path: Path):

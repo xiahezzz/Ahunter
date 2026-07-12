@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -36,7 +37,12 @@ from advisor.quality import (
     evaluate_run_quality,
     persist_quality_results,
 )
-from advisor.reporting.contracts import AdviceItem, ReportPaths, ReviewItem
+from advisor.reporting.contracts import (
+    AdviceItem,
+    ReportPaths,
+    ReviewItem,
+    read_verified_archive,
+)
 from advisor.reporting.failure import write_failure_report
 from advisor.reporting.premarket import write_premarket_report
 from advisor.reporting.review import write_review_report
@@ -199,7 +205,9 @@ def run_review(
                 connection, active_run_id, "review", report_day, output_dir, blocking, as_of
             )
 
-        morning = _load_morning_advice(connection, report_day)
+        morning = _load_morning_advice(
+            connection, output_dir, report_day, premarket_run_id
+        )
         if not morning:
             failure = QualityResult(
                 "advice_linkage", "blocking", False, "morning advice is unavailable"
@@ -207,15 +215,20 @@ def run_review(
             return _blocked_result(
                 connection, active_run_id, "review", report_day, output_dir, [failure], as_of
             )
-        reviews = [
-            ReviewItem(
-                _stable_id("review", active_run_id, item.advice_id),
-                item.advice_id,
-                "reviewed",
-                f"Daily review completed for {item.code} {item.action} research advice.",
+        morning_codes = tuple(item.code for item in morning)
+        if len(morning_codes) != len(set(morning_codes)) or set(morning_codes) != set(codes):
+            failure = QualityResult(
+                "advice_scope", "blocking", False,
+                "selected morning advice does not match quality-checked candidates",
             )
+            return _blocked_result(
+                connection, active_run_id, "review", report_day, output_dir, [failure], as_of
+            )
+        reviews = [
+            _evaluate_review_item(connection, active_run_id, report_day, as_of, item)
             for item in morning
         ]
+        connection.execute("BEGIN IMMEDIATE")
         _persist_reviews(connection, active_run_id, as_of, reviews)
         warnings = _project_review_profiles(
             connection, db_path, chart_dir, profile_dir, report_day, as_of,
@@ -404,7 +417,6 @@ def _persist_reviews(
             """,
             (item.review_id, run_id, item.advice_id, item.outcome, item.review_text, as_of.isoformat()),
         )
-    connection.commit()
 
 
 def _upsert_securities(
@@ -501,7 +513,8 @@ def _project_review_profiles(
             assets,
         )
         _write_profile(
-            connection, profile_dir, profile, as_of, run_id, "daily review projection"
+            connection, profile_dir, profile, as_of, run_id, "daily review projection",
+            transactional=True,
         )
     return warnings
 
@@ -530,7 +543,6 @@ def _chart_assets(
         """,
         (asset_id, code, as_of.isoformat(), str(path), as_of.isoformat()),
     )
-    connection.commit()
     return [str(path)]
 
 
@@ -541,8 +553,13 @@ def _write_profile(
     as_of: datetime,
     run_id: str,
     change_summary: str,
+    *,
+    transactional: bool = False,
 ) -> None:
-    upsert_profile(connection, profile)
+    if transactional:
+        _upsert_profile_without_commit(connection, profile, as_of)
+    else:
+        upsert_profile(connection, profile)
     profile_dir.mkdir(parents=True, exist_ok=True)
     (profile_dir / f"{profile.code}.md").write_text(
         render_profile_markdown(profile), encoding="utf-8"
@@ -563,7 +580,43 @@ def _write_profile(
             as_of.isoformat(),
         ),
     )
-    connection.commit()
+
+
+def _upsert_profile_without_commit(
+    connection: sqlite3.Connection, profile: StockProfile, as_of: datetime
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO stock_profiles (
+          code, thesis_json, information_flow_json, capital_flow_json,
+          fundamentals_json, analyst_flow_json, ledger_exposure_json,
+          assets_json, updated_at
+        ) VALUES (?, ?, ?, ?, '{}', ?, '{}', ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+          thesis_json = excluded.thesis_json,
+          information_flow_json = excluded.information_flow_json,
+          capital_flow_json = excluded.capital_flow_json,
+          analyst_flow_json = excluded.analyst_flow_json,
+          assets_json = excluded.assets_json,
+          updated_at = excluded.updated_at
+        """,
+        (
+            profile.code,
+            json.dumps(
+                {
+                    "name": profile.name,
+                    "industry": profile.industry,
+                    "thesis": profile.thesis,
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(profile.information_flow, ensure_ascii=False),
+            json.dumps(profile.capital_flow, ensure_ascii=False),
+            json.dumps(profile.analyst_flow, ensure_ascii=False),
+            json.dumps(profile.assets, ensure_ascii=False),
+            as_of.isoformat(),
+        ),
+    )
 
 
 def _archive_report(
@@ -585,24 +638,123 @@ def _archive_report(
             str(paths.markdown_path), str(paths.json_path), as_of.isoformat(),
         ),
     )
-    connection.commit()
 
 
 def _load_morning_advice(
-    connection: sqlite3.Connection, report_date: str
+    connection: sqlite3.Connection,
+    output_dir: Path,
+    report_date: str,
+    premarket_run_id: str,
 ) -> list[AdviceItem]:
-    rows = connection.execute(
+    try:
+        payload = read_verified_archive(
+            output_dir, report_date, "premarket", premarket_run_id
+        )["json"]
+    except ValueError as error:
+        raise ValueError("premarket archive not found") from error
+    archived_advice = payload.get("advice") if isinstance(payload, dict) else None
+    archived_ids = payload.get("advice_ids") if isinstance(payload, dict) else None
+    if not isinstance(archived_advice, list) or not isinstance(archived_ids, list):
+        raise ValueError("invalid premarket archive")
+
+    items: list[AdviceItem] = []
+    try:
+        for archived in archived_advice:
+            if not isinstance(archived, dict):
+                raise ValueError
+            item = AdviceItem(
+                archived["advice_id"], archived["code"], archived["action"],
+                archived["confidence"], archived["rationale"], archived["evidence_ids"],
+            )
+            row = connection.execute(
+                """
+                SELECT advice.advice_id, advice.code, advice.action, advice.confidence,
+                       advice.rationale, advice.evidence_ids_json
+                FROM advice JOIN advisor_runs ON advisor_runs.run_id = advice.run_id
+                WHERE advice.advice_id = ? AND advisor_runs.run_type = 'premarket'
+                  AND advisor_runs.status = 'passed' AND date(advisor_runs.as_of) = ?
+                """,
+                (item.advice_id, report_date),
+            ).fetchone()
+            if row is None:
+                raise ValueError
+            stored = AdviceItem(
+                row[0], row[1], row[2], row[3], row[4], json.loads(row[5])
+            )
+            if stored != item:
+                raise ValueError
+            items.append(stored)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("morning advice does not match premarket archive") from error
+    if archived_ids != [item.advice_id for item in items]:
+        raise ValueError("morning advice does not match premarket archive")
+    return items
+
+
+def _evaluate_review_item(
+    connection: sqlite3.Connection,
+    run_id: str,
+    report_date: str,
+    as_of: datetime,
+    advice: AdviceItem,
+) -> ReviewItem:
+    market_rows = connection.execute(
         """
-        SELECT advice.advice_id, advice.code, advice.action, advice.confidence,
-               advice.rationale, advice.evidence_ids_json
-        FROM advice JOIN advisor_runs ON advisor_runs.run_id = advice.run_id
-        WHERE advisor_runs.run_type = 'premarket' AND advisor_runs.status = 'passed'
-          AND date(advisor_runs.as_of) = ?
-        ORDER BY advice.advice_id
+        SELECT trade_date, close FROM market_daily
+        WHERE code = ? AND quality_status = 'passed'
+          AND date(trade_date) <= date(?) AND date(trade_date) <= date(?)
+        ORDER BY trade_date DESC LIMIT 2
         """,
-        (report_date,),
+        (advice.code, report_date, as_of.date().isoformat()),
     ).fetchall()
-    return [AdviceItem(row[0], row[1], row[2], row[3], row[4], json.loads(row[5])) for row in rows]
+    ledger_count = connection.execute(
+        """
+        SELECT COUNT(*) FROM ledger_transactions
+        WHERE code = ? AND date(trade_date) = date(?)
+          AND julianday(created_at) <= julianday(?)
+        """,
+        (advice.code, report_date, as_of.isoformat()),
+    ).fetchone()[0]
+    ledger_text = (
+        f"{ledger_count} ledger transaction{'s' if ledger_count != 1 else ''} recorded"
+        if ledger_count
+        else "no ledger transactions recorded"
+    )
+
+    valid_market = len(market_rows) == 2
+    if valid_market:
+        try:
+            latest_close = float(market_rows[0][1])
+            prior_close = float(market_rows[1][1])
+            valid_market = math.isfinite(latest_close) and math.isfinite(prior_close)
+        except (TypeError, ValueError, OverflowError):
+            valid_market = False
+    if not valid_market:
+        outcome = "no_market_data"
+        review_text = (
+            f"No two valid closes were available through {report_date}; {ledger_text} "
+            f"for {advice.code} on {report_date}."
+        )
+    else:
+        change = latest_close - prior_close
+        if change > 0:
+            outcome = "followed_strength"
+        elif ledger_count:
+            outcome = "risk_review"
+        else:
+            outcome = "missed_or_flat"
+        direction = "above" if change > 0 else "below" if change < 0 else "equal to"
+        review_text = (
+            f"Latest close {latest_close:.4f} on {market_rows[0][0]} was {direction} "
+            f"the prior close {prior_close:.4f} on {market_rows[1][0]}; {ledger_text} "
+            f"for {advice.code} on {report_date}."
+        )
+    return ReviewItem(
+        _stable_id("review", run_id, advice.advice_id),
+        advice.advice_id,
+        outcome,
+        review_text,
+    )
 
 
 def _review_quality_checks(checks: tuple[QualityResult, ...]) -> tuple[QualityResult, ...]:

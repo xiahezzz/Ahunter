@@ -1,6 +1,8 @@
+import argparse
 import json
 from pathlib import Path
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 
 from advisor.quality import QualityResult
 from advisor.reporting.contracts import (
@@ -140,3 +142,47 @@ def write_review_report(
 def _append_context(lines: list[str], context: dict[str, list[str]], key: str) -> None:
     values = context.get(key, [])
     lines.extend(f"- {value}" for value in values) if values else lines.append("- No current entries")
+
+
+def main(argv: Sequence[str] | None = None, *, coordinator=None, snapshot_reader=None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--as-of", required=True, type=datetime.fromisoformat)
+    parser.add_argument("--report-date", required=True)
+    parser.add_argument("--codes", required=True)
+    parser.add_argument("--events-db", type=Path, default=Path("data/state/events.sqlite"))
+    parser.add_argument("--allowed-rids", type=Path, default=Path("config/allowed-rids.yaml"))
+    parser.add_argument("--output-dir", type=Path, default=Path("reports"))
+    parser.add_argument("--config", type=Path, default=Path("config/advisor.yaml"))
+    parser.add_argument("--run-id")
+    parser.add_argument("--report-run-id")
+    parser.add_argument("--rerun-reason")
+    parser.add_argument("--supersedes")
+    parser.add_argument("--premarket-run-id", default="initial")
+    args = parser.parse_args(argv)
+    if coordinator is None:
+        from advisor.coordinator import run_review
+        coordinator = run_review
+    if snapshot_reader is None:
+        from advisor.evidence.mx_adapter import read_collector_snapshot
+        snapshot_reader = read_collector_snapshot
+    snapshot = snapshot_reader(args.events_db, args.allowed_rids, as_of=args.as_of)
+    result = coordinator(
+        collector_snapshot=snapshot,
+        as_of=args.as_of,
+        report_date=args.report_date,
+        candidate_codes=tuple(args.codes.split(",")),
+        output_dir=args.output_dir,
+        config_path=args.config,
+        run_id=args.run_id,
+        report_run_id=args.report_run_id,
+        rerun_reason=args.rerun_reason,
+        supersedes=args.supersedes,
+        premarket_run_id=args.premarket_run_id,
+    )
+    print(json.dumps({
+        "json_path": str(result.report_paths.json_path),
+        "markdown_path": str(result.report_paths.markdown_path),
+        "run_id": result.run_id,
+        "status": result.status,
+        "warnings": list(result.warnings),
+    }, sort_keys=True))
