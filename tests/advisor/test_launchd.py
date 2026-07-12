@@ -78,6 +78,21 @@ def test_launchd_validator_cli_accepts_templates():
     assert "valid launchd template" in result.stdout
 
 
+def test_installed_launchd_console_script_imports_advisor_outside_repo(tmp_path):
+    script = Path(sys.executable).with_name("advisor-launchd-render")
+
+    result = subprocess.run(
+        [str(script), "--help"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "Validate or render A Hunter advisor launchd templates" in result.stdout
+
+
 def test_launchd_render_creates_log_directories_for_output(tmp_path):
     output = tmp_path / "Library" / "LaunchAgents" / "advisor.plist"
     repo_root = tmp_path / "repo"

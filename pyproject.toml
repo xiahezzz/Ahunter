@@ -28,6 +28,9 @@ advisor-report-premarket = "advisor.reporting.premarket:main"
 advisor-report-review = "advisor.reporting.review:main"
 advisor-launchd-render = "advisor.scheduler.launchd:main"
 
+[tool.setuptools.packages.find]
+include = ["advisor*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/advisor"]
 pythonpath = ["."]
