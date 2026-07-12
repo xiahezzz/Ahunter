@@ -677,3 +677,90 @@ git diff --check
 ### Concerns
 
 None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
+
+## Latest Reviewer Fix: Anchored MX and Calendar Provenance
+
+### Status
+
+DONE
+
+Implementation commit: `da3e73f22f7bedef81211dd30feb6a85940f78e0`
+
+Required commit subject: `fix: anchor mx and calendar provenance`
+
+### Fix Summary
+
+- Bound RID authorization proof issuance to the resolved repository `config/allowed-rids.yaml`, rejected alternate and symlinked paths, and revalidated the current authoritative file before evidence persistence starts a transaction.
+- Added the constrained `trading_calendar_proofs` contract and deterministic repository writer. Calendar quality now reads only this table, verifies fixed producer/version fields and a domain-separated canonical content hash, and treats `market_sources` as non-authoritative historical fetch metadata.
+- Rejected delimiter-bounded `sessionid`, `socketid`, `debugidentifier`, `cdptoken`, `apikey`, and `idtoken` compounds while preserving established event IDs such as `evt-authorized-1`.
+- Added dedicated calendar proofs to future-data leakage checks and retained fail-closed stale, future, conflict, malformed, and missing-coverage behavior.
+
+### TDD Evidence
+
+The initial reviewer regressions produced:
+
+```text
+10 failed, 20 passed in 0.52s
+```
+
+The failures covered all six concatenated sensitive identifier compounds, alternate RID authorization paths, authoritative-path revalidation before persistence, exact-constant `market_sources` impersonation, and missing dedicated calendar proof storage.
+
+The isolated future-proof regression then produced:
+
+```text
+1 failed, 1 passed in 0.19s
+```
+
+After adding `trading_calendar_proofs` to future-data leakage checks, the same cases produced:
+
+```text
+2 passed in 0.08s
+```
+
+### Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_db_schema.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+235 passed in 2.64s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+353 passed in 4.76s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 520.019875
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+### Changed Files
+
+- `advisor/db/repository.py`
+- `advisor/db/schema.sql`
+- `advisor/evidence/mx_adapter.py`
+- `advisor/quality.py`
+- `tests/advisor/test_db_schema.py`
+- `tests/advisor/test_mx_evidence_quality.py`
+- `tests/advisor/test_quality_gate.py`
+- `.superpowers/sdd/task-15-report.md`
+
+### Concerns
+
+None. No collector behavior, RID values, frontend, broker/order code, live smoke test, Chrome session, or MX page operation was changed or invoked. Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched.
