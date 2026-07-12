@@ -631,6 +631,78 @@ def test_review_rejects_excessive_ledger_accounts_before_rendering_context(
     assert query_all(paths["db_path"], "SELECT COUNT(*) FROM portfolio_snapshots") == [(0,)]
 
 
+def test_review_bounds_ledger_account_discovery_before_snapshot_materialization(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from advisor.db.migrate import migrate_database
+    from advisor.ledger import importer as ledger_importer
+
+    monkeypatch.setattr(ledger_importer, "MAX_LEDGER_SNAPSHOT_ACCOUNTS", 2, raising=False)
+    paths = coordinator_paths(tmp_path)
+    migrate_database(paths["db_path"])
+    seed_premarket_report(
+        paths,
+        database_run_id="initial",
+        report_run_id="initial",
+        advice=[AdviceItem("advice-1", CODE, "watch", 0.7, "fixture rationale", ())],
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    account_rows = [
+        (f"account-{index}", f"Account {index}", AS_OF.isoformat())
+        for index in range(1, 6)
+    ]
+    connection.executemany(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES (?, ?, ?)",
+        account_rows,
+    )
+    connection.executemany(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, "
+        "transaction_type, code, quantity, price, amount, fees, source, created_at) "
+        "VALUES (?, ?, '2026-07-11', 'cash_deposit', NULL, 0, 0, 1000, 0, 'fixture', ?)",
+        [
+            (f"deposit-{index}", f"account-{index}", AS_OF.isoformat())
+            for index in range(1, 6)
+        ],
+    )
+    connection.commit()
+    connection.close()
+    account_queries: list[str] = []
+
+    class RecordingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=(), /):
+            if "SELECT DISTINCT account_id FROM ledger_transactions" in sql:
+                account_queries.append(sql)
+            return super().execute(sql, parameters)
+
+    def recording_connect(path: Path) -> sqlite3.Connection:
+        connection = sqlite3.connect(path, factory=RecordingConnection)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def fail_if_unbounded_materialized(_connection, account_ids, **_kwargs):
+        assert len(account_ids) <= 3
+        raise AssertionError("snapshot materialization should not run after cap overflow")
+
+    monkeypatch.setattr(coordinator_module, "connect", recording_connect)
+    monkeypatch.setattr(
+        coordinator_module, "materialize_ledger_snapshots", fail_if_unbounded_materialized
+    )
+
+    with pytest.raises(ValueError, match="ledger snapshot account limit"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE,),
+            run_id="review-bounded-account-discovery",
+            quality_evaluator=passed_quality,
+            **paths,
+        )
+
+    assert account_queries
+    assert "LIMIT" in account_queries[0].upper()
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM portfolio_snapshots") == [(0,)]
+
+
 def test_review_rejects_excessive_ledger_context_items_before_rendering(
     tmp_path: Path,
     monkeypatch,
@@ -677,6 +749,63 @@ def test_review_rejects_excessive_ledger_context_items_before_rendering(
         )
 
     assert not (paths["output_dir"] / "2026-07-12" / "review.json").exists()
+
+
+def test_review_truncates_excessive_same_day_trade_matches_per_context_item(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from advisor.db.migrate import migrate_database
+
+    monkeypatch.setattr(
+        coordinator_module, "MAX_REVIEW_LEDGER_MATCHES_PER_CONTEXT_ITEM", 2, raising=False
+    )
+    paths = coordinator_paths(tmp_path)
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    seed_premarket_report(
+        paths,
+        database_run_id="initial",
+        report_run_id="initial",
+        advice=[AdviceItem("advice-1", CODE, "watch", 0.7, "fixture rationale", ())],
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('account-1', 'Account', ?)",
+        (AS_OF.isoformat(),),
+    )
+    connection.executemany(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, "
+        "transaction_type, code, quantity, price, amount, fees, source, created_at) "
+        "VALUES (?, 'account-1', '2026-07-12', 'buy', ?, 1, 10, -10, 0, 'fixture', ?)",
+        [
+            (f"match-{index}", CODE, AS_OF.isoformat())
+            for index in range(1, 5)
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    result = run_review(
+        collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        run_id="review-bounded-matches",
+        quality_evaluator=passed_quality,
+        **paths,
+    )
+
+    context = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))["context"]
+    impact = json.loads(context["ledger_impact"][0])
+    assert impact["transactions"] == [
+        {"transaction_id": "match-1", "transaction_type": "buy"},
+        {"transaction_id": "match-2", "transaction_type": "buy"},
+    ]
+    assert impact["transactions_truncated"] is True
+    assert impact["transaction_match_count"] == 4
+    assert query_all(
+        paths["db_path"],
+        "SELECT transaction_id FROM advice_trade_matches ORDER BY transaction_id",
+    ) == [("match-1",), ("match-2",)]
 
 
 @pytest.mark.parametrize("module", [premarket_reporting, review_reporting])

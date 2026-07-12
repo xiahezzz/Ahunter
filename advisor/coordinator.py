@@ -30,6 +30,7 @@ from advisor.db.migrate import migrate_database
 from advisor.db.repository import connect
 from advisor.evidence.mx_adapter import CollectorSnapshot
 from advisor.evidence.service import EvidenceRecord, persist_evidence
+from advisor.ledger import importer as ledger_importer
 from advisor.ledger.importer import ledger_exposure_by_code, materialize_ledger_snapshots
 from advisor.paths import repo_root
 from advisor.profiles.service import StockProfile, render_profile_markdown, upsert_profile
@@ -56,6 +57,7 @@ EvidencePersister = Callable[..., list[EvidenceRecord]]
 _RESEARCH_ACTIONS = frozenset({"buy", "watch", "hold", "reduce", "exit", "avoid"})
 _CODE_PATTERN = re.compile(r"(?<!\d)([03468]\d{5})(?!\d)")
 MAX_REVIEW_LEDGER_CONTEXT_ITEMS = 500
+MAX_REVIEW_LEDGER_MATCHES_PER_CONTEXT_ITEM = 50
 
 
 @dataclass(frozen=True)
@@ -916,18 +918,26 @@ def _review_ledger_context(
     as_of: datetime,
     run_id: str,
 ) -> list[str]:
-    codes = tuple(dict.fromkeys(item.code for item in advice_items))
-    placeholders = ",".join("?" for _ in codes)
     account_rows = connection.execute(
         """
         SELECT DISTINCT account_id FROM ledger_transactions
         WHERE date(trade_date) <= date(?)
           AND julianday(created_at) <= julianday(?)
         ORDER BY account_id
+        LIMIT ?
         """,
-        (report_date, as_of.isoformat()),
+        (
+            report_date,
+            as_of.isoformat(),
+            ledger_importer.MAX_LEDGER_SNAPSHOT_ACCOUNTS + 1,
+        ),
     ).fetchall()
     account_ids = tuple(row[0] for row in account_rows)
+    if len(account_ids) > ledger_importer.MAX_LEDGER_SNAPSHOT_ACCOUNTS:
+        raise ValueError(
+            f"ledger snapshot account limit exceeds "
+            f"{ledger_importer.MAX_LEDGER_SNAPSHOT_ACCOUNTS}"
+        )
     context_items = len(account_ids) * len(advice_items)
     if context_items > MAX_REVIEW_LEDGER_CONTEXT_ITEMS:
         raise ValueError(
@@ -936,34 +946,29 @@ def _review_ledger_context(
     snapshots = materialize_ledger_snapshots(
         connection, account_ids, as_of=as_of, snapshot_source=run_id
     )
-    transaction_rows = connection.execute(
-        f"""
-        SELECT account_id, code, transaction_id, transaction_type, trade_date
-        FROM ledger_transactions
-        WHERE code IN ({placeholders})
-          AND date(trade_date) = date(?)
-          AND julianday(created_at) <= julianday(?)
-        ORDER BY account_id, code, transaction_id
-        """,
-        (*codes, report_date, as_of.isoformat()),
-    ).fetchall()
     context: list[str] = []
     for advice in advice_items:
         for account_id in account_ids:
+            matched_rows, match_count = _review_trade_matches_for_context_item(
+                connection,
+                account_id,
+                advice.code,
+                report_date,
+                as_of,
+                MAX_REVIEW_LEDGER_MATCHES_PER_CONTEXT_ITEM,
+            )
             matched = [
                 {
-                    "transaction_id": row[2],
-                    "transaction_type": row[3],
+                    "transaction_id": row[0],
+                    "transaction_type": row[1],
                 }
-                for row in transaction_rows
-                if row[0] == account_id and row[1] == advice.code
+                for row in matched_rows
             ]
-            for row in transaction_rows:
-                if row[0] == account_id and row[1] == advice.code:
-                    _persist_advice_trade_match(
-                        connection, run_id, advice.advice_id, row[2], account_id,
-                        advice.code, row[4], as_of,
-                    )
+            for row in matched_rows:
+                _persist_advice_trade_match(
+                    connection, run_id, advice.advice_id, row[0], account_id,
+                    advice.code, row[2], as_of,
+                )
             snapshot = snapshots[account_id]
             context.append(
                 json.dumps(
@@ -978,6 +983,8 @@ def _review_ledger_context(
                         "realized_pnl": snapshot["realized_pnl"],
                         "snapshot_id": snapshot["snapshot_id"],
                         "transactions": matched,
+                        "transaction_match_count": match_count,
+                        "transactions_truncated": match_count > len(matched),
                         "unrealized_pnl": snapshot["unrealized_pnl"],
                     },
                     ensure_ascii=True,
@@ -986,6 +993,40 @@ def _review_ledger_context(
                 )
             )
     return context
+
+
+def _review_trade_matches_for_context_item(
+    connection: sqlite3.Connection,
+    account_id: str,
+    code: str,
+    report_date: str,
+    as_of: datetime,
+    limit: int,
+) -> tuple[list[sqlite3.Row], int]:
+    rows = connection.execute(
+        """
+        SELECT transaction_id, transaction_type, trade_date
+        FROM ledger_transactions
+        WHERE account_id = ?
+          AND code = ?
+          AND date(trade_date) = date(?)
+          AND julianday(created_at) <= julianday(?)
+        ORDER BY transaction_id
+        LIMIT ?
+        """,
+        (account_id, code, report_date, as_of.isoformat(), limit),
+    ).fetchall()
+    count = connection.execute(
+        """
+        SELECT COUNT(*) FROM ledger_transactions
+        WHERE account_id = ?
+          AND code = ?
+          AND date(trade_date) = date(?)
+          AND julianday(created_at) <= julianday(?)
+        """,
+        (account_id, code, report_date, as_of.isoformat()),
+    ).fetchone()[0]
+    return rows, int(count)
 
 
 def _persist_advice_trade_match(
