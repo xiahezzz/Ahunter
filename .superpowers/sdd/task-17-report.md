@@ -310,3 +310,82 @@ No live smoke test, browser screenshot QA, MX page operation, collector start, R
 ### Concerns
 
 Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched and are not included in the review-fix commits.
+
+## Final Review-Loop Fixes
+
+### RED Evidence
+
+Streamed oversized bodies without Content-Length were initially rejected only after both ASGI chunks were consumed:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py -q -k 'streamed_body_over_limit'
+FF                                                                       [100%]
+2 failed, 86 deselected in 0.59s
+```
+
+The required `LedgerStore` facade was initially absent:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q -k 'ledger_store'
+ModuleNotFoundError: No module named 'advisor.ledger.store'
+1 error in 0.19s
+```
+
+### GREEN Evidence
+
+Focused streamed-body and existing raw-body bounds:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py -q -k 'streamed_body_over_limit or oversized_raw_body'
+....                                                                     [100%]
+4 passed, 84 deselected in 0.39s
+```
+
+Focused store facade contract:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q -k 'ledger_store'
+..                                                                       [100%]
+2 passed, 23 deselected in 0.14s
+```
+
+### Final Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 39%]
+........................................................................ [ 79%]
+......................................                                   [100%]
+182 passed in 5.53s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 16%]
+........................................................................ [ 32%]
+........................................................................ [ 48%]
+........................................................................ [ 65%]
+........................................................................ [ 81%]
+........................................................................ [ 97%]
+..........                                                               [100%]
+442 passed in 7.80s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 510.113542
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
