@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8,6 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import yaml
 
+from advisor.evidence import mx_adapter
 from advisor.evidence.mx_adapter import read_collector_snapshot
 from advisor.evidence.service import persist_evidence
 
@@ -260,6 +263,74 @@ def test_sensitive_values_in_decoded_summary_are_not_exposed(
     assert "[redacted]" in snapshot.events[0].summary
 
 
+def test_complete_auth_cookie_bearer_and_jwt_secrets_are_redacted(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    secrets = (
+        "super-secret-token",
+        "session=secret-cookie",
+        "standalone-bearer-secret",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signature-secret",
+        "assigned-secret",
+    )
+    decoded = (
+        "关注 600519 Authorization: Bearer super-secret-token "
+        "Cookie: session=secret-cookie\n"
+        "Bearer standalone-bearer-secret "
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signature-secret "
+        "token=assigned-secret"
+    )
+    db, _ = create_collector_db(tmp_path)
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "UPDATE events SET decoded_text = ? WHERE event_id = 'evt-authorized-2'",
+        (decoded,),
+    )
+    connection.commit()
+    connection.close()
+
+    snapshot = read_collector_snapshot(
+        db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF, limit=1
+    )
+    serialized = json.dumps(snapshot.events[0].to_dict())
+
+    assert all(secret not in serialized for secret in secrets)
+    assert "Bearer" not in snapshot.events[0].summary
+
+
+def test_collector_database_read_is_pinned_to_validated_descriptor(
+    tmp_path, create_collector_db, write_allowed_rids, monkeypatch
+):
+    db, _ = create_collector_db(tmp_path)
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    replacement, _ = create_collector_db(replacement_dir)
+    replacement_connection = sqlite3.connect(replacement)
+    replacement_connection.execute("DELETE FROM events")
+    replacement_connection.execute("UPDATE ingest_counters SET count = 0 WHERE kind = 'accepted'")
+    replacement_connection.commit()
+    replacement_connection.close()
+    allowed = write_allowed_rids(tmp_path, [123])
+    real_connect = sqlite3.connect
+    opened_uri = None
+
+    def swap_path_then_connect(database, *args, **kwargs):
+        nonlocal opened_uri
+        opened_uri = database
+        os.replace(replacement, db)
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(mx_adapter.sqlite3, "connect", swap_path_then_connect)
+
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+
+    assert opened_uri is not None and ".mx-read-" in opened_uri
+    assert {event.source_id for event in snapshot.events} == {
+        "evt-authorized-1",
+        "evt-authorized-2",
+    }
+
+
 def _advisor_evidence_tables(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -298,6 +369,80 @@ def test_persist_evidence_is_idempotent_bounded_and_excludes_future(
     assert len(normalized[0]) <= 800
     assert "raw-secret" not in normalized[1]
     assert "source_url" not in normalized[1]
+
+
+def test_persist_evidence_excludes_future_source_and_media_timestamps(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    snapshot = read_collector_snapshot(db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF)
+    source_future = replace(
+        snapshot.events[1], source_created_at=AS_OF + timedelta(seconds=1)
+    )
+    media_event = snapshot.events[0]
+    assert media_event.media
+    media_future = replace(
+        media_event,
+        media=(replace(media_event.media[0], downloaded_at=AS_OF + timedelta(seconds=1)),),
+    )
+    bounded_snapshot = replace(snapshot, events=(source_future, media_future))
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+
+    records = persist_evidence(connection, "advisor-run", bounded_snapshot, as_of=AS_OF)
+
+    assert records == []
+    assert connection.execute("SELECT count(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 0
+
+
+def test_persist_evidence_rejects_snapshot_after_run_as_of(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    snapshot = read_collector_snapshot(db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF)
+    future_snapshot = replace(snapshot, as_of=AS_OF + timedelta(seconds=1))
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+
+    with pytest.raises(ValueError, match="snapshot as_of"):
+        persist_evidence(connection, "advisor-run", future_snapshot, as_of=AS_OF)
+
+    assert connection.execute("SELECT count(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 0
+
+
+def test_persisted_summary_and_raw_refs_contain_no_complete_secrets(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    secret = "persisted-super-secret-token"
+    db, _ = create_collector_db(tmp_path)
+    source = sqlite3.connect(db)
+    source.execute(
+        "UPDATE events SET decoded_text = ? WHERE event_id = 'evt-authorized-2'",
+        (f"关注 600519 Authorization: Bearer {secret}",),
+    )
+    source.execute(
+        "UPDATE media SET local_path = ? WHERE event_id = 'evt-authorized-2'",
+        (f"data/events/media/token={secret}",),
+    )
+    source.commit()
+    source.close()
+    snapshot = read_collector_snapshot(
+        db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF, limit=1
+    )
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+
+    persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    summary, raw_ref = connection.execute(
+        "SELECT summary, raw_ref_json FROM events_normalized"
+    ).fetchone()
+    evidence_summary = connection.execute("SELECT summary FROM evidence").fetchone()[0]
+    assert secret not in summary
+    assert secret not in evidence_summary
+    assert secret not in raw_ref
 
 
 def test_persist_evidence_rolls_back_both_tables_on_failure(

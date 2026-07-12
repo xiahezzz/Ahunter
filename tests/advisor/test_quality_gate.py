@@ -1,12 +1,13 @@
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from advisor.agents.astock_adapter import ANALYST_ROLES
 from advisor.db.migrate import migrate_database
-from advisor.evidence.mx_adapter import CollectorSnapshot
+from advisor.evidence.mx_adapter import CollectorSnapshot, MediaMetadata, MxEvidence
 from advisor.quality import QualityRequest, QualityResult, evaluate_run_quality
 
 
@@ -56,6 +57,17 @@ def quality_connection(tmp_path: Path) -> sqlite3.Connection:
             """,
             (f"output-{role}", role, AS_OF.isoformat()),
         )
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('calendar-proof', 'sina_http', 'bounded', 'calendar', ?, 'passed', ?)
+        """,
+        (
+            AS_OF.isoformat(),
+            json.dumps({"latest_expected_session": "2026-07-10"}),
+        ),
+    )
     connection.commit()
     return connection
 
@@ -161,6 +173,65 @@ def test_future_market_fetch_timestamp_blocks(tmp_path: Path):
 
     assert result.status == "blocked"
     assert next(check for check in result.checks if check.check_name == "future_data_leakage").blocking_failure
+
+
+def test_future_snapshot_source_and_media_timestamps_block_future_leakage(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    event = MxEvidence(
+        evidence_id="e" * 64,
+        source_type="mx",
+        source_id="event-1",
+        rid=123,
+        content_hash="c" * 64,
+        summary="关注 600519",
+        received_at=AS_OF,
+        source_created_at=AS_OF + timedelta(seconds=1),
+        media=(
+            MediaMetadata(
+                content_hash="m" * 64,
+                content_type="image/jpeg",
+                local_path="data/events/media/a.jpg",
+                downloaded_at=AS_OF + timedelta(seconds=1),
+            ),
+        ),
+    )
+    future_collector = replace(
+        collector(),
+        events=(event,),
+        as_of=AS_OF + timedelta(seconds=1),
+    )
+
+    result = evaluate_run_quality(connection, request(collector=future_collector))
+
+    assert result.status == "blocked"
+    assert next(
+        check for check in result.checks if check.check_name == "future_data_leakage"
+    ).blocking_failure
+
+
+def test_trading_calendar_blocks_when_candidate_misses_latest_expected_session(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute(
+        "UPDATE market_daily SET trade_date = '2026-07-09', as_of_date = '2026-07-09' "
+        "WHERE trade_date = '2026-07-10'"
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "2026-07-10" in check.details
+
+
+def test_trading_calendar_passes_when_candidate_covers_latest_expected_session(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.passed
+    assert "2026-07-10" in check.details
 
 
 def test_invalid_ledger_replay_blocks(tmp_path: Path):
@@ -307,3 +378,31 @@ def test_quality_persistence_is_idempotent(tmp_path: Path):
     assert connection.execute(
         "SELECT count(*) FROM data_quality_checks WHERE run_id = 'run-15'"
     ).fetchone()[0] == len(first.checks)
+
+
+def test_quality_persistence_replaces_obsolete_optional_failure(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('optional-failed', 'optional_news', 'bounded', 'optional', ?, 'failed', ?)
+        """,
+        (AS_OF.isoformat(), json.dumps({"optional": True})),
+    )
+    connection.commit()
+
+    first = evaluate_run_quality(connection, request())
+    assert any(check.check_name == "optional_source_degradation" for check in first.checks)
+
+    connection.execute("DELETE FROM market_sources WHERE source = 'optional_news'")
+    connection.commit()
+    second = evaluate_run_quality(connection, request())
+
+    assert all(check.check_name != "optional_source_degradation" for check in second.checks)
+    assert connection.execute(
+        """
+        SELECT count(*) FROM data_quality_checks
+        WHERE run_id = 'run-15' AND check_name = 'optional_source_degradation'
+        """
+    ).fetchone()[0] == 0

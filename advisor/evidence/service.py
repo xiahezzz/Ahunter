@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
-from advisor.evidence.mx_adapter import CollectorSnapshot, MxEvidence
+from advisor.evidence.mx_adapter import CollectorSnapshot, MxEvidence, redact_sensitive_text
 
 
 _STOCK_CODE_RE = re.compile(r"\b([03468]\d{5})\b")
@@ -38,8 +38,15 @@ def persist_evidence(
         raise TypeError("snapshot must be CollectorSnapshot")
     if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
         raise ValueError("as_of must be timezone-aware")
+    if (
+        not isinstance(snapshot.as_of, datetime)
+        or snapshot.as_of.tzinfo is None
+        or snapshot.as_of.utcoffset() is None
+        or snapshot.as_of > as_of
+    ):
+        raise ValueError("snapshot as_of exceeds run as_of")
 
-    events = [event for event in snapshot.events if event.received_at <= as_of]
+    events = [event for event in snapshot.events if _event_is_bounded(event, as_of)]
     records = [_record(run_id, event) for event in events]
     owns_transaction = not connection.in_transaction
     savepoint = "mx_evidence_handoff"
@@ -53,7 +60,7 @@ def persist_evidence(
                     "received_at": event.received_at.isoformat(),
                     "rid": event.rid,
                     "source_created_at": event.source_created_at.isoformat() if event.source_created_at else None,
-                    "source_id": event.source_id,
+                    "source_id": redact_sensitive_text(event.source_id),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -67,7 +74,7 @@ def persist_evidence(
                 """,
                 (
                     event.evidence_id, event.source_type, event.source_id, record.code,
-                    record.as_of, event.summary, raw_ref,
+                    record.as_of, record.summary, raw_ref,
                 ),
             )
             normalized = connection.execute(
@@ -79,7 +86,7 @@ def persist_evidence(
             ).fetchone()
             if normalized is None or tuple(normalized) != (
                 event.source_type, event.source_id, record.code, record.as_of,
-                event.summary, raw_ref, "passed",
+                record.summary, raw_ref, "passed",
             ):
                 raise ValueError("conflicting normalized evidence identity")
             connection.execute(
@@ -121,7 +128,8 @@ def persist_evidence(
 
 
 def _record(run_id: str, event: MxEvidence) -> EvidenceRecord:
-    match = _STOCK_CODE_RE.search(event.summary)
+    summary = redact_sensitive_text(event.summary)
+    match = _STOCK_CODE_RE.search(summary)
     return EvidenceRecord(
         evidence_id=event.evidence_id,
         run_id=run_id,
@@ -129,5 +137,30 @@ def _record(run_id: str, event: MxEvidence) -> EvidenceRecord:
         as_of=event.received_at.isoformat(),
         source_type=event.source_type,
         source_id=event.source_id,
-        summary=event.summary,
+        summary=summary,
     )
+
+
+def _event_is_bounded(event: MxEvidence, as_of: datetime) -> bool:
+    timestamps = (event.received_at, event.source_created_at)
+    try:
+        if any(
+            value is not None
+            and (
+                not isinstance(value, datetime)
+                or value.tzinfo is None
+                or value.utcoffset() is None
+                or value > as_of
+            )
+            for value in timestamps
+        ):
+            return False
+        return all(
+            isinstance(item.downloaded_at, datetime)
+            and item.downloaded_at.tzinfo is not None
+            and item.downloaded_at.utcoffset() is not None
+            and item.downloaded_at <= as_of
+            for item in event.media
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False

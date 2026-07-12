@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import sqlite3
 import stat
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
@@ -20,8 +22,17 @@ _MAX_SCAN_ROWS = 1_000
 _MAX_MEDIA_PER_EVENT = 20
 _HASH_CHARS = frozenset("0123456789abcdef")
 _COUNTER_KINDS = frozenset({"accepted", "duplicate", "failed", "ignored", "media_failed", "rejected"})
+_AUTHORIZATION = re.compile(
+    r"\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;]+",
+    re.IGNORECASE,
+)
+_COOKIE = re.compile(r"\bcookie\s*[:=]\s*[^\r\n]+", re.IGNORECASE)
+_BEARER = re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
+_JWT = re.compile(
+    r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+)
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"\b(?:api[_-]?key|secret|password|credential|authorization|cookie|token|session|socket(?:[_.-]?id)?|debug(?:ger|[_.-]?id)?|cdp)\s*[:=]\s*\S+",
+    r"\b(?:api[_-]?key|secret|password|credential|token|session|socket(?:[_.-]?id)?|debug(?:ger|[_.-]?id)?|cdp)\s*[:=]\s*[^\s,;]+",
     re.IGNORECASE,
 )
 _SECRET_PREFIX = re.compile(r"\b(?:sk|pk|sess)_[A-Za-z0-9_-]{8,}", re.IGNORECASE)
@@ -68,8 +79,8 @@ class MediaMetadata:
     def to_dict(self) -> dict[str, object]:
         return {
             "content_hash": self.content_hash,
-            "content_type": self.content_type,
-            "local_path": self.local_path,
+            "content_type": redact_sensitive_text(self.content_type),
+            "local_path": redact_sensitive_text(self.local_path),
             "downloaded_at": self.downloaded_at.isoformat(),
         }
 
@@ -182,21 +193,58 @@ def _read_allowed_rids(path: Path) -> tuple[int, ...]:
 def _open_read_only(path: Path) -> sqlite3.Connection:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
+    pin_dir: Path | None = None
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("collector database must be a regular file")
-        current = os.stat(path, follow_symlinks=False)
-        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
-            raise ValueError("collector database changed while opening")
-        uri = f"file:{quote(str(path.absolute()))}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True)
-        rebound = os.stat(path, follow_symlinks=False)
-        if (opened.st_dev, opened.st_ino) != (rebound.st_dev, rebound.st_ino):
-            connection.close()
-            raise ValueError("collector database changed while opening")
+        pin_dir = Path(tempfile.mkdtemp(prefix=".mx-read-", dir=path.parent))
+        pinned_db = pin_dir / "events.sqlite"
+        os.link(path, pinned_db, follow_symlinks=False)
+        pinned = pinned_db.stat()
+        if (opened.st_dev, opened.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise ValueError("collector database changed while pinning")
+        for suffix in ("-wal", "-shm"):
+            _pin_optional_sqlite_sidecar(Path(f"{path}{suffix}"), Path(f"{pinned_db}{suffix}"))
+        uri = f"file:{quote(str(pinned_db))}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, factory=_PinnedReadOnlyConnection)
+        connection.pin_dir = pin_dir
         connection.execute("PRAGMA query_only = ON")
         return connection
+    except BaseException:
+        if pin_dir is not None:
+            shutil.rmtree(pin_dir, ignore_errors=True)
+        raise
+    finally:
+        os.close(descriptor)
+
+
+class _PinnedReadOnlyConnection(sqlite3.Connection):
+    pin_dir: Path | None = None
+
+    def close(self) -> None:
+        pin_dir = self.pin_dir
+        try:
+            super().close()
+        finally:
+            if pin_dir is not None:
+                shutil.rmtree(pin_dir, ignore_errors=True)
+                self.pin_dir = None
+
+
+def _pin_optional_sqlite_sidecar(source: Path, target: Path) -> None:
+    try:
+        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("collector SQLite sidecar must be a regular file")
+        os.link(source, target, follow_symlinks=False)
+        pinned = target.stat()
+        if (opened.st_dev, opened.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise ValueError("collector SQLite sidecar changed while pinning")
     finally:
         os.close(descriptor)
 
@@ -366,9 +414,7 @@ def _event_from_row(row: sqlite3.Row, media: tuple[MediaMetadata, ...], as_of: d
         or not isinstance(row["decoded_text"], str)
     ):
         raise ValueError("invalid accepted event")
-    summary = " ".join(row["decoded_text"].split())
-    summary = _SENSITIVE_ASSIGNMENT.sub("[redacted]", summary)
-    summary = _SECRET_PREFIX.sub("[redacted]", summary)[:_MAX_SUMMARY_CHARS]
+    summary = redact_sensitive_text(" ".join(row["decoded_text"].split()))[:_MAX_SUMMARY_CHARS]
     received_at = _timestamp(row["received_at"], as_of.tzinfo)
     source_created_at = (
         _timestamp(row["source_created_at"], as_of.tzinfo)
@@ -397,6 +443,15 @@ def _timestamp(value: object, zone) -> datetime:
 
 def _valid_hash(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value.lower()) <= _HASH_CHARS
+
+
+def redact_sensitive_text(value: str) -> str:
+    redacted = _AUTHORIZATION.sub("[redacted]", value)
+    redacted = _COOKIE.sub("[redacted]", redacted)
+    redacted = _BEARER.sub("[redacted]", redacted)
+    redacted = _JWT.sub("[redacted]", redacted)
+    redacted = _SENSITIVE_ASSIGNMENT.sub("[redacted]", redacted)
+    return _SECRET_PREFIX.sub("[redacted]", redacted)
 
 
 def _blocked(as_of: datetime, details: str) -> CollectorSnapshot:

@@ -125,17 +125,44 @@ def _collector_check(snapshot: CollectorSnapshot | None) -> QualityResult:
 
 
 def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
-    date = request.as_of.date().isoformat()
+    rows = connection.execute(
+        """
+        SELECT details_json FROM market_sources
+        WHERE status = 'passed' AND julianday(fetched_at) IS NOT NULL
+          AND julianday(fetched_at) <= julianday(?)
+        ORDER BY fetched_at DESC, source_key DESC
+        LIMIT ?
+        """,
+        (request.as_of.isoformat(), _MAX_SOURCE_ROWS + 1),
+    ).fetchall()
+    if len(rows) > _MAX_SOURCE_ROWS:
+        return _blocked_check("trading_calendar", "trading calendar proof scan limit exceeded")
+    expected_sessions: list[dt.date] = []
+    for (raw_details,) in rows:
+        try:
+            details = json.loads(raw_details)
+            value = details.get("latest_expected_session") if isinstance(details, dict) else None
+            if value is not None:
+                expected_sessions.append(dt.date.fromisoformat(value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return _blocked_check("trading_calendar", "trading calendar proof is invalid")
+    if not expected_sessions:
+        return _blocked_check("trading_calendar", "latest expected trading session is unavailable")
+    expected = max(expected_sessions)
+    if expected > request.as_of.date():
+        return _blocked_check("trading_calendar", "latest expected trading session is future-dated")
     placeholders = ",".join("?" for _ in request.candidate_codes)
     rows = connection.execute(
-        f"SELECT DISTINCT code FROM market_daily WHERE code IN ({placeholders}) AND trade_date <= ? AND quality_status = 'passed'",
-        (*request.candidate_codes, date),
+        f"SELECT DISTINCT code FROM market_daily WHERE code IN ({placeholders}) AND trade_date = ? AND quality_status = 'passed'",
+        (*request.candidate_codes, expected.isoformat()),
     ).fetchall()
     found = {row[0] for row in rows}
     missing = sorted(set(request.candidate_codes) - found)
     return QualityResult(
         "trading_calendar", "blocking", not missing,
-        "trading calendar available" if not missing else f"trading calendar unavailable for {len(missing)} candidates",
+        f"latest expected trading session {expected.isoformat()} is covered"
+        if not missing
+        else f"latest expected trading session {expected.isoformat()} missing for {len(missing)} candidates",
     )
 
 
@@ -208,7 +235,9 @@ def _future_data_check(connection: sqlite3.Connection, request: QualityRequest) 
             (as_of,),
         ),
     )
-    leaked = any(connection.execute(sql, params).fetchone() is not None for sql, params in queries)
+    leaked = _collector_has_future_data(request.collector, request.as_of) or any(
+        connection.execute(sql, params).fetchone() is not None for sql, params in queries
+    )
     return QualityResult(
         "future_data_leakage", "blocking", not leaked,
         "no future-dated records detected" if not leaked else "future-dated records detected",
@@ -368,9 +397,10 @@ def _persist_checks(
     checks: tuple[QualityResult, ...],
 ) -> None:
     started = not connection.in_transaction
-    if started:
-        connection.execute("BEGIN IMMEDIATE")
+    savepoint = "quality_check_replacement"
     try:
+        connection.execute("BEGIN IMMEDIATE" if started else f"SAVEPOINT {savepoint}")
+        connection.execute("DELETE FROM data_quality_checks WHERE run_id = ?", (request.run_id,))
         for check in checks:
             check_id = hashlib.sha256(
                 f"a-hunter:quality:v1\0{request.run_id}\0{check.check_name}".encode("utf-8")
@@ -395,10 +425,50 @@ def _persist_checks(
             )
         if started:
             connection.commit()
+        else:
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
     except BaseException:
         if started:
             connection.rollback()
+        else:
+            connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         raise
+
+
+def _collector_has_future_data(snapshot: CollectorSnapshot, as_of: dt.datetime) -> bool:
+    try:
+        if (
+            not isinstance(snapshot.as_of, dt.datetime)
+            or snapshot.as_of.tzinfo is None
+            or snapshot.as_of.utcoffset() is None
+            or snapshot.as_of > as_of
+        ):
+            return True
+        for event in snapshot.events:
+            timestamps = (event.received_at, event.source_created_at)
+            if any(
+                value is not None
+                and (
+                    not isinstance(value, dt.datetime)
+                    or value.tzinfo is None
+                    or value.utcoffset() is None
+                    or value > as_of
+                )
+                for value in timestamps
+            ):
+                return True
+            if any(
+                not isinstance(media.downloaded_at, dt.datetime)
+                or media.downloaded_at.tzinfo is None
+                or media.downloaded_at.utcoffset() is None
+                or media.downloaded_at > as_of
+                for media in event.media
+            ):
+                return True
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return True
+    return False
 
 
 def _blocked_check(name: str, details: str) -> QualityResult:
