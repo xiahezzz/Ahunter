@@ -1269,6 +1269,64 @@ def test_ledger_import_rejects_huge_unknown_field_before_database_write(
     assert not db_path.exists()
 
 
+def test_ledger_transaction_rejects_oversized_raw_body_before_json_decode(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(web_api, "_MAX_LEDGER_REQUEST_BYTES", 32, raising=False)
+    db_path = tmp_path / "advisor.sqlite"
+    body = json.dumps(
+        {
+            "transaction_id": "cash-1",
+            "trade_date": "2026-07-11",
+            "transaction_type": "cash_deposit",
+            "quantity": 0,
+            "price": 0,
+            "amount": 100,
+            "fees": 0,
+        }
+    )
+
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        "/api/ledger/transactions",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "ledger request body is too large"
+    assert not db_path.exists()
+
+
+def test_ledger_import_rejects_oversized_raw_body_before_json_decode(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(web_api, "_MAX_LEDGER_REQUEST_BYTES", 32, raising=False)
+    db_path = tmp_path / "advisor.sqlite"
+    body = json.dumps(
+        [
+            {
+                "transaction_id": "cash-1",
+                "trade_date": "2026-07-11",
+                "transaction_type": "cash_deposit",
+                "quantity": 0,
+                "price": 0,
+                "amount": 100,
+                "fees": 0,
+            }
+        ]
+    )
+
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        "/api/ledger/import",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "ledger request body is too large"
+    assert not db_path.exists()
+
+
 def test_ledger_import_rejects_rows_over_key_limit_before_database_write(tmp_path):
     db_path = tmp_path / "advisor.sqlite"
     row = {

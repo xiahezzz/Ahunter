@@ -932,7 +932,7 @@ def _review_ledger_context(
     )
     transaction_rows = connection.execute(
         f"""
-        SELECT account_id, code, transaction_id, transaction_type
+        SELECT account_id, code, transaction_id, transaction_type, trade_date
         FROM ledger_transactions
         WHERE code IN ({placeholders})
           AND date(trade_date) = date(?)
@@ -952,6 +952,12 @@ def _review_ledger_context(
                 for row in transaction_rows
                 if row[0] == account_id and row[1] == advice.code
             ]
+            for row in transaction_rows:
+                if row[0] == account_id and row[1] == advice.code:
+                    _persist_advice_trade_match(
+                        connection, run_id, advice.advice_id, row[2], account_id,
+                        advice.code, row[4], as_of,
+                    )
             snapshot = snapshots[account_id]
             context.append(
                 json.dumps(
@@ -974,6 +980,32 @@ def _review_ledger_context(
                 )
             )
     return context
+
+
+def _persist_advice_trade_match(
+    connection: sqlite3.Connection,
+    run_id: str,
+    advice_id: str,
+    transaction_id: str,
+    account_id: str,
+    code: str,
+    trade_date: str,
+    as_of: datetime,
+) -> None:
+    match_id = _stable_id("advice-trade-match", run_id, advice_id, transaction_id)
+    connection.execute(
+        """
+        INSERT INTO advice_trade_matches (
+          match_id, run_id, advice_id, transaction_id, account_id, code,
+          trade_date, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id, advice_id, transaction_id) DO NOTHING
+        """,
+        (
+            match_id, run_id, advice_id, transaction_id, account_id, code,
+            trade_date, as_of.isoformat(),
+        ),
+    )
 
 
 def _review_quality_checks(checks: tuple[QualityResult, ...]) -> tuple[QualityResult, ...]:

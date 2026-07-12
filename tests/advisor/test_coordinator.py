@@ -548,6 +548,11 @@ def test_review_versions_snapshots_for_every_active_ledger_account(tmp_path: Pat
         {"transaction_id": "review-buy", "transaction_type": "buy"}
     ]
     assert impact["exposure"][CODE]["quantity"] == 100
+    assert query_all(
+        paths["db_path"],
+        "SELECT run_id, advice_id, transaction_id, account_id, code, trade_date "
+        "FROM advice_trade_matches",
+    ) == [("review-first", advice_id, "review-buy", "review-account", CODE, "2026-07-12")]
 
     connection = sqlite3.connect(paths["db_path"])
     connection.row_factory = sqlite3.Row

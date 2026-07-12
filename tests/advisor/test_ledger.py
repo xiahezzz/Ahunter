@@ -502,6 +502,47 @@ def test_snapshot_replay_is_stable_and_marks_missing_prices(tmp_path: Path):
     assert json.loads(snapshot_after[0][1])["positions"]["000001"]["pricing_status"] == "missing_price"
 
 
+def test_historical_review_snapshot_does_not_regress_current_positions(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    initial = write_ledger(
+        tmp_path / "initial.csv",
+        [
+            "deposit,2026-07-09,cash_deposit,,0,0,20000,0",
+            "buy,2026-07-10,buy,600519,100,100,-10000,0",
+        ],
+    )
+    import_ledger_csv(initial, db_path, as_of=AS_OF)
+    later = write_ledger(
+        tmp_path / "later.csv",
+        ["sell,2026-07-13,sell,600519,100,110,11000,0"],
+    )
+    import_ledger_csv(later, db_path, as_of=AS_OF.replace(day=13))
+    assert query_all(db_path, "SELECT code, quantity FROM positions") == []
+
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        ledger_importer.materialize_ledger_snapshots(
+            connection,
+            ("default",),
+            as_of=AS_OF.replace(hour=22, minute=30),
+            snapshot_source="historical-review",
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert query_all(db_path, "SELECT code, quantity FROM positions") == []
+    snapshot_payload = json.loads(
+        query_all(
+            db_path,
+            "SELECT exposure_json FROM portfolio_snapshots "
+            "WHERE account_id = 'default' AND as_of = '2026-07-12T22:30:00+08:00'",
+        )[0][0]
+    )
+    assert snapshot_payload["positions"]["600519"]["quantity"] == 100
+
+
 def test_ledger_exposure_code_filter_is_explicitly_bounded(tmp_path: Path, monkeypatch):
     from advisor.ledger.importer import ledger_exposure_by_code
 

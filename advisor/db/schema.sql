@@ -158,6 +158,18 @@ CREATE TABLE IF NOT EXISTS reviews (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS advice_trade_matches (
+  match_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES advisor_runs(run_id),
+  advice_id TEXT NOT NULL REFERENCES advice(advice_id),
+  transaction_id TEXT NOT NULL REFERENCES ledger_transactions(transaction_id),
+  account_id TEXT NOT NULL REFERENCES ledger_accounts(account_id),
+  code TEXT NOT NULL,
+  trade_date TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id, advice_id, transaction_id)
+);
+
 CREATE TABLE IF NOT EXISTS ledger_accounts (
   account_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -223,3 +235,4 @@ CREATE INDEX IF NOT EXISTS market_daily_code_date_idx ON market_daily(code, trad
 CREATE INDEX IF NOT EXISTS evidence_code_asof_idx ON evidence(code, as_of);
 CREATE INDEX IF NOT EXISTS advice_run_idx ON advice(run_id);
 CREATE INDEX IF NOT EXISTS reviews_advice_idx ON reviews(advice_id);
+CREATE INDEX IF NOT EXISTS advice_trade_matches_transaction_idx ON advice_trade_matches(transaction_id);

@@ -15,7 +15,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from advisor import paths as advisor_paths
@@ -49,6 +49,7 @@ _CHART_TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
 _MAX_LEDGER_REPLAY_ROWS = 10_000
 _MAX_IMPORT_TRANSACTIONS = _MAX_LEDGER_REPLAY_ROWS
+_MAX_LEDGER_REQUEST_BYTES = 512 * 1024
 _MAX_LEDGER_FIELD_LENGTH = 4096
 _LEDGER_PAYLOAD_KEYS = frozenset({
     "transaction_id", "account_id", "trade_date", "transaction_type", "code",
@@ -217,8 +218,9 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
                 connection.close()
 
     @app.post("/api/ledger/transactions", status_code=201)
-    def add_ledger_transaction(payload: object = Body(...)) -> dict:
+    async def add_ledger_transaction(request: Request) -> dict:
         try:
+            payload = await _ledger_request_payload(request)
             account_id, transaction = _transaction_from_payload(payload)
             return _write_ledger_transactions(resolved_db_path, [(account_id, transaction)], "manual")
         except _LedgerValidationError as error:
@@ -229,8 +231,9 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
             raise HTTPException(status_code=409, detail=str(error)) from None
 
     @app.post("/api/ledger/import", status_code=201)
-    def import_ledger_transactions(payload: object = Body(...)) -> dict:
+    async def import_ledger_transactions(request: Request) -> dict:
         try:
+            payload = await _ledger_request_payload(request)
             rows = _validate_ledger_import_shape(payload)
             transactions = [_transaction_from_payload(item) for item in rows]
             return _write_ledger_transactions(resolved_db_path, transactions, "import")
@@ -505,6 +508,25 @@ def _transaction_from_payload(payload: object) -> tuple[str, LedgerTransaction]:
     return account_id, transaction
 
 
+async def _ledger_request_payload(request: Request) -> object:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > _MAX_LEDGER_REQUEST_BYTES:
+                raise HTTPException(
+                    status_code=413, detail="ledger request body is too large"
+                )
+        except ValueError:
+            raise HTTPException(status_code=422, detail="invalid ledger request body") from None
+    body = await request.body()
+    if len(body) > _MAX_LEDGER_REQUEST_BYTES:
+        raise HTTPException(status_code=413, detail="ledger request body is too large")
+    try:
+        return json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=422, detail="invalid ledger request body") from None
+
+
 def _validate_ledger_import_shape(payload: object) -> list[dict]:
     if not isinstance(payload, list):
         raise _LedgerValidationError("invalid ledger request shape")
@@ -586,27 +608,6 @@ def _write_ledger_transactions(
     finally:
         connection.close()
     return result
-
-
-def _validate_candidate_ledger_state(
-    existing_rows: list[sqlite3.Row],
-    candidates: list[tuple[str, LedgerTransaction]],
-) -> None:
-    grouped: dict[str, list[LedgerTransaction]] = defaultdict(list)
-    for row in existing_rows:
-        try:
-            if not _valid_account_id(row["account_id"]):
-                raise ValueError("invalid account")
-            grouped[row["account_id"]].append(_ledger_transaction_from_row(row))
-        except ValueError as error:
-            raise _LedgerConflictError("ledger state is invalid") from error
-    for account_id, transaction in candidates:
-        grouped[account_id].append(transaction)
-    for account_transactions in grouped.values():
-        try:
-            apply_transactions(sorted(account_transactions, key=ledger_transaction_sort_key))
-        except ValueError as error:
-            raise _LedgerValidationError("invalid transaction") from error
 
 
 def _derive_ledger_state(rows: list[sqlite3.Row], connection: sqlite3.Connection | None) -> dict:

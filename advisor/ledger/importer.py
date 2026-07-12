@@ -255,24 +255,41 @@ def materialize_ledger_snapshots(
         not isinstance(snapshot_source, str) or not _SOURCE_RE.fullmatch(snapshot_source)
     ):
         raise ValueError("invalid snapshot source")
-    rows = connection.execute(
-        """
+    placeholders = ",".join("?" for _ in requested)
+    current_rows = connection.execute(
+        f"""
         SELECT transaction_id, account_id, trade_date, transaction_type, code,
                quantity, price, amount, fees
         FROM ledger_transactions
-        WHERE date(trade_date) <= date(?) AND julianday(created_at) <= julianday(?)
+        WHERE account_id IN ({placeholders})
         ORDER BY account_id, trade_date, transaction_id LIMIT ?
         """,
-        (as_of.date().isoformat(), as_of.isoformat(), max_rows + 1),
+        (*requested, max_rows + 1),
     ).fetchall()
-    if len(rows) > max_rows:
+    if len(current_rows) > max_rows:
         raise LedgerCapacityError("ledger history exceeds replay limit")
-    grouped = _group_stored_transactions(rows)
+    snapshot_rows = connection.execute(
+        f"""
+        SELECT transaction_id, account_id, trade_date, transaction_type, code,
+               quantity, price, amount, fees
+        FROM ledger_transactions
+        WHERE account_id IN ({placeholders})
+          AND date(trade_date) <= date(?)
+          AND julianday(created_at) <= julianday(?)
+        ORDER BY account_id, trade_date, transaction_id LIMIT ?
+        """,
+        (*requested, as_of.date().isoformat(), as_of.isoformat(), max_rows + 1),
+    ).fetchall()
+    if len(snapshot_rows) > max_rows:
+        raise LedgerCapacityError("ledger history exceeds replay limit")
+    grouped = _group_stored_transactions(current_rows)
+    snapshot_grouped = _group_stored_transactions(snapshot_rows)
     missing = set(requested) - set(grouped)
     if missing:
         raise ValueError("ledger account has no transactions")
     return _materialize_grouped_accounts(
-        connection, grouped, requested, as_of, snapshot_source=snapshot_source
+        connection, grouped, requested, as_of, snapshot_source=snapshot_source,
+        snapshot_grouped=snapshot_grouped,
     )
 
 
@@ -360,6 +377,7 @@ def _materialize_grouped_accounts(
     as_of: datetime,
     *,
     snapshot_source: str | None = None,
+    snapshot_grouped: dict[str, list[LedgerTransaction]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     snapshots: dict[str, dict[str, Any]] = {}
     prepared: dict[str, tuple[LedgerState, LedgerState, list[dict[str, object]], dict]] = {}
@@ -367,7 +385,16 @@ def _materialize_grouped_accounts(
     for account_id in account_ids:
         transactions = sorted(grouped[account_id], key=ledger_transaction_sort_key)
         full_state = apply_transactions(transactions)
-        snapshot_transactions = [item for item in transactions if item.trade_date <= cutoff]
+        snapshot_base = (
+            snapshot_grouped.get(account_id, [])
+            if snapshot_grouped is not None
+            else transactions
+        )
+        snapshot_transactions = [
+            item
+            for item in sorted(snapshot_base, key=ledger_transaction_sort_key)
+            if item.trade_date <= cutoff
+        ]
         snapshot_state = apply_transactions(snapshot_transactions)
         quality_flags = _ledger_quality_flags(snapshot_transactions)
         rows = [
