@@ -14,6 +14,8 @@ from advisor.quality import QualityRequest, QualityResult, evaluate_run_quality
 
 
 AS_OF = datetime(2026, 7, 12, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+CALENDAR_PROOF_ENDPOINT = "advisor-internal:trading-calendar:v1"
+CALENDAR_PROOF_PRODUCER = "a-hunter-advisor-calendar-producer-v1"
 
 
 def collector(*, passed: bool = True) -> CollectorSnapshot:
@@ -64,9 +66,11 @@ def quality_connection(tmp_path: Path) -> sqlite3.Connection:
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('calendar-proof', 'exchange_calendar', 'bounded', 'calendar', ?, 'passed', ?)
+        ) VALUES ('advisor-calendar-proof:v1:primary', 'exchange_calendar', ?, ?, ?, 'passed', ?)
         """,
         (
+            CALENDAR_PROOF_ENDPOINT,
+            CALENDAR_PROOF_PRODUCER,
             AS_OF.isoformat(),
             json.dumps(
                 {
@@ -268,13 +272,13 @@ def test_clearly_named_local_calendar_source_is_trusted(tmp_path: Path):
     connection = quality_connection(tmp_path)
     details = json.loads(
         connection.execute(
-            "SELECT details_json FROM market_sources WHERE source_key = 'calendar-proof'"
+            "SELECT details_json FROM market_sources WHERE source_key = 'advisor-calendar-proof:v1:primary'"
         ).fetchone()[0]
     )
     details["calendar_source"] = "local_calendar"
     connection.execute(
         "UPDATE market_sources SET source = 'local_calendar', details_json = ? "
-        "WHERE source_key = 'calendar-proof'",
+        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
         (json.dumps(details),),
     )
     connection.commit()
@@ -292,13 +296,46 @@ def test_market_provider_cannot_self_declare_trading_calendar_authority(
     connection = quality_connection(tmp_path)
     details = json.loads(
         connection.execute(
-            "SELECT details_json FROM market_sources WHERE source_key = 'calendar-proof'"
+            "SELECT details_json FROM market_sources WHERE source_key = 'advisor-calendar-proof:v1:primary'"
         ).fetchone()[0]
     )
     details["calendar_source"] = market_provider
     connection.execute(
-        "UPDATE market_sources SET source = ?, details_json = ? WHERE source_key = 'calendar-proof'",
+        "UPDATE market_sources SET source = ?, details_json = ? "
+        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
         (market_provider, json.dumps(details)),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "calendar" in check.details
+
+
+def test_whitelisted_labels_cannot_impersonate_trusted_calendar_producer(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM market_sources WHERE source_key LIKE 'advisor-calendar-proof:%'")
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('provider-calendar-claim', 'exchange_calendar', 'arbitrary-market-provider',
+                  'caller-supplied', ?, 'passed', ?)
+        """,
+        (
+            AS_OF.isoformat(),
+            json.dumps(
+                {
+                    "as_of": AS_OF.isoformat(),
+                    "calendar_source": "exchange_calendar",
+                    "coverage_codes": ["600519"],
+                    "latest_expected_session": "2026-07-10",
+                    "proof_type": "trading_calendar",
+                }
+            ),
+        ),
     )
     connection.commit()
 
@@ -406,9 +443,11 @@ def test_conflicting_current_calendar_claims_block(tmp_path: Path):
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('other-proof', 'local_trading_calendar', 'bounded', 'other', ?, 'passed', ?)
+        ) VALUES ('advisor-calendar-proof:v1:other', 'local_trading_calendar', ?, ?, ?, 'passed', ?)
         """,
         (
+            CALENDAR_PROOF_ENDPOINT,
+            CALENDAR_PROOF_PRODUCER,
             AS_OF.isoformat(),
             json.dumps(
                 {
@@ -437,9 +476,11 @@ def test_historical_calendar_proof_is_ignored_when_current_proof_is_available(tm
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('historical-calendar-proof', 'historical_calendar', 'bounded', 'historical', ?, 'passed', ?)
+        ) VALUES ('advisor-calendar-proof:v1:historical', 'historical_calendar', ?, ?, ?, 'passed', ?)
         """,
         (
+            CALENDAR_PROOF_ENDPOINT,
+            CALENDAR_PROOF_PRODUCER,
             historical_as_of.isoformat(),
             json.dumps(
                 {
@@ -464,21 +505,24 @@ def test_calendar_proof_future_instant_in_earlier_timezone_blocks(tmp_path: Path
     run_as_of = datetime(2026, 7, 12, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
     details = json.loads(
         connection.execute(
-            "SELECT details_json FROM market_sources WHERE source_key = 'calendar-proof'"
+            "SELECT details_json FROM market_sources WHERE source_key = 'advisor-calendar-proof:v1:primary'"
         ).fetchone()[0]
     )
     details["as_of"] = run_as_of.isoformat()
     connection.execute(
-        "UPDATE market_sources SET fetched_at = ?, details_json = ? WHERE source_key = 'calendar-proof'",
+        "UPDATE market_sources SET fetched_at = ?, details_json = ? "
+        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
         (run_as_of.isoformat(), json.dumps(details)),
     )
     connection.execute(
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('future-timezone-proof', 'future_calendar', 'bounded', 'timezone', ?, 'passed', ?)
+        ) VALUES ('advisor-calendar-proof:v1:future-timezone', 'future_calendar', ?, ?, ?, 'passed', ?)
         """,
         (
+            CALENDAR_PROOF_ENDPOINT,
+            CALENDAR_PROOF_PRODUCER,
             run_as_of.isoformat(),
             json.dumps(
                 {
@@ -507,9 +551,11 @@ def test_calendar_proof_current_in_run_timezone_conflicts_across_timezones(tmp_p
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('cross-timezone-proof', 'local_trading_calendar', 'bounded', 'timezone', ?, 'passed', ?)
+        ) VALUES ('advisor-calendar-proof:v1:cross-timezone', 'local_trading_calendar', ?, ?, ?, 'passed', ?)
         """,
         (
+            CALENDAR_PROOF_ENDPOINT,
+            CALENDAR_PROOF_PRODUCER,
             proof_as_of.isoformat(),
             json.dumps(
                 {
@@ -545,7 +591,8 @@ def test_unsafe_quality_request_run_id_blocks_without_persisting_checks(tmp_path
 def test_calendar_proof_newer_than_selected_source_data_blocks(tmp_path: Path):
     connection = quality_connection(tmp_path)
     connection.execute(
-        "UPDATE market_sources SET details_json = ? WHERE source_key = 'calendar-proof'",
+        "UPDATE market_sources SET details_json = ? "
+        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
         (
             json.dumps(
                 {
@@ -571,12 +618,13 @@ def test_stale_calendar_proof_blocks_current_run(tmp_path: Path):
     connection = quality_connection(tmp_path)
     details = json.loads(
         connection.execute(
-            "SELECT details_json FROM market_sources WHERE source_key = 'calendar-proof'"
+            "SELECT details_json FROM market_sources WHERE source_key = 'advisor-calendar-proof:v1:primary'"
         ).fetchone()[0]
     )
     details["as_of"] = (AS_OF - timedelta(days=1)).isoformat()
     connection.execute(
-        "UPDATE market_sources SET details_json = ? WHERE source_key = 'calendar-proof'",
+        "UPDATE market_sources SET details_json = ? "
+        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
         (json.dumps(details),),
     )
     connection.commit()

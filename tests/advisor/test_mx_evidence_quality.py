@@ -349,15 +349,25 @@ def test_secret_or_unsafe_collector_source_id_fails_closed(
     "source_id",
     [
         "session_abcdefgh",
+        "event_session_abcdefgh",
         "SESSION-ID.abcdefgh",
         "sess-abcdefgh",
         "socket_id_abcdefgh",
+        "event-socket-id-foo",
         "token.abcdefgh",
         "access_token_foo",
         "refresh-token.foo",
         "debug_identifier",
+        "mx.debug_identifier",
         "debugger-id",
         "cdp.identifier",
+        "event_api_key_foo",
+        "event-secret-foo",
+        "event.password.foo",
+        "event_credential_foo",
+        "event-id-token-foo",
+        "event_cookie_foo",
+        "event.authorization.foo",
     ],
 )
 def test_sensitive_opaque_collector_source_id_fails_closed(
@@ -659,10 +669,20 @@ def test_persistence_rejects_forged_sensitive_source_id_without_writing():
     "source_id",
     [
         "session_abcdefgh",
+        "event_session_abcdefgh",
         "debug_identifier",
+        "mx.debug_identifier",
         "access_token_foo",
         "socket-id.foo",
+        "event-socket-id-foo",
         "CDP.identifier",
+        "event_api_key_foo",
+        "event-secret-foo",
+        "event.password.foo",
+        "event_credential_foo",
+        "event-id-token-foo",
+        "event_cookie_foo",
+        "event.authorization.foo",
     ],
 )
 def test_persistence_rejects_sensitive_opaque_source_id_before_transaction(source_id: str):
@@ -712,6 +732,49 @@ def test_persist_evidence_rejects_non_allowlisted_rid_before_transaction(
     connection.set_trace_callback(statements.append)
 
     with pytest.raises(ValueError, match="allowlisted rid"):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    assert not any(statement.startswith(("BEGIN", "SAVEPOINT")) for statement in statements)
+    assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+def test_persist_evidence_rejects_forged_allowlist_provenance_before_transaction(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    snapshot = read_collector_snapshot(
+        db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF, limit=1
+    )
+    forged = replace(snapshot.events[0], rid=456)
+    forged_snapshot = replace(snapshot, events=(forged,), allowed_rids=(456,))
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    with pytest.raises(ValueError, match="authorization provenance"):
+        persist_evidence(connection, "advisor-run", forged_snapshot, as_of=AS_OF)
+
+    assert not any(statement.startswith(("BEGIN", "SAVEPOINT")) for statement in statements)
+    assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("replacement", ([], [456]))
+def test_persist_evidence_revalidates_current_allowlist_before_transaction(
+    tmp_path, create_collector_db, write_allowed_rids, replacement
+):
+    db, _ = create_collector_db(tmp_path)
+    allowed = write_allowed_rids(tmp_path, [123])
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF, limit=1)
+    write_allowed_rids(tmp_path, replacement)
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    with pytest.raises(ValueError, match="authorization provenance"):
         persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
 
     assert not any(statement.startswith(("BEGIN", "SAVEPOINT")) for statement in statements)

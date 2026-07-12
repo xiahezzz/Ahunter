@@ -14,6 +14,7 @@ from advisor.evidence.mx_adapter import (
     valid_content_hash,
     valid_media_metadata,
     valid_opaque_identifier,
+    valid_snapshot_authorization,
 )
 
 
@@ -70,6 +71,8 @@ def persist_evidence(
         _validate_event(event, as_of)
         if event.rid not in snapshot.allowed_rids:
             raise ValueError("event rid is not an allowlisted rid")
+    if not valid_snapshot_authorization(snapshot):
+        raise ValueError("RID authorization provenance is invalid")
     events = list(snapshot.events)
     records = [_record(run_id, event) for event in events]
     owns_transaction = not connection.in_transaction

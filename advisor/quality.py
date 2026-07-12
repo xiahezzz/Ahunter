@@ -30,6 +30,11 @@ _TRUSTED_CALENDAR_SOURCES = frozenset(
         "trading_calendar",
     }
 )
+_CALENDAR_PROOF_KEY_RE = re.compile(
+    r"advisor-calendar-proof:v1:[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z"
+)
+_CALENDAR_PROOF_ENDPOINT = "advisor-internal:trading-calendar:v1"
+_CALENDAR_PROOF_PRODUCER = "a-hunter-advisor-calendar-producer-v1"
 
 
 @dataclass(frozen=True)
@@ -170,7 +175,8 @@ def _authoritative_expected_session(
 ) -> tuple[dt.date | None, str | None]:
     rows = connection.execute(
         """
-        SELECT source, details_json FROM market_sources
+        SELECT source_key, source, endpoint, params_hash, details_json
+        FROM market_sources
         WHERE status = 'passed' AND julianday(fetched_at) IS NOT NULL
           AND julianday(fetched_at) <= julianday(?)
         ORDER BY fetched_at DESC, source_key DESC
@@ -182,8 +188,15 @@ def _authoritative_expected_session(
         return None, "trading calendar proof scan limit exceeded"
     claims_by_code: dict[str, set[dt.date]] = defaultdict(set)
     saw_historical_proof = False
-    for source, raw_details in rows:
+    for source_key, source, endpoint, producer, raw_details in rows:
         try:
+            if (
+                not isinstance(source_key, str)
+                or not _CALENDAR_PROOF_KEY_RE.fullmatch(source_key)
+                or endpoint != _CALENDAR_PROOF_ENDPOINT
+                or producer != _CALENDAR_PROOF_PRODUCER
+            ):
+                continue
             details = json.loads(raw_details)
             if not isinstance(details, dict) or details.get("proof_type") != "trading_calendar":
                 continue
@@ -236,7 +249,7 @@ def _authoritative_expected_session(
     if any(code not in claims_by_code for code in request.candidate_codes):
         if saw_historical_proof and not claims_by_code:
             return None, "trading calendar proof is stale or not current for this run"
-        return None, "latest expected trading session is unavailable"
+        return None, "trading calendar latest expected session is unavailable"
     if any(len(claims) != 1 for claims in claims_by_code.values()):
         return None, "conflicting trading calendar proof"
     expected_sessions = {next(iter(claims)) for claims in claims_by_code.values()}

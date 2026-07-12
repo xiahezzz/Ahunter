@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
@@ -41,9 +41,10 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 )
 _SECRET_PREFIX = re.compile(r"\b(?:sk|pk|sess)_[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
-_SENSITIVE_OPAQUE_PREFIX = re.compile(
-    r"(?:session(?:[_.-]?id)?|sess|socket(?:[_.-]?id)?|token|"
-    r"access[_.-]?token|refresh[_.-]?token|debug(?:ger)?|cdp)(?:[_.-]|$)",
+_SENSITIVE_OPAQUE_COMPONENT = re.compile(
+    r"(?:^|[_.:-])(?:api[_.:-]+key|access[_.:-]+token|refresh[_.:-]+token|"
+    r"id[_.:-]+token|authorization|cookie|credentials?|password|secret|"
+    r"session|sess|socket|token|debug|debugger|cdp)(?:[_.:-]|$)",
     re.IGNORECASE,
 )
 _MEDIA_CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\Z")
@@ -130,6 +131,26 @@ class CollectorSnapshot:
     quality: object
     as_of: datetime
     allowed_rids: tuple[int, ...]
+    authorization: object | None = field(default=None, repr=False, compare=False)
+
+
+_AUTHORIZATION_ISSUER = object()
+
+
+class _RidAuthorizationProof:
+    __slots__ = ("_allowed_rids", "_issuer", "_path")
+
+    def __init__(
+        self, path: Path, allowed_rids: tuple[int, ...], issuer: object
+    ) -> None:
+        if issuer is not _AUTHORIZATION_ISSUER:
+            raise TypeError("RID authorization proofs are adapter-issued")
+        object.__setattr__(self, "_path", path)
+        object.__setattr__(self, "_allowed_rids", allowed_rids)
+        object.__setattr__(self, "_issuer", issuer)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("RID authorization proofs are immutable")
 
 
 def read_collector_snapshot(
@@ -144,24 +165,47 @@ def read_collector_snapshot(
         allowed_rids = _read_allowed_rids(allowed_rids_path)
     except (OSError, UnicodeError, yaml.YAMLError, ValueError):
         return _blocked(as_of, "allowed RID configuration is invalid")
+    authorization = _RidAuthorizationProof(
+        allowed_rids_path, allowed_rids, _AUTHORIZATION_ISSUER
+    )
     if not allowed_rids:
         return _blocked(
-            as_of, "collector is intentionally inactive: no allowed RIDs", allowed_rids
+            as_of,
+            "collector is intentionally inactive: no allowed RIDs",
+            allowed_rids,
+            authorization,
         )
 
     try:
         connection = _open_read_only(events_db)
     except (OSError, sqlite3.Error):
-        return _blocked(as_of, "collector database is unavailable", allowed_rids)
+        return _blocked(
+            as_of, "collector database is unavailable", allowed_rids, authorization
+        )
     try:
         connection.row_factory = sqlite3.Row
         if not _valid_schema(connection):
             return _blocked(
-                as_of, "collector schema is missing required columns", allowed_rids
+                as_of,
+                "collector schema is missing required columns",
+                allowed_rids,
+                authorization,
             )
-        return _snapshot_from_connection(connection, allowed_rids, as_of, limit)
+        snapshot = _snapshot_from_connection(connection, allowed_rids, as_of, limit)
+        return CollectorSnapshot(
+            events=snapshot.events,
+            quality=snapshot.quality,
+            as_of=snapshot.as_of,
+            allowed_rids=snapshot.allowed_rids,
+            authorization=authorization,
+        )
     except (sqlite3.Error, TypeError, ValueError, OverflowError):
-        return _blocked(as_of, "collector data is invalid or ambiguous", allowed_rids)
+        return _blocked(
+            as_of,
+            "collector data is invalid or ambiguous",
+            allowed_rids,
+            authorization,
+        )
     finally:
         connection.close()
 
@@ -497,9 +541,27 @@ def valid_opaque_identifier(value: object) -> bool:
     return (
         isinstance(value, str)
         and bool(_OPAQUE_ID.fullmatch(value))
-        and not _SENSITIVE_OPAQUE_PREFIX.match(value)
+        and not _SENSITIVE_OPAQUE_COMPONENT.search(value)
         and redact_sensitive_text(value) == value
     )
+
+
+def valid_snapshot_authorization(snapshot: object) -> bool:
+    if not isinstance(snapshot, CollectorSnapshot):
+        return False
+    proof = snapshot.authorization
+    if (
+        not isinstance(proof, _RidAuthorizationProof)
+        or proof._issuer is not _AUTHORIZATION_ISSUER
+        or not proof._allowed_rids
+        or snapshot.allowed_rids != proof._allowed_rids
+    ):
+        return False
+    try:
+        current_allowed_rids = _read_allowed_rids(proof._path)
+    except (OSError, UnicodeError, yaml.YAMLError, ValueError):
+        return False
+    return current_allowed_rids == proof._allowed_rids
 
 
 def valid_media_metadata(value: object) -> bool:
@@ -533,11 +595,15 @@ def redact_sensitive_text(value: str) -> str:
 
 
 def _blocked(
-    as_of: datetime, details: str, allowed_rids: tuple[int, ...] = ()
+    as_of: datetime,
+    details: str,
+    allowed_rids: tuple[int, ...] = (),
+    authorization: object | None = None,
 ) -> CollectorSnapshot:
     return CollectorSnapshot(
         events=(),
         quality=CollectorQuality("collector_state", "blocking", False, details),
         as_of=as_of,
         allowed_rids=allowed_rids,
+        authorization=authorization,
     )
