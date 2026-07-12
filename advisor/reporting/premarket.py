@@ -2,7 +2,8 @@ import argparse
 import json
 from pathlib import Path
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 from advisor.quality import QualityResult
 from advisor.reporting.contracts import (
@@ -14,6 +15,7 @@ from advisor.reporting.contracts import (
     report_paths,
     validate_unique_ids,
 )
+from advisor.reporting.failure import write_failure_report
 
 
 DISCLAIMER = "Research output only. This is not an order, broker instruction, or guaranteed return."
@@ -115,11 +117,11 @@ def _append_context(lines: list[str], context: dict[str, list[str]], key: str) -
     lines.extend(f"- {value}" for value in values) if values else lines.append("- No current entries")
 
 
-def main(argv: Sequence[str] | None = None, *, coordinator=None, snapshot_reader=None) -> None:
+def main(argv: Sequence[str] | None = None, *, coordinator=None, snapshot_reader=None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--as-of", required=True, type=datetime.fromisoformat)
-    parser.add_argument("--report-date", required=True)
-    parser.add_argument("--codes", required=True)
+    parser.add_argument("--as-of", type=datetime.fromisoformat)
+    parser.add_argument("--date", "--report-date", dest="report_date")
+    parser.add_argument("--codes")
     parser.add_argument("--events-db", type=Path, default=Path("data/state/events.sqlite"))
     parser.add_argument("--allowed-rids", type=Path, default=Path("config/allowed-rids.yaml"))
     parser.add_argument("--output-dir", type=Path, default=Path("reports"))
@@ -129,29 +131,54 @@ def main(argv: Sequence[str] | None = None, *, coordinator=None, snapshot_reader
     parser.add_argument("--rerun-reason")
     parser.add_argument("--supersedes")
     args = parser.parse_args(argv)
+    report_date = args.report_date or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    try:
+        report_day = date.fromisoformat(report_date)
+    except ValueError:
+        parser.error("--date must be an ISO date")
+    as_of = args.as_of or datetime.combine(
+        report_day, time(8, 30), tzinfo=ZoneInfo("Asia/Shanghai")
+    )
     if coordinator is None:
         from advisor.coordinator import run_premarket
         coordinator = run_premarket
     if snapshot_reader is None:
         from advisor.evidence.mx_adapter import read_collector_snapshot
         snapshot_reader = read_collector_snapshot
-    snapshot = snapshot_reader(args.events_db, args.allowed_rids, as_of=args.as_of)
-    result = coordinator(
-        collector_snapshot=snapshot,
-        as_of=args.as_of,
-        report_date=args.report_date,
-        candidate_codes=tuple(args.codes.split(",")),
-        output_dir=args.output_dir,
-        config_path=args.config,
-        run_id=args.run_id,
-        report_run_id=args.report_run_id,
-        rerun_reason=args.rerun_reason,
-        supersedes=args.supersedes,
-    )
-    print(json.dumps({
-        "json_path": str(result.report_paths.json_path),
-        "markdown_path": str(result.report_paths.markdown_path),
-        "run_id": result.run_id,
-        "status": result.status,
-        "warnings": list(result.warnings),
-    }, sort_keys=True))
+    try:
+        snapshot = snapshot_reader(args.events_db, args.allowed_rids, as_of=as_of)
+        result = coordinator(
+            collector_snapshot=snapshot,
+            as_of=as_of,
+            report_date=report_date,
+            candidate_codes=tuple(filter(None, args.codes.split(","))) if args.codes else (),
+            output_dir=args.output_dir,
+            config_path=args.config,
+            run_id=args.run_id,
+            report_run_id=args.report_run_id,
+            rerun_reason=args.rerun_reason,
+            supersedes=args.supersedes,
+        )
+        payload = {
+            "json_path": str(result.report_paths.json_path),
+            "markdown_path": str(result.report_paths.markdown_path),
+            "run_id": result.run_id,
+            "status": result.status,
+            "warnings": list(result.warnings),
+        }
+        print(json.dumps(payload, sort_keys=True))
+        return 0 if result.status == "passed" else 2
+    except Exception as error:
+        run_id = args.run_id or f"premarket-cli-{report_day:%Y%m%d}"
+        payload = {"error": type(error).__name__, "run_id": run_id, "status": "failed"}
+        try:
+            paths = write_failure_report(
+                report_date, "premarket",
+                [QualityResult("runtime", "blocking", False, type(error).__name__)],
+                args.output_dir, run_id=run_id,
+            )
+            payload.update({"json_path": str(paths.json_path), "markdown_path": str(paths.markdown_path)})
+        except Exception:
+            pass
+        print(json.dumps(payload, sort_keys=True))
+        return 1

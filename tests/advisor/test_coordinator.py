@@ -86,6 +86,41 @@ class BlockingRunner:
         raise DataQualityBlockedError("provider token=must-not-archive")
 
 
+class DecisionRunner(PassingRunner):
+    def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
+        outputs = super().run(code, trade_date, evidence)
+        summaries = {
+            "portfolio_manager": "Portfolio favors staged research exposure.",
+            "trader": "Trader confirms liquidity is adequate.",
+            "research_manager": "Research case is evidence-backed.",
+        }
+        return [
+            AnalystOutput(
+                item.role,
+                item.code,
+                summaries.get(item.role, item.summary),
+                {"decision": {"action": "buy", "confidence": 0.82}}
+                if item.role == "portfolio_manager"
+                else item.payload,
+            )
+            for item in outputs
+        ]
+
+
+class CandidateRunner:
+    def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
+        return [
+            AnalystOutput(
+                role,
+                code,
+                f"{role} summary",
+                {"quality_outcome": QualityOutcome(True, "hard checks passed")}
+                if role == "quality_gate" else {"signal": role},
+            )
+            for role in ANALYST_ROLES
+        ]
+
+
 def persist_fixture_evidence(connection, run_id, snapshot, *, as_of):
     record = EvidenceRecord(
         EVIDENCE_ID, run_id, CODE, as_of.isoformat(), "mx", "event-1", "关注 600519",
@@ -217,6 +252,101 @@ def test_premarket_happy_path_persists_complete_projection(tmp_path: Path):
     assert next(paths["chart_dir"].rglob("*.png")).stat().st_size > 1000
 
 
+def test_premarket_uses_bounded_analyst_decision_and_role_rationale(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+
+    result = run_premarket(
+        collector_snapshot=collector(), analyst_runner=DecisionRunner(), as_of=AS_OF,
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, evidence_persister=persist_fixture_evidence,
+        **paths,
+    )
+
+    payload = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))
+    item = payload["advice"][0]
+    assert item["action"] == "buy"
+    assert item["confidence"] == pytest.approx(0.82)
+    assert "Portfolio favors" in item["rationale"]
+    assert "Trader confirms" in item["rationale"]
+    assert "Research case" in item["rationale"]
+    assert payload["context"]["chart_markers"] == [f"{CODE}: advice=buy at 2026-07-12"]
+
+
+def test_premarket_expands_candidates_from_mx_summary_and_positions(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('a1', 'fixture', ?)",
+        (AS_OF.isoformat(),),
+    )
+    connection.execute(
+        "INSERT INTO positions (account_id, code, quantity, cost_basis, updated_at) "
+        "VALUES ('a1', '000001', 10, 10, ?)",
+        (AS_OF.isoformat(),),
+    )
+    connection.commit()
+    connection.close()
+    event = SimpleNamespace(summary="MX accepted discussion of 600519")
+    snapshot = CollectorSnapshot((event,), collector().quality, AS_OF, ())
+    checked = []
+
+    def capture_quality(_connection, request):
+        checked.append(request.candidate_codes)
+        return passed_quality()
+
+    result = run_premarket(
+        collector_snapshot=snapshot, analyst_runner=CandidateRunner(), as_of=AS_OF,
+        report_date="2026-07-12", candidate_codes=(),
+        quality_evaluator=capture_quality, evidence_persister=persist_fixture_evidence,
+        **paths,
+    )
+
+    assert result.status == "passed"
+    assert checked == [(CODE, "000001"), (CODE, "000001")]
+    assert {row[0] for row in query_all(paths["db_path"], "SELECT code FROM advice")} == {CODE, "000001"}
+
+
+def test_premarket_projection_preserves_non_empty_profile_history(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute(
+        "INSERT INTO securities (code, name, exchange, created_at, updated_at) VALUES (?, ?, 'SSE', ?, ?)",
+        (CODE, CODE, AS_OF.isoformat(), AS_OF.isoformat()),
+    )
+    connection.execute(
+        "INSERT INTO stock_profiles (code, thesis_json, information_flow_json, capital_flow_json, "
+        "fundamentals_json, analyst_flow_json, ledger_exposure_json, assets_json, updated_at) "
+        "VALUES (?, '{}', '[\"prior information\"]', '[]', '{}', '[\"prior analyst\"]', '{}', "
+        "'[\"prior-chart.png\"]', ?)",
+        (CODE, AS_OF.isoformat()),
+    )
+    connection.commit()
+    connection.close()
+
+    run_premarket(
+        collector_snapshot=collector(), analyst_runner=PassingRunner(), as_of=AS_OF,
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, evidence_persister=persist_fixture_evidence,
+        **paths,
+    )
+
+    row = query_all(
+        paths["db_path"],
+        f"SELECT information_flow_json, analyst_flow_json, assets_json FROM stock_profiles WHERE code = '{CODE}'",
+    )[0]
+    assert "prior information" in json.loads(row[0])
+    assert "prior analyst" in json.loads(row[1])
+    assert "prior-chart.png" in json.loads(row[2])
+
+
 def test_quality_blocked_premarket_publishes_only_sanitized_failure(tmp_path: Path):
     paths = coordinator_paths(tmp_path)
     result = run_premarket(
@@ -320,6 +450,42 @@ def test_premarket_cli_invokes_injected_coordinator(tmp_path: Path):
     assert calls["snapshot"][2] == AS_OF
     assert calls["coordinator"]["collector_snapshot"] is snapshot
     assert calls["coordinator"]["candidate_codes"] == (CODE,)
+
+
+@pytest.mark.parametrize(
+    ("module", "expected_hour"),
+    [(premarket_reporting, 8), (review_reporting, 22)],
+)
+def test_report_cli_date_defaults_as_of_and_allows_candidate_expansion(
+    module, expected_hour, tmp_path: Path, capsys
+):
+    calls = {}
+
+    def snapshot_reader(_events_db, _allowed_rids_path, *, as_of):
+        calls["snapshot_as_of"] = as_of
+        return collector()
+
+    def coordinator(**kwargs):
+        calls["coordinator"] = kwargs
+        return SimpleNamespace(
+            run_id="cli-run", status="blocked", warnings=(),
+            report_paths=SimpleNamespace(
+                markdown_path=tmp_path / "failure.md",
+                json_path=tmp_path / "failure.json",
+            ),
+        )
+
+    exit_code = module.main(
+        ["--date", "2026-07-12", "--output-dir", str(tmp_path / "reports")],
+        coordinator=coordinator,
+        snapshot_reader=snapshot_reader,
+    )
+
+    assert calls["snapshot_as_of"].date().isoformat() == "2026-07-12"
+    assert (calls["snapshot_as_of"].hour, calls["snapshot_as_of"].minute) == (expected_hour, 30)
+    assert calls["coordinator"]["candidate_codes"] == ()
+    assert exit_code == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "blocked"
 
 
 def test_review_uses_exact_selected_premarket_archive(tmp_path: Path):
@@ -698,6 +864,50 @@ def test_review_outcome_uses_decline_and_same_day_ledger_activity(tmp_path: Path
     assert "9.0000" in payload["reviews"][0]["review_text"]
     assert "10.0000" in payload["reviews"][0]["review_text"]
     assert "1 ledger transaction" in payload["reviews"][0]["review_text"]
+
+
+def test_review_treats_decline_as_favorable_for_reduce_and_lists_ledger_types(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    advice = AdviceItem("initial-advice", CODE, "reduce", 0.75, "risk reduction", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[advice]
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.executemany(
+        "INSERT INTO market_daily (code, trade_date, open, high, low, close, volume, amount, "
+        "source, fetched_at, as_of_date, content_hash, quality_status) "
+        "VALUES (?, ?, 10, 10, 9, ?, 100, 1000, 'fixture', ?, ?, ?, 'passed')",
+        [
+            (CODE, "2026-07-11", 10.0, AS_OF.isoformat(), "2026-07-11", "prior"),
+            (CODE, "2026-07-12", 9.0, AS_OF.isoformat(), "2026-07-12", "latest"),
+        ],
+    )
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('a1', 'fixture', ?)",
+        (AS_OF.isoformat(),),
+    )
+    connection.executemany(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, "
+        "transaction_type, code, quantity, price, amount, fees, source, created_at) "
+        "VALUES (?, 'a1', '2026-07-12', ?, ?, 1, 9, 9, 0, 'fixture', ?)",
+        [("t1", "sell", CODE, AS_OF.isoformat()), ("t2", "fee", CODE, AS_OF.isoformat())],
+    )
+    connection.commit()
+    connection.close()
+
+    result = run_review(
+        collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, **paths,
+    )
+
+    review = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))["reviews"][0]
+    assert review["outcome"] == "followed_strength"
+    assert "2 ledger transactions" in review["review_text"]
+    assert "fee=1" in review["review_text"]
+    assert "sell=1" in review["review_text"]
 
 
 def test_coordinator_resolves_configured_storage_without_tushare(tmp_path: Path):

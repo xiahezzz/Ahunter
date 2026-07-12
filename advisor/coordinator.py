@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -51,6 +52,8 @@ from advisor.reporting.review import write_review_report
 
 QualityEvaluator = Callable[[sqlite3.Connection, QualityRequest], QualityGateResult]
 EvidencePersister = Callable[..., list[EvidenceRecord]]
+_RESEARCH_ACTIONS = frozenset({"buy", "watch", "hold", "reduce", "exit", "avoid"})
+_CODE_PATTERN = re.compile(r"(?<!\d)([03468]\d{5})(?!\d)")
 
 
 @dataclass(frozen=True)
@@ -82,13 +85,13 @@ def run_premarket(
     evidence_persister: EvidencePersister = persist_evidence,
 ) -> CoordinatorResult:
     report_day = _report_date(report_date)
-    codes = _candidate_codes(candidate_codes)
     db_path, chart_dir, profile_dir = _storage_paths(
         db_path, chart_dir, profile_dir, config_path=config_path, root=root
     )
     active_run_id = run_id or _default_run_id("premarket", as_of)
     migrate_database(db_path)
     connection = connect(db_path)
+    codes = _expanded_candidate_codes(connection, candidate_codes, collector_snapshot)
     _start_run(connection, active_run_id, "premarket", as_of)
     request = QualityRequest(active_run_id, "premarket", as_of, codes, collector_snapshot)
 
@@ -114,6 +117,8 @@ def run_premarket(
                     runner=analyst_runner,
                 )
             )
+        if any(output.code not in codes for output in outputs):
+            raise DataQualityBlockedError("analyst output referenced an unchecked security")
         _persist_analyst_outputs(connection, active_run_id, as_of, outputs)
 
         final_gate = quality_evaluator(connection, request)
@@ -139,7 +144,7 @@ def run_premarket(
             advice_items,
             output_dir,
             quality_results=final_gate.checks,
-            context=_premarket_context(outputs, evidence, warnings),
+            context=_premarket_context(outputs, evidence, advice_items, report_day, warnings),
             run_id=report_run_id,
             rerun_reason=rerun_reason,
             supersedes=supersedes,
@@ -185,13 +190,13 @@ def run_review(
     quality_evaluator: QualityEvaluator = evaluate_run_quality,
 ) -> CoordinatorResult:
     report_day = _report_date(report_date)
-    codes = _candidate_codes(candidate_codes)
     db_path, chart_dir, profile_dir = _storage_paths(
         db_path, chart_dir, profile_dir, config_path=config_path, root=root
     )
     active_run_id = run_id or _default_run_id("review", as_of)
     migrate_database(db_path)
     connection = connect(db_path)
+    codes = _expanded_candidate_codes(connection, candidate_codes, collector_snapshot)
     _start_run(connection, active_run_id, "review", as_of)
     request = QualityRequest(active_run_id, "review", as_of, codes, collector_snapshot)
 
@@ -359,8 +364,8 @@ def _advice_items(
     by_code = {(output.code, output.role): output for output in outputs}
     items = []
     for code in codes:
-        summaries = [
-            by_code[(code, role)].summary
+        role_summaries = [
+            f"{role}: {by_code[(code, role)].summary}"
             for role in ("portfolio_manager", "trader", "research_manager")
             if (code, role) in by_code and by_code[(code, role)].summary
         ]
@@ -371,13 +376,83 @@ def _advice_items(
             AdviceItem(
                 _stable_id("advice", run_id, code),
                 code,
-                "watch",
-                0.5,
-                " ".join(summaries)[:2000] or "Monitor pending additional research evidence.",
+                *_analyst_decision(code, outputs, bool(evidence_ids)),
+                " ".join(role_summaries)[:2000]
+                or "research_manager: Monitor pending additional research evidence.",
                 evidence_ids,
             )
         )
     return items
+
+
+def _analyst_decision(
+    code: str, outputs: Sequence[AnalystOutput], has_evidence: bool
+) -> tuple[str, float]:
+    relevant = [
+        item for role in ("portfolio_manager", "trader", "research_manager")
+        for item in outputs if item.code == code and item.role == role
+    ]
+    action: str | None = None
+    confidence: float | None = None
+    for output in relevant:
+        for value in _bounded_payload_dicts(output.payload):
+            candidate = value.get("action", value.get("decision"))
+            if action is None and isinstance(candidate, str):
+                normalized = candidate.strip().lower()
+                if normalized in _RESEARCH_ACTIONS:
+                    action = normalized
+            if confidence is None:
+                confidence = _valid_confidence(value.get("confidence"))
+            if action is not None and confidence is not None:
+                break
+        if action is not None and confidence is not None:
+            break
+    if action is None:
+        for output in relevant:
+            match = re.search(
+                r"\b(?:action|decision)\s*[:=]\s*(buy|watch|hold|reduce|exit|avoid)\b",
+                output.summary[:2000], re.IGNORECASE,
+            )
+            if match:
+                action = match.group(1).lower()
+                break
+    if confidence is None:
+        for output in relevant:
+            match = re.search(
+                r"\bconfidence\s*[:=]\s*(0(?:\.\d+)?|1(?:\.0+)?)\b",
+                output.summary[:2000], re.IGNORECASE,
+            )
+            if match:
+                confidence = _valid_confidence(match.group(1))
+                if confidence is not None:
+                    break
+    resolved_action = action or "watch"
+    if confidence is None:
+        confidence = 0.6 if action is not None and has_evidence else 0.5
+    return resolved_action, confidence
+
+
+def _bounded_payload_dicts(payload: object) -> list[dict[str, object]]:
+    pending: list[tuple[object, int]] = [(payload, 0)]
+    dictionaries: list[dict[str, object]] = []
+    while pending and len(dictionaries) < 32:
+        value, depth = pending.pop(0)
+        if not isinstance(value, dict):
+            continue
+        dictionaries.append(value)
+        if depth < 3:
+            pending.extend((item, depth + 1) for item in list(value.values())[:32])
+    return dictionaries
+
+
+def _valid_confidence(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return confidence if math.isfinite(confidence) and 0 <= confidence <= 1 else None
 
 
 def _persist_advice(
@@ -451,12 +526,27 @@ def _project_premarket_profiles(
         assets = _chart_assets(connection, db_path, chart_dir, report_date, as_of, code, warnings)
         code_outputs = [item for item in outputs if item.code == code]
         portfolio = next((item.summary for item in code_outputs if item.role == "portfolio_manager"), "")
+        existing = connection.execute(
+            "SELECT information_flow_json, analyst_flow_json, assets_json "
+            "FROM stock_profiles WHERE code = ?", (code,),
+        ).fetchone()
+        prior_information, prior_analyst, prior_assets = (
+            (json.loads(existing[0]), json.loads(existing[1]), json.loads(existing[2]))
+            if existing else ([], [], [])
+        )
+        information = list(dict.fromkeys(
+            prior_information + [item.summary for item in evidence if item.code in {None, code}]
+        ))
+        analyst = list(dict.fromkeys(
+            prior_analyst + [f"{item.role}: {item.summary}" for item in code_outputs]
+        ))
+        assets = list(dict.fromkeys(prior_assets + assets))
         profile = StockProfile(
             code, _security_name(connection, code), _security_industry(connection, code),
             portfolio or "Research watch candidate.",
-            [item.summary for item in evidence if item.code in {None, code}],
+            information,
             [],
-            [f"{item.role}: {item.summary}" for item in code_outputs],
+            analyst,
             [item.summary for item in code_outputs if item.role.endswith("_risk")],
             assets,
         )
@@ -531,7 +621,7 @@ def _chart_assets(
 ) -> list[str]:
     output = chart_dir / report_date / f"{code}-kline.png"
     try:
-        path = generate_kline_chart(db_path, code, output)
+        path = generate_kline_chart(db_path, code, output, as_of=as_of, report_date=report_date)
     except (OSError, ValueError, sqlite3.Error) as error:
         warnings.append(f"{code} chart omitted: {type(error).__name__}")
         return []
@@ -738,16 +828,20 @@ def _evaluate_review_item(
         """,
         (advice.code, report_date, as_of.date().isoformat()),
     ).fetchall()
-    ledger_count = connection.execute(
+    ledger_rows = connection.execute(
         """
-        SELECT COUNT(*) FROM ledger_transactions
+        SELECT transaction_type, COUNT(*) FROM ledger_transactions
         WHERE code = ? AND date(trade_date) = date(?)
           AND julianday(created_at) <= julianday(?)
+        GROUP BY transaction_type ORDER BY transaction_type
         """,
         (advice.code, report_date, as_of.isoformat()),
-    ).fetchone()[0]
+    ).fetchall()
+    ledger_count = sum(row[1] for row in ledger_rows)
+    ledger_types = ", ".join(f"{row[0]}={row[1]}" for row in ledger_rows)
     ledger_text = (
         f"{ledger_count} ledger transaction{'s' if ledger_count != 1 else ''} recorded"
+        + (f" ({ledger_types})" if ledger_types else "")
         if ledger_count
         else "no ledger transactions recorded"
     )
@@ -768,7 +862,8 @@ def _evaluate_review_item(
         )
     else:
         change = latest_close - prior_close
-        if change > 0:
+        favorable = change > 0 if advice.action in {"buy", "watch", "hold"} else change <= 0
+        if favorable:
             outcome = "followed_strength"
         elif ledger_count:
             outcome = "risk_review"
@@ -817,12 +912,17 @@ def _evidence_for_code(items: list[dict[str, Any]], code: str) -> list[dict[str,
 def _premarket_context(
     outputs: Sequence[AnalystOutput],
     evidence: Sequence[EvidenceRecord],
+    advice: Sequence[AdviceItem],
+    report_date: str,
     warnings: Sequence[str],
 ) -> dict[str, list[str]]:
     return {
         "information_flow": [item.summary for item in evidence],
         "analyst_flow": [f"{item.role}: {item.summary}" for item in outputs],
         "evidence": [item.evidence_id for item in evidence],
+        "chart_markers": [
+            f"{item.code}: advice={item.action} at {report_date}" for item in advice
+        ],
         "risk_controls": list(warnings),
     }
 
@@ -843,12 +943,46 @@ def _json_safe(value: Any) -> Any:
 
 def _candidate_codes(values: Sequence[str]) -> tuple[str, ...]:
     codes = tuple(values)
-    if not codes or len(set(codes)) != len(codes) or any(
+    if len(set(codes)) != len(codes) or any(
         not isinstance(code, str) or len(code) != 6 or not code.isdigit()
         for code in codes
     ):
         raise ValueError("candidate_codes are missing or invalid")
     return codes
+
+
+def _expanded_candidate_codes(
+    connection: sqlite3.Connection,
+    values: Sequence[str],
+    collector_snapshot: CollectorSnapshot,
+) -> tuple[str, ...]:
+    codes = list(_candidate_codes(values))
+    for event in collector_snapshot.events[:1000]:
+        summary = getattr(event, "summary", "")
+        if isinstance(summary, str):
+            codes.extend(_CODE_PATTERN.findall(summary[:800]))
+    codes.extend(
+        row[0] for row in connection.execute(
+            "SELECT DISTINCT code FROM positions WHERE quantity != 0 ORDER BY code LIMIT 1000"
+        ).fetchall()
+        if isinstance(row[0], str)
+    )
+    codes.extend(
+        row[0] for row in connection.execute(
+            """
+            SELECT code FROM ledger_transactions
+            WHERE code IS NOT NULL AND transaction_type IN ('buy', 'sell')
+            GROUP BY code
+            HAVING SUM(CASE WHEN transaction_type = 'buy' THEN quantity ELSE -quantity END) > 0
+            ORDER BY code LIMIT 1000
+            """
+        ).fetchall()
+        if isinstance(row[0], str)
+    )
+    expanded = tuple(dict.fromkeys(codes))
+    if not expanded:
+        raise ValueError("candidate_codes are missing or invalid")
+    return _candidate_codes(expanded)
 
 
 def _report_date(value: str | date) -> str:

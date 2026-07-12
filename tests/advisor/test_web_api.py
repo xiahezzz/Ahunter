@@ -158,6 +158,57 @@ def test_report_routes_list_and_serve_only_verified_archives(tmp_path, monkeypat
     assert client.get("/api/reports/2026-07-11/unknown").status_code == 404
 
 
+def test_small_report_page_verifies_only_bounded_archive_candidates(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    start = date(2026, 1, 1)
+    for index in range(180):
+        report_date = (start + timedelta(days=index)).isoformat()
+        paths = write_premarket_report(
+            report_date,
+            [],
+            reports_root,
+            quality_results=[QualityResult("market", "blocking", True, "current")],
+        )
+        run_id = f"history-{index}"
+        connection.execute(
+            "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+            "VALUES (?, 'premarket', ?, 'passed', ?)",
+            (run_id, report_date, f"{report_date}T08:30:00+08:00"),
+        )
+        insert_report_archive(
+            connection,
+            database_run_id=run_id,
+            report_type="premarket",
+            report_date=report_date,
+            markdown_path=paths.markdown_path,
+            json_path=paths.json_path,
+        )
+    connection.commit()
+    connection.close()
+    verification_calls = 0
+    real_reader = web_api.read_verified_archive
+
+    def counted_reader(*args, **kwargs):
+        nonlocal verification_calls
+        verification_calls += 1
+        return real_reader(*args, **kwargs)
+
+    monkeypatch.setattr(web_api, "read_verified_archive", counted_reader)
+
+    response = TestClient(create_app(tmp_path, db_path=db_path)).get(
+        "/api/reports?start_date=2026-01-01&end_date=2026-06-29&limit=1"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reports"][0]["report_date"] == "2026-06-29"
+    assert response.json()["truncated"] is True
+    assert verification_calls <= 20
+
+
 def test_report_routes_hide_verified_archive_without_committed_archive_row(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)

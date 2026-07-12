@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import date, datetime
 from pathlib import Path
 
 import matplotlib
@@ -8,16 +9,31 @@ import mplfinance as mpf
 import pandas as pd
 
 
-def generate_kline_chart(db_path: Path, code: str, output_path: Path) -> Path:
+def generate_kline_chart(
+    db_path: Path,
+    code: str,
+    output_path: Path,
+    *,
+    as_of: datetime | None = None,
+    report_date: str | date | None = None,
+) -> Path:
+    cutoffs = []
+    if as_of is not None:
+        cutoffs.append(as_of.date())
+    if report_date is not None:
+        cutoffs.append(
+            report_date if isinstance(report_date, date) else date.fromisoformat(report_date)
+        )
+    cutoff = min(cutoffs).isoformat() if cutoffs else date.max.isoformat()
     connection = sqlite3.connect(db_path)
     rows = connection.execute(
         """
         SELECT trade_date, open, high, low, close, volume
         FROM market_daily
-        WHERE code = ?
+        WHERE code = ? AND quality_status = 'passed' AND date(trade_date) <= date(?)
         ORDER BY trade_date
         """,
-        (code,),
+        (code, cutoff),
     ).fetchall()
     connection.close()
     if not rows:

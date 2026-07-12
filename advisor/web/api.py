@@ -1280,23 +1280,21 @@ def _page_db_backed_archives(
     after, expected_snapshot = _decode_report_cursor(
         cursor, cursor_secret, requested_start, requested_end
     ) if cursor else (None, None)
-    eligible = _eligible_report_keys(
-        connection,
-        reports_root,
-        start_date=requested_start,
-        end_date=requested_end,
+    snapshot_digest = _report_archive_snapshot_digest(
+        connection, requested_start, requested_end
     )
-    items = _read_verified_report_items(reports_root, eligible)
-    snapshot_digest = hashlib.sha256(
-        json.dumps(items, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
     if expected_snapshot is not None and not hmac.compare_digest(
         expected_snapshot, snapshot_digest
     ):
         raise StaleArchiveCursorError("stale report cursor")
-    available = [item for item in items if after is None or _report_key(item) < after]
-    page_items = available[:limit]
-    truncated = len(available) > limit
+    page_items, truncated, verified_count = _read_report_page_candidates(
+        connection,
+        reports_root,
+        start_date=requested_start,
+        end_date=requested_end,
+        after=after,
+        limit=limit,
+    )
     next_cursor = (
         _encode_report_cursor(
             page_items[-1], cursor_secret, requested_start, requested_end, snapshot_digest
@@ -1310,7 +1308,150 @@ def _page_db_backed_archives(
         "truncated": truncated,
         "requested_start_date": requested_start,
         "requested_end_date": requested_end,
-        "verified_candidate_count": len(items),
+        "verified_candidate_count": verified_count,
+    }
+
+
+def _report_archive_snapshot_digest(
+    connection: sqlite3.Connection | None, start_date: str, end_date: str
+) -> str:
+    if connection is None:
+        values = (0, None, None, 0)
+    else:
+        try:
+            row = connection.execute(
+                """
+                SELECT COUNT(*), MAX(report_archive.rowid), MAX(report_archive.created_at),
+                       COALESCE(SUM(LENGTH(report_archive.json_path) +
+                                    LENGTH(report_archive.markdown_path)), 0)
+                FROM report_archive
+                JOIN advisor_runs ON advisor_runs.run_id = report_archive.run_id
+                WHERE report_archive.report_type IN ('premarket', 'review')
+                  AND advisor_runs.status = 'passed'
+                  AND report_archive.report_date >= ?
+                  AND report_archive.report_date <= ?
+                """,
+                (start_date, end_date),
+            ).fetchone()
+            values = tuple(row) if row is not None else (0, None, None, 0)
+        except sqlite3.Error as error:
+            raise ValueError("report archive query failed") from error
+    return hashlib.sha256(
+        json.dumps(values, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _read_report_page_candidates(
+    connection: sqlite3.Connection | None,
+    reports_root: Path,
+    *,
+    start_date: str,
+    end_date: str,
+    after: tuple[str, str, str] | None,
+    limit: int,
+) -> tuple[list[dict], bool, int]:
+    if connection is None:
+        return [], False, 0
+    root = reports_root.resolve(strict=False)
+    batch_size = min(100, max(20, limit * 2 + 1))
+    scanned = 0
+    verified = 0
+    items: list[dict] = []
+    last_key: tuple[str, str, str, int] | None = None
+    after_path = None
+    if after is not None:
+        report_date, report_type, run_id = after
+        suffix = "" if run_id == "initial" else f".{run_id}"
+        after_path = str(root / report_date / f"{report_type}{suffix}.json")
+    while scanned < _MAX_REPORT_ARCHIVE_ROWS and len(items) <= limit:
+        filters = [
+            "report_archive.report_date >= ?",
+            "report_archive.report_date <= ?",
+        ]
+        parameters: list[object] = [start_date, end_date]
+        if after is not None and after_path is not None:
+            filters.append(
+                "(report_archive.report_date, report_archive.report_type, "
+                "report_archive.json_path) < (?, ?, ?)"
+            )
+            parameters.extend((after[0], after[1], after_path))
+        if last_key is not None:
+            filters.append(
+                "(report_archive.report_date, report_archive.report_type, "
+                "report_archive.json_path, report_archive.rowid) < (?, ?, ?, ?)"
+            )
+            parameters.extend(last_key)
+        parameters.append(min(batch_size, _MAX_REPORT_ARCHIVE_ROWS - scanned))
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT report_archive.report_type, report_archive.report_date,
+                       report_archive.markdown_path, report_archive.json_path,
+                       report_archive.rowid
+                FROM report_archive
+                JOIN advisor_runs ON advisor_runs.run_id = report_archive.run_id
+                WHERE report_archive.report_type IN ('premarket', 'review')
+                  AND advisor_runs.status = 'passed'
+                  AND {' AND '.join(filters)}
+                ORDER BY report_archive.report_date DESC,
+                         report_archive.report_type DESC,
+                         report_archive.json_path DESC,
+                         report_archive.rowid DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise ValueError("report archive query failed") from error
+        if not rows:
+            break
+        scanned += len(rows)
+        tail = rows[-1]
+        last_key = (tail["report_date"], tail["report_type"], tail["json_path"], tail["rowid"])
+        for row in rows:
+            item = _verified_report_row(root, reports_root, row)
+            if item is None:
+                continue
+            verified += 1
+            items.append(item)
+            if len(items) > limit:
+                break
+        if len(rows) < batch_size:
+            break
+    return items[:limit], len(items) > limit or scanned >= _MAX_REPORT_ARCHIVE_ROWS, verified
+
+
+def _verified_report_row(root: Path, reports_root: Path, row: sqlite3.Row) -> dict | None:
+    report_type = row["report_type"]
+    report_date = row["report_date"]
+    try:
+        if report_type not in {"premarket", "review"}:
+            return None
+        if date.fromisoformat(report_date).isoformat() != report_date:
+            return None
+        json_path = Path(row["json_path"])
+        markdown_path = Path(row["markdown_path"])
+    except (TypeError, ValueError):
+        return None
+    run_id = _report_run_id(report_type, json_path.name)
+    if run_id is None:
+        return None
+    suffix = "" if run_id == "initial" else f".{run_id}"
+    expected_directory = root / report_date
+    if (
+        json_path.resolve(strict=False) != expected_directory / f"{report_type}{suffix}.json"
+        or markdown_path.resolve(strict=False) != expected_directory / f"{report_type}{suffix}.md"
+    ):
+        return None
+    try:
+        archive = read_verified_archive(reports_root, report_date, report_type, run_id)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return {
+        "report_date": report_date,
+        "report_type": report_type,
+        "run_id": run_id,
+        "quality_status": archive["json"].get("quality_status", "unknown"),
     }
 
 
