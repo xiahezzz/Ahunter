@@ -80,12 +80,6 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> dict:
-        connection = _read_connection(resolved_db_path)
-        try:
-            eligible = _eligible_report_keys(connection, advisor_paths.reports_dir())
-        finally:
-            if connection is not None:
-                connection.close()
         try:
             page = page_verified_archives(
                 advisor_paths.reports_dir(),
@@ -99,6 +93,16 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
             raise HTTPException(status_code=409, detail="report cursor stale") from None
         except ValueError:
             raise HTTPException(status_code=503, detail="report listing unavailable") from None
+        connection = _read_connection(resolved_db_path)
+        try:
+            eligible = _eligible_report_keys(
+                connection,
+                advisor_paths.reports_dir(),
+                candidate_keys={_report_key(item) for item in page["items"]},
+            )
+        finally:
+            if connection is not None:
+                connection.close()
         page["items"] = [
             item for item in page["items"]
             if _report_key(item) in eligible
@@ -123,7 +127,11 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
                 _shanghai_today().isoformat(),
                 database_present=_database_entry_present(resolved_db_path),
             )
-            eligible = _eligible_report_keys(connection, advisor_paths.reports_dir())
+            eligible = _eligible_report_keys(
+                connection,
+                advisor_paths.reports_dir(),
+                candidate_keys={(report_date, report_type, run_id)},
+            )
         finally:
             if connection is not None:
                 connection.close()
@@ -276,7 +284,15 @@ def _current_state(state_dir: Path, db_path: Path, report_cursor_secret: bytes) 
         )
         profiles, profile_list = _read_profile_links_with_status(connection)
         charts, chart_list = _read_chart_links_with_status(connection, state_dir)
-        eligible_reports = _eligible_report_keys(connection, advisor_paths.reports_dir())
+        report_start = (
+            date.fromisoformat(today) - timedelta(days=_CURRENT_REPORT_LOOKBACK_DAYS)
+        ).isoformat()
+        eligible_reports = _eligible_report_keys(
+            connection,
+            advisor_paths.reports_dir(),
+            start_date=report_start,
+            end_date=today,
+        )
     finally:
         if connection is not None:
             connection.close()
@@ -1131,59 +1147,99 @@ def _regular_file_within(path: Path, root: Path) -> bool:
 
 
 def _eligible_report_keys(
-    connection: sqlite3.Connection | None, reports_root: Path
+    connection: sqlite3.Connection | None,
+    reports_root: Path,
+    *,
+    candidate_keys: set[tuple[str, str, str]] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> set[tuple[str, str, str]]:
-    if connection is None:
+    if connection is None or (candidate_keys is not None and not candidate_keys):
         return set()
+    root = reports_root.resolve(strict=False)
+    filters = []
+    parameters: list[object] = []
+    if candidate_keys is not None:
+        candidate_filters = []
+        for report_date, report_type in sorted(
+            {(key[0], key[1]) for key in candidate_keys}
+        ):
+            candidate_filters.append(
+                "(report_archive.report_date = ? AND report_archive.report_type = ?)"
+            )
+            parameters.extend((report_date, report_type))
+        filters.append(f"({' OR '.join(candidate_filters)})")
+    if start_date is not None:
+        filters.append("report_archive.report_date >= ?")
+        parameters.append(start_date)
+    if end_date is not None:
+        filters.append("report_archive.report_date <= ?")
+        parameters.append(end_date)
+    bounded_filter = f" AND {' AND '.join(filters)}" if filters else ""
+    row_limit = (
+        ""
+        if candidate_keys is not None
+        else "ORDER BY report_archive.report_date DESC, "
+        "report_archive.created_at DESC LIMIT ?"
+    )
+    if candidate_keys is None:
+        parameters.append(_MAX_REPORT_ARCHIVE_ROWS)
     try:
         rows = connection.execute(
-            """
+            f"""
             SELECT report_archive.report_type, report_archive.report_date,
                    report_archive.markdown_path, report_archive.json_path
             FROM report_archive
             JOIN advisor_runs ON advisor_runs.run_id = report_archive.run_id
-            WHERE (report_archive.report_type IN ('premarket', 'review')
-                   AND advisor_runs.status = 'passed')
+            WHERE ((report_archive.report_type IN ('premarket', 'review')
+                    AND advisor_runs.status = 'passed')
                OR (report_archive.report_type = 'failure'
-                   AND advisor_runs.status = 'blocked')
-            LIMIT ?
+                   AND advisor_runs.status = 'blocked'))
+              {bounded_filter}
+            {row_limit}
             """,
-            (_MAX_REPORT_ARCHIVE_ROWS + 1,),
-        ).fetchall()
+            parameters,
+        )
     except sqlite3.Error:
-        return set()
-    if len(rows) > _MAX_REPORT_ARCHIVE_ROWS:
         return set()
 
     keys: set[tuple[str, str, str]] = set()
-    root = reports_root.resolve(strict=False)
-    for row in rows:
-        report_type = row["report_type"]
-        report_date = row["report_date"]
-        if report_type not in {"premarket", "review", "failure"}:
-            continue
-        try:
-            if date.fromisoformat(report_date).isoformat() != report_date:
+    try:
+        for row in rows:
+            report_type = row["report_type"]
+            report_date = row["report_date"]
+            if report_type not in {"premarket", "review", "failure"}:
                 continue
-        except (TypeError, ValueError):
-            continue
-        try:
-            json_path = Path(row["json_path"])
-            markdown_path = Path(row["markdown_path"])
-        except TypeError:
-            continue
-        run_id = _report_run_id(report_type, json_path.name)
-        if run_id is None:
-            continue
-        suffix = "" if run_id == "initial" else f".{run_id}"
-        expected_directory = root / report_date
-        if (
-            json_path.resolve(strict=False) != expected_directory / f"{report_type}{suffix}.json"
-            or markdown_path.resolve(strict=False)
-            != expected_directory / f"{report_type}{suffix}.md"
-        ):
-            continue
-        keys.add((report_date, report_type, run_id))
+            try:
+                if date.fromisoformat(report_date).isoformat() != report_date:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            try:
+                json_path = Path(row["json_path"])
+                markdown_path = Path(row["markdown_path"])
+            except TypeError:
+                continue
+            run_id = _report_run_id(report_type, json_path.name)
+            if run_id is None:
+                continue
+            key = (report_date, report_type, run_id)
+            if candidate_keys is not None and key not in candidate_keys:
+                continue
+            suffix = "" if run_id == "initial" else f".{run_id}"
+            expected_directory = root / report_date
+            if (
+                json_path.resolve(strict=False)
+                != expected_directory / f"{report_type}{suffix}.json"
+                or markdown_path.resolve(strict=False)
+                != expected_directory / f"{report_type}{suffix}.md"
+            ):
+                continue
+            keys.add(key)
+            if candidate_keys is not None and keys == candidate_keys:
+                break
+    except sqlite3.Error:
+        return set()
     return keys
 
 
