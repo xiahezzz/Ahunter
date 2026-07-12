@@ -109,31 +109,82 @@ Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched and a
 
 ## Task 17 Final Boundedness Fix
 
-Addressed the remaining reviewer findings by rejecting non-finite ledger replay/materialized state before commits and by bounding parsed API ledger import payload shape before transaction construction.
+Implementation commit: `f752ad71cb4a528b4cd7b355a2659da3baa6ef71`
 
-Focused RED run from the pre-existing TDD tests:
+Required commit subject: `fix: bound ledger materialized state`
+
+### Summary
+
+- Rejects non-finite replayed cash, realized P&L, and position cost basis through a shared `LedgerState` validator.
+- Computes and validates all affected account states, position exposures, market values, and unrealized P&L aggregates before issuing position or snapshot writes.
+- Rolls back ledger transactions, positions, and snapshots atomically when replay or materialized aggregates are non-finite.
+- Bounds API imports before `LedgerTransaction` construction by top-level row count, per-row key count, a fixed allowed key set, and string length.
+- Rejects nested lists/dictionaries and oversized unknown fields with deterministic HTTP 422 responses and no database writes.
+- Preserves passive collector behavior and makes no RID configuration, broker/order, frontend visual, schema, or unrelated changes.
+
+### TDD Evidence
+
+Initial regression RED:
 
 ```text
-.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_import_rejects_non_finite_replayed_cash_atomically tests/advisor/test_web_api.py::test_ledger_import_rejects_non_finite_replayed_cash_atomically tests/advisor/test_web_api.py::test_ledger_import_rejects_nested_values_before_database_write tests/advisor/test_web_api.py::test_ledger_import_rejects_huge_unknown_field_before_database_write tests/advisor/test_web_api.py::test_ledger_import_rejects_rows_over_key_limit_before_database_write -q
-5 failed, 1 passed in 0.70s
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_import_rejects_non_finite_replayed_cash_atomically tests/advisor/test_web_api.py::test_ledger_import_rejects_non_finite_replayed_cash_atomically tests/advisor/test_web_api.py::test_ledger_import_rejects_nested_values_before_database_write tests/advisor/test_web_api.py::test_ledger_import_rejects_huge_unknown_field_before_database_write -q
+FFFF.                                                                    [100%]
+4 failed, 1 passed in 0.85s
 ```
 
-Focused GREEN after the boundedness fixes:
+Explicit per-row key-bound RED:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py::test_ledger_import_rejects_rows_over_key_limit_before_database_write -q
+F                                                                        [100%]
+1 failed in 0.57s
+```
+
+Focused regression GREEN:
 
 ```text
 .venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_import_rejects_non_finite_replayed_cash_atomically tests/advisor/test_web_api.py::test_ledger_import_rejects_non_finite_replayed_cash_atomically tests/advisor/test_web_api.py::test_ledger_import_rejects_nested_values_before_database_write tests/advisor/test_web_api.py::test_ledger_import_rejects_huge_unknown_field_before_database_write tests/advisor/test_web_api.py::test_ledger_import_rejects_rows_over_key_limit_before_database_write -q
+......                                                                   [100%]
 6 passed in 0.33s
 ```
 
-Required verification:
+Snapshot aggregate regression:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_import_rejects_non_finite_snapshot_aggregates_atomically -q
+.                                                                        [100%]
+1 passed in 0.22s
+```
+
+### Verification
+
+Required focused matrix:
 
 ```text
 .venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
-174 passed in 5.56s
+........................................................................ [ 41%]
+........................................................................ [ 82%]
+...............................                                          [100%]
+175 passed in 5.51s
+```
 
+Complete advisor suite:
+
+```text
 .venv311/bin/python -m pytest tests/advisor -q
-434 passed in 7.59s
+........................................................................ [ 16%]
+........................................................................ [ 33%]
+........................................................................ [ 49%]
+........................................................................ [ 66%]
+........................................................................ [ 82%]
+........................................................................ [ 99%]
+...                                                                      [100%]
+435 passed in 7.83s
+```
 
+Offline collector self-test:
+
+```text
 /Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
 tests 133
 pass 133
@@ -141,7 +192,27 @@ fail 0
 cancelled 0
 skipped 0
 todo 0
-duration_ms 517.796958
+duration_ms 494.829417
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
 ```
 
 No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
+### Changed Files
+
+- `advisor/ledger/model.py`
+- `advisor/ledger/importer.py`
+- `advisor/web/api.py`
+- `tests/advisor/test_ledger.py`
+- `tests/advisor/test_web_api.py`
+- `.superpowers/sdd/task-17-report.md`
+
+### Concerns
+
+Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched and are not included in either boundedness commit.
