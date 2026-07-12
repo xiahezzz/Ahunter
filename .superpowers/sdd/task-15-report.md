@@ -296,6 +296,89 @@ git diff --check
 
 None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
 
+## Fourth Reviewer Fix: Stable MX Quality Proofs
+
+### Status
+
+DONE
+
+Implementation commit: `00167d496e6ea64ed4d0def563a058a0c5a14591`
+
+Required commit subject: `fix: stabilize mx quality proofs`
+
+### Fix Summary
+
+- Calendar proof selection now classifies each trading-calendar proof by its proof `as_of` before validating or aggregating claims. Historical proofs are ignored when a current proof exists; only current applicable claims can conflict.
+- A stale proof blocks only when no current claim exists. Missing current coverage remains unavailable rather than being mislabeled as stale.
+- Evidence persistence and quality requests now share the reporting-contract run-ID shape: `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`. Unsafe IDs are rejected before evidence writes, and invalid quality IDs produce a blocked result without creating `data_quality_checks` rows.
+
+### RED Evidence
+
+The first focused run exposed a missing `pytest` import in the newly parametrized quality test:
+
+```text
+NameError: name 'pytest' is not defined
+```
+
+After correcting that test setup, the intended RED command was:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py::test_persist_evidence_rejects_unsafe_run_id_before_writing tests/advisor/test_quality_gate.py::test_historical_calendar_proof_is_ignored_when_current_proof_is_available tests/advisor/test_quality_gate.py::test_conflicting_current_calendar_claims_block tests/advisor/test_quality_gate.py::test_unsafe_quality_request_run_id_blocks_without_persisting_checks -q
+```
+
+Output:
+
+```text
+7 failed, 1 passed in 0.28s
+```
+
+The seven failures were the three unsafe evidence run IDs being accepted, the current proof being blocked by a historical proof, and the three unsafe quality run IDs persisting seven checks each. The current-current conflict regression already passed, confirming the RED case isolated historical proof handling.
+
+### GREEN Evidence
+
+The same focused command after implementation:
+
+```text
+8 passed in 0.15s
+```
+
+### Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+176 passed in 2.14s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+296 passed in 4.02s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 490.065667
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+### Concerns
+
+None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
+
 ## Third Reviewer Fix: Authoritative MX Quality Proof
 
 ### Status
