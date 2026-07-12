@@ -399,6 +399,40 @@ def test_sensitive_opaque_collector_source_id_fails_closed(
     assert snapshot.quality.blocking_failure
 
 
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        "event_accesstoken_foo",
+        "event_refreshtoken_foo",
+        "event_sessiontoken_foo",
+        "event_authorizationtoken_foo",
+        "event_cookietoken_foo",
+        "event_debugid_foo",
+        "event_authtoken_foo",
+        "event_sockettoken_foo",
+        "event_apikeytoken_foo",
+        "event_passwordtoken_foo",
+        "event_credentialtoken_foo",
+        "event_secrettoken_foo",
+    ],
+)
+def test_concatenated_sensitive_opaque_identifiers_are_rejected(source_id):
+    assert not mx_adapter.valid_opaque_identifier(source_id)
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        "evt-authorized-1",
+        "event_author_foo",
+        "event_sessionized_foo",
+        "event_debuggable_foo",
+    ],
+)
+def test_benign_opaque_identifiers_remain_valid(source_id):
+    assert mx_adapter.valid_opaque_identifier(source_id)
+
+
 def test_snapshot_dto_redacts_forged_sensitive_values():
     secrets = (
         "dto-auth-secret",

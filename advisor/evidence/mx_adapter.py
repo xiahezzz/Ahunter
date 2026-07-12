@@ -50,7 +50,12 @@ _SENSITIVE_OPAQUE_COMPONENT = re.compile(
     re.IGNORECASE,
 )
 _SENSITIVE_OPAQUE_COMPOUND = re.compile(
-    r"(?:^|[_.:-])(?:sessionid|socketid|debugidentifier|cdptoken|apikey|idtoken)(?:[_.:-]|$)",
+    r"(?:^|[_.:-])"
+    r"(?:access|refresh|id|token|session|authorization|auth|cookie|debug|debugger|"
+    r"cdp|socket|api|apikey|password|credential|credentials|secret)"
+    r"(?:token|id|identifier|key|session|authorization|auth|cookie|debug|debugger|"
+    r"socket|apikey|password|credential|credentials|secret)"
+    r"(?:[_.:-]|$)",
     re.IGNORECASE,
 )
 _MEDIA_CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\Z")
