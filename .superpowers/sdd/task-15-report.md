@@ -764,3 +764,94 @@ git diff --check
 ### Concerns
 
 None. No collector behavior, RID values, frontend, broker/order code, live smoke test, Chrome session, or MX page operation was changed or invoked. Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched.
+
+## Final Reviewer Fix: Calendar Authority Outside the Database
+
+### Status
+
+DONE
+
+Implementation commit: `738d1f8b1772e574e9ead837e6a1dd25bba84bbf`
+
+Required commit subject: `fix: compute calendar authority outside db`
+
+### Fix Summary
+
+- Added a deterministic code-backed A-share calendar provider that derives the latest weekday session from the run's timezone-aware `as_of` value.
+- Changed calendar proof handling from database authority to an audit comparison against the independently computed session. Missing, malformed, stale, future, incomplete, and conflicting proof rows still fail closed.
+- Kept candidate latest-session coverage and optional-source interval coverage bound to the independently computed expected session.
+- Added a direct-SQL regression that inserts a valid public content hash, self-consistent `2026-07-09` proof, and matching market row while `as_of` independently requires `2026-07-10`; the quality gate blocks the forgery.
+
+### TDD Evidence
+
+The new direct-SQL forgery regression initially produced:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py::test_self_consistent_direct_calendar_proof_cannot_change_expected_session -q
+F                                                                        [100%]
+AssertionError: assert False
+1 failed in 0.20s
+```
+
+After implementation, the regression and complete quality-gate file produced:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py::test_self_consistent_direct_calendar_proof_cannot_change_expected_session -q
+1 passed in 0.16s
+
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py -q
+40 passed in 0.37s
+```
+
+### Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py tests/advisor/test_db_schema.py tests/advisor/test_mx_evidence_quality.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+........................................................................ [ 30%]
+........................................................................ [ 61%]
+........................................................................ [ 91%]
+....................                                                     [100%]
+236 passed in 2.55s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 20%]
+........................................................................ [ 40%]
+........................................................................ [ 61%]
+........................................................................ [ 81%]
+..................................................................       [100%]
+354 passed in 4.58s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 508.741333
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+### Changed Files
+
+- `advisor/calendar.py` (new deterministic calendar provider)
+- `advisor/quality.py`
+- `tests/advisor/test_quality_gate.py`
+- `.superpowers/sdd/task-15-report.md`
+
+### Concerns
+
+The deterministic provider intentionally models weekdays only, as permitted for this task. Exchange holidays and makeup sessions will require a root-contained code/config calendar extension before those dates are used operationally. No collector behavior, RID values, frontend, broker/order code, live smoke test, Chrome session, or MX page operation was changed or invoked. Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched.
