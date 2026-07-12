@@ -56,7 +56,11 @@ from advisor.reporting.review import write_review_report
 
 QualityEvaluator = Callable[[sqlite3.Connection, QualityRequest], QualityGateResult]
 EvidencePersister = Callable[..., list[EvidenceRecord]]
-_RESEARCH_ACTIONS = frozenset({"buy", "watch", "hold", "reduce", "exit", "avoid"})
+_BULLISH_REVIEW_ACTIONS = frozenset({"buy", "watch_buy", "watch_add"})
+_NEUTRAL_REVIEW_ACTIONS = frozenset({"hold", "watch"})
+_BEARISH_REVIEW_ACTIONS = frozenset(
+    {"watch_reduce", "watch_exit", "reduce", "exit", "avoid"}
+)
 _CODE_PATTERN = re.compile(r"(?<!\d)([03468]\d{5})(?!\d)")
 MAX_REVIEW_LEDGER_CONTEXT_ITEMS = 500
 MAX_REVIEW_LEDGER_MATCHES_PER_CONTEXT_ITEM = 50
@@ -877,7 +881,7 @@ def _evaluate_review_item(
         )
     else:
         change = latest_close - prior_close
-        favorable = change > 0 if advice.action in {"buy", "watch", "hold"} else change <= 0
+        favorable = _favorable_review_move(advice.action, change)
         if favorable:
             outcome = "followed_strength"
         elif ledger_count:
@@ -896,6 +900,17 @@ def _evaluate_review_item(
         outcome,
         review_text,
     )
+
+
+def _favorable_review_move(action: str, change: float) -> bool:
+    normalized = action.strip().lower()
+    if normalized in _BULLISH_REVIEW_ACTIONS:
+        return change > 0
+    if normalized in _BEARISH_REVIEW_ACTIONS:
+        return change <= 0
+    if normalized in _NEUTRAL_REVIEW_ACTIONS:
+        return change == 0
+    return False
 
 
 def _review_ledger_context(

@@ -19,6 +19,7 @@ _SAFE_DESCRIPTIONS = {
     "analyst_contract_readiness": "Required output readiness check failed.",
     "market_source_state": "Market source state check failed.",
     "optional_source_coverage": "Alternate source coverage check failed.",
+    "runtime": "Runtime execution check failed.",
 }
 
 

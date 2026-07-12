@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from advisor.agents.astock_adapter import ANALYST_ROLES
-from advisor.calendar import latest_expected_session
+from advisor.calendar import UnsupportedTradingCalendarError, latest_expected_session
 from advisor.db.repository import (
     CALENDAR_PROOF_PRODUCER,
     CALENDAR_PROOF_VERSION,
@@ -185,7 +185,10 @@ def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequ
 def _expected_session_with_proof_audit(
     connection: sqlite3.Connection, request: QualityRequest
 ) -> tuple[dt.date | None, str | None]:
-    expected = latest_expected_session(request.as_of)
+    try:
+        expected = latest_expected_session(request.as_of)
+    except UnsupportedTradingCalendarError:
+        return None, "trading calendar coverage is unsupported for this run"
     rows = connection.execute(
         """
         SELECT proof_id, contract_version, producer, calendar_source, as_of,

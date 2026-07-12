@@ -539,7 +539,7 @@ def test_review_links_morning_advice_and_persists_review(tmp_path: Path):
 
     assert morning.status == result.status == "passed"
     advice_id = query_all(paths["db_path"], "SELECT advice_id FROM advice")[0][0]
-    assert query_all(paths["db_path"], "SELECT advice_id, outcome FROM reviews") == [(advice_id, "followed_strength")]
+    assert query_all(paths["db_path"], "SELECT advice_id, outcome FROM reviews") == [(advice_id, "missed_or_flat")]
     payload = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))
     assert payload["linked_premarket"]["run_id"] == "initial"
     assert payload["reviews"][0]["advice_id"] == advice_id
@@ -1411,6 +1411,41 @@ def test_review_treats_decline_as_favorable_for_reduce_and_lists_ledger_types(tm
     assert "2 ledger transactions" in review["review_text"]
     assert "buy=1" in review["review_text"]
     assert "sell=1" in review["review_text"]
+
+
+@pytest.mark.parametrize("action", ["watch_buy", "watch_add"])
+def test_review_treats_buy_and_overweight_mapped_actions_as_bullish(
+    tmp_path: Path,
+    action: str,
+):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    advice = AdviceItem("initial-advice", CODE, action, 0.75, "bullish mapped action", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[advice]
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.executemany(
+        "INSERT INTO market_daily (code, trade_date, open, high, low, close, volume, amount, "
+        "source, fetched_at, as_of_date, content_hash, quality_status) "
+        "VALUES (?, ?, 10, 10, 9, ?, 100, 1000, 'fixture', ?, ?, ?, 'passed')",
+        [
+            (CODE, "2026-07-11", 10.0, AS_OF.isoformat(), "2026-07-11", "prior"),
+            (CODE, "2026-07-12", 9.0, AS_OF.isoformat(), "2026-07-12", "latest"),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    result = run_review(
+        collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, **paths,
+    )
+
+    review = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))["reviews"][0]
+    assert review["outcome"] == "missed_or_flat"
 
 
 def test_coordinator_resolves_configured_storage_without_tushare(tmp_path: Path):

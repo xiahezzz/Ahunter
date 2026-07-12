@@ -14,6 +14,9 @@ from advisor.data_sources.backfill import update_market_database
 from advisor.data_sources.free_sources import ConfiguredProviderRegistry
 from advisor.db.migrate import migrate_database
 from advisor.evidence.mx_adapter import read_collector_snapshot
+from advisor.quality import QualityResult
+from advisor.reporting.contracts import validate_run_id
+from advisor.reporting.failure import write_failure_report
 from advisor.scheduler.premarket import _expanded_candidate_codes, _parse_codes, _three_year_start
 
 
@@ -40,51 +43,82 @@ def main(argv: Sequence[str] | None = None, *, coordinator=None) -> int:
         report_day = date.fromisoformat(report_date)
     except ValueError:
         parser.error("--date must be an ISO date")
-    if args.as_of is None:
-        as_of = datetime.combine(report_day, time(22, 30), tzinfo=ZoneInfo("Asia/Shanghai"))
-    config_path = args.config.resolve()
-    root = config_path.parent.parent if config_path.parent.name == "config" else config_path.parent
-    config = load_advisor_config(config_path)
-    db_path = resolve_state_db(config, root)
-    migrate_database(db_path)
+    try:
+        if args.as_of is None:
+            as_of = datetime.combine(report_day, time(22, 30), tzinfo=ZoneInfo("Asia/Shanghai"))
+        config_path = args.config.resolve()
+        root = config_path.parent.parent if config_path.parent.name == "config" else config_path.parent
+        config = load_advisor_config(config_path)
+        db_path = resolve_state_db(config, root)
+        migrate_database(db_path)
 
-    snapshot = read_collector_snapshot(args.events_db, args.allowed_rids, as_of=as_of)
-    explicit_codes = _parse_codes(args.codes)
-    candidate_codes = _expanded_candidate_codes(db_path, explicit_codes, snapshot)
-    if candidate_codes:
-        expected_session = latest_expected_session(as_of)
-        registry = ConfiguredProviderRegistry.from_yaml(config_path.with_name("data-sources.yaml"))
-        update_market_database(
-            db_path,
-            registry.historical_provider,
-            candidate_codes,
-            _three_year_start(expected_session),
-            expected_session,
+        snapshot = read_collector_snapshot(args.events_db, args.allowed_rids, as_of=as_of)
+        explicit_codes = _parse_codes(args.codes)
+        candidate_codes = _expanded_candidate_codes(db_path, explicit_codes, snapshot)
+        if candidate_codes:
+            expected_session = latest_expected_session(as_of)
+            registry = ConfiguredProviderRegistry.from_yaml(config_path.with_name("data-sources.yaml"))
+            update_market_database(
+                db_path,
+                registry.historical_provider,
+                candidate_codes,
+                _three_year_start(expected_session),
+                expected_session,
+                as_of=as_of,
+            )
+
+        active_coordinator = coordinator or coordinator_module.run_review
+        result = active_coordinator(
+            collector_snapshot=snapshot,
             as_of=as_of,
+            report_date=report_date,
+            candidate_codes=candidate_codes,
+            output_dir=args.output_dir,
+            config_path=config_path,
+            run_id=args.run_id,
+            report_run_id=args.report_run_id,
+            rerun_reason=args.rerun_reason,
+            supersedes=args.supersedes,
+            premarket_run_id=args.premarket_run_id,
         )
+        print(json.dumps({
+            "json_path": str(result.report_paths.json_path),
+            "markdown_path": str(result.report_paths.markdown_path),
+            "run_id": result.run_id,
+            "status": result.status,
+            "warnings": list(result.warnings),
+        }, sort_keys=True))
+        return 0 if result.status in {"passed", "blocked"} else 1
+    except Exception as error:
+        run_id = _failure_run_id(args.run_id, report_day)
+        payload = {"error": type(error).__name__, "run_id": run_id, "status": "failed"}
+        try:
+            paths = write_failure_report(
+                report_date,
+                "review",
+                [QualityResult("runtime", "blocking", False, type(error).__name__)],
+                args.output_dir,
+                run_id=run_id,
+            )
+            payload.update({
+                "json_path": str(paths.json_path),
+                "markdown_path": str(paths.markdown_path),
+            })
+        except Exception:
+            pass
+        print(json.dumps(payload, sort_keys=True))
+        return 1
 
-    active_coordinator = coordinator or coordinator_module.run_review
-    result = active_coordinator(
-        collector_snapshot=snapshot,
-        as_of=as_of,
-        report_date=report_date,
-        candidate_codes=candidate_codes,
-        output_dir=args.output_dir,
-        config_path=config_path,
-        run_id=args.run_id,
-        report_run_id=args.report_run_id,
-        rerun_reason=args.rerun_reason,
-        supersedes=args.supersedes,
-        premarket_run_id=args.premarket_run_id,
-    )
-    print(json.dumps({
-        "json_path": str(result.report_paths.json_path),
-        "markdown_path": str(result.report_paths.markdown_path),
-        "run_id": result.run_id,
-        "status": result.status,
-        "warnings": list(result.warnings),
-    }, sort_keys=True))
-    return 0 if result.status in {"passed", "blocked"} else 1
+
+def _failure_run_id(raw_run_id: str | None, report_day: date) -> str:
+    if raw_run_id is not None:
+        try:
+            validate_run_id(raw_run_id)
+        except ValueError:
+            pass
+        else:
+            return raw_run_id
+    return f"review-runtime-failed-{report_day:%Y%m%d}"
 
 
 if __name__ == "__main__":

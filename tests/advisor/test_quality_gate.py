@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from advisor.agents.astock_adapter import ANALYST_ROLES
-from advisor.calendar import latest_expected_session
+from advisor.calendar import is_trading_session, latest_expected_session
 from advisor.db.migrate import migrate_database
 from advisor.db.repository import calendar_proof_content_hash, record_trading_calendar_proof
 from advisor.evidence.mx_adapter import CollectorSnapshot, MediaMetadata, MxEvidence
@@ -141,6 +141,46 @@ def test_latest_expected_session_uses_completed_a_share_exchange_sessions(
     as_of: str, expected_session: date
 ):
     assert latest_expected_session(datetime.fromisoformat(as_of)) == expected_session
+
+
+@pytest.mark.parametrize(
+    ("closed_session", "reopen_session"),
+    [
+        (date(2025, 5, 5), date(2025, 5, 6)),
+        (date(2026, 2, 23), date(2026, 2, 24)),
+        (date(2026, 5, 4), date(2026, 5, 6)),
+        (date(2026, 5, 5), date(2026, 5, 6)),
+    ],
+)
+def test_a_share_calendar_includes_official_omitted_holiday_closures(
+    closed_session: date, reopen_session: date
+):
+    assert is_trading_session(closed_session) is False
+    assert is_trading_session(reopen_session) is True
+    assert latest_expected_session(
+        datetime.combine(reopen_session, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
+        .replace(hour=22, minute=30)
+    ) == reopen_session
+
+
+def test_a_share_calendar_fails_closed_for_unsupported_future_range():
+    unsupported = datetime(2027, 1, 4, 22, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    with pytest.raises(ValueError, match="unsupported A-share trading calendar range"):
+        latest_expected_session(unsupported)
+    assert is_trading_session(unsupported.date()) is False
+
+
+def test_quality_gate_blocks_unsupported_calendar_range(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    unsupported = datetime(2027, 1, 4, 22, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    result = evaluate_run_quality(connection, request(as_of=unsupported))
+
+    assert result.status == "blocked"
+    calendar = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert calendar.blocking_failure
+    assert calendar.details == "trading calendar coverage is unsupported for this run"
 
 
 def test_complete_quality_gate_passes_and_persists_all_required_checks(tmp_path: Path):
