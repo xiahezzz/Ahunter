@@ -205,3 +205,93 @@ A direct read-only inspection also confirmed that the pinned connection sees an 
 ### Concerns
 
 None. No collector implementation, RID values, Chrome session, market provider/backfill, reporting implementation, frontend, broker, or order behavior was changed or invoked.
+
+## Second Reviewer Fix: MX Safety Gap Closure
+
+### Status
+
+DONE
+
+Implementation commit: `a6976c6d122d7722facb3f2920453cfc241538e7`
+
+Required commit subject: `fix: close mx safety gaps`
+
+### Fix Summary
+
+- Centralized sensitive-text redaction for snapshot DTOs, persistence references, and failure reports, including full Authorization/Cookie values, Basic/Bearer credentials, JWT-like values, and token/session/debug assignments.
+- Rejected unsafe opaque collector IDs at adapter and persistence boundaries and replaced invalid DTO IDs with a redacted sentinel.
+- Required normalized relative media paths under `data/events/media`, with independent persistence validation against URLs, absolute paths, traversal, control characters, secret assignments, and oversized values.
+- Moved descriptor pin artifacts to owner-private temporary scratch outside the collector directory while retaining same-filesystem hard links, SQLite `mode=ro`, `query_only`, and WAL sidecar visibility.
+- Added authoritative `historical_market_fetch` calendar proof to successful production backfill attempts and bound quality-gate proof to candidate code, selected source, and that source's latest persisted session. Missing, stale, invalid, conflicting, and unrelated claims now fail closed or are ignored as appropriate.
+
+### RED Evidence
+
+The initial focused reviewer regressions produced:
+
+```text
+9 failed, 3 passed, 130 deselected in 0.65s
+```
+
+Failures covered URL and absolute media paths, unsafe source IDs, forged DTO secret exposure, writes required in a read-only collector directory, forged source-ID persistence, unrelated calendar proof acceptance, conflicting calendar claims, and missing production calendar metadata. The existing traversal and bounded failure-report cases already passed.
+
+Self-review then added two further RED cycles:
+
+```text
+test_authoritative_proof_for_unrelated_code_is_ignored
+1 failed in 0.15s
+
+test_persistence_rejects_forged_unsafe_media_path
+3 failed in 0.12s
+```
+
+These exposed unrelated production proof rows incorrectly blocking a candidate and forged media DTOs bypassing persistence validation.
+
+### GREEN Evidence
+
+The initial focused regressions after implementation:
+
+```text
+12 passed, 130 deselected in 0.42s
+```
+
+The two self-review regressions after correction:
+
+```text
+1 passed in 0.09s
+4 passed in 0.05s
+```
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+146 passed in 2.07s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+266 passed in 4.12s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 521.531375
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+### Concerns
+
+None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
