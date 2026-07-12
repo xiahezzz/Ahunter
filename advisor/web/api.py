@@ -525,7 +525,7 @@ async def _ledger_request_payload(request: Request) -> object:
         body.extend(chunk)
     try:
         return json.loads(bytes(body))
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
         raise HTTPException(status_code=422, detail="invalid ledger request body") from None
 
 

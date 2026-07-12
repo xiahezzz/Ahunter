@@ -97,23 +97,32 @@ def load_ledger_csv(path: Path) -> list[LedgerTransaction]:
 
 
 def import_ledger_csv(
-    csv_path: Path,
     db_path: Path,
+    csv_path: Path,
     *,
     account_id: str = "default",
     account_name: str | None = None,
     source: str = "csv",
     as_of: datetime | None = None,
 ) -> LedgerImportResult:
-    transactions = load_ledger_csv(Path(csv_path))
+    active_db_path, active_csv_path = _resolve_import_ledger_csv_paths(db_path, csv_path)
+    transactions = load_ledger_csv(active_csv_path)
     return import_ledger_transactions(
         transactions,
-        Path(db_path),
+        active_db_path,
         account_id=account_id,
         account_name=account_name,
         source=source,
         as_of=as_of,
     )
+
+
+def _resolve_import_ledger_csv_paths(db_path: Path, csv_path: Path) -> tuple[Path, Path]:
+    active_db_path = Path(db_path)
+    active_csv_path = Path(csv_path)
+    if active_db_path.suffix.lower() == ".csv" and active_csv_path.suffix.lower() != ".csv":
+        return active_csv_path, active_db_path
+    return active_db_path, active_csv_path
 
 
 def import_ledger_transactions(
@@ -623,8 +632,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             db_path = resolve_state_db(load_advisor_config(config_path), root)
         result = import_ledger_csv(
-            args.csv_path,
             db_path,
+            args.csv_path,
             account_id=args.account_id,
             account_name=args.account_name,
             source=args.source,

@@ -1220,6 +1220,38 @@ def test_ledger_rejects_huge_json_integer_without_overflow(tmp_path):
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("path", ["/api/ledger/transactions", "/api/ledger/import"])
+def test_ledger_routes_map_json_value_errors_before_database_write(tmp_path, path):
+    db_path = tmp_path / "advisor.sqlite"
+    body = '{"amount":' + "9" * 5000 + "}"
+
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        path,
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid ledger request body"
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("path", ["/api/ledger/transactions", "/api/ledger/import"])
+def test_ledger_routes_map_json_recursion_errors_before_database_write(tmp_path, path):
+    db_path = tmp_path / "advisor.sqlite"
+    body = "[" * 2000 + "]" * 2000
+
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        path,
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid ledger request body"
+    assert not db_path.exists()
+
+
 def test_ledger_import_is_atomic_for_bounded_validated_json_lists(tmp_path):
     client = TestClient(create_app(tmp_path))
     transactions = [

@@ -129,6 +129,27 @@ def test_import_ledger_csv_persists_account_transactions_positions_and_snapshot(
     }
 
 
+def test_import_ledger_csv_plan_contract_accepts_db_path_then_csv_path(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = write_ledger(
+        tmp_path / "ledger.csv",
+        ["deposit,2026-07-09,cash_deposit,,0,0,20000,0"],
+    )
+
+    result = import_ledger_csv(
+        db_path,
+        csv_path,
+        account_id="plan-contract",
+        as_of=AS_OF,
+    )
+
+    assert result.account_id == "plan-contract"
+    assert result.imported_count == 1
+    assert query_all(
+        db_path, "SELECT transaction_id, account_id FROM ledger_transactions"
+    ) == [("deposit", "plan-contract")]
+
+
 def test_invalid_import_rolls_back_every_ledger_row(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
     migrate_database(db_path)
