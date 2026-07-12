@@ -166,9 +166,7 @@ def seed_premarket_report(
                 item.rationale, json.dumps(item.evidence_ids), AS_OF.isoformat(),
             ),
         )
-    connection.commit()
-    connection.close()
-    write_premarket_report(
+    report_paths = write_premarket_report(
         "2026-07-12",
         advice,
         paths["output_dir"],
@@ -177,6 +175,16 @@ def seed_premarket_report(
         rerun_reason=None if report_run_id == "initial" else "updated candidates",
         supersedes=supersedes,
     )
+    connection.execute(
+        "INSERT INTO report_archive (report_id, run_id, report_type, report_date, "
+        "markdown_path, json_path, created_at) VALUES (?, ?, 'premarket', ?, ?, ?, ?)",
+        (
+            f"report-{database_run_id}", database_run_id, "2026-07-12",
+            str(report_paths.markdown_path), str(report_paths.json_path), AS_OF.isoformat(),
+        ),
+    )
+    connection.commit()
+    connection.close()
 
 
 def test_premarket_happy_path_persists_complete_projection(tmp_path: Path):
@@ -337,6 +345,63 @@ def test_review_uses_exact_selected_premarket_archive(tmp_path: Path):
 
     assert result.status == "passed"
     assert query_all(paths["db_path"], "SELECT advice_id FROM reviews") == [("initial-advice",)]
+
+
+def test_review_rejects_selected_premarket_archive_without_archive_row(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    advice = AdviceItem("initial-advice", CODE, "watch", 0.5, "initial", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[advice]
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute("DELETE FROM report_archive WHERE run_id = 'morning-initial'")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ValueError, match="premarket archive not found"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE,),
+            quality_evaluator=passed_quality, **paths,
+        )
+
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
+
+
+def test_review_rejects_archive_with_advice_from_multiple_premarket_runs(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    advice = [
+        AdviceItem("advice-1", CODE, "watch", 0.5, "first", []),
+        AdviceItem("advice-2", "000001", "watch", 0.5, "second", []),
+    ]
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=advice
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at, finished_at) "
+        "VALUES ('morning-other', 'premarket', ?, 'passed', ?, ?)",
+        (AS_OF.isoformat(), AS_OF.isoformat(), AS_OF.isoformat()),
+    )
+    connection.execute(
+        "UPDATE advice SET run_id = 'morning-other' WHERE advice_id = 'advice-2'"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ValueError, match="morning advice does not match premarket archive"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE, "000001"),
+            quality_evaluator=passed_quality, **paths,
+        )
+
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
 
 
 def test_review_rolls_back_rows_when_selected_archive_linkage_fails(tmp_path: Path):

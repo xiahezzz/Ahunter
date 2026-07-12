@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -647,11 +648,37 @@ def _load_morning_advice(
     premarket_run_id: str,
 ) -> list[AdviceItem]:
     try:
-        payload = read_verified_archive(
+        archive = read_verified_archive(
             output_dir, report_date, "premarket", premarket_run_id
-        )["json"]
+        )
     except ValueError as error:
         raise ValueError("premarket archive not found") from error
+    suffix = "" if premarket_run_id == "initial" else f".{premarket_run_id}"
+    archive_directory = Path(os.path.abspath(output_dir)) / report_date
+    expected_markdown = archive_directory / f"premarket{suffix}.md"
+    expected_json = archive_directory / f"premarket{suffix}.json"
+    archive_rows = connection.execute(
+        """
+        SELECT report_archive.run_id, report_archive.markdown_path,
+               report_archive.json_path
+        FROM report_archive
+        JOIN advisor_runs ON advisor_runs.run_id = report_archive.run_id
+        WHERE report_archive.report_type = 'premarket'
+          AND report_archive.report_date = ?
+          AND advisor_runs.run_type = 'premarket'
+          AND advisor_runs.status = 'passed'
+        """,
+        (report_date,),
+    ).fetchall()
+    linked_rows = [
+        row for row in archive_rows
+        if _normalized_absolute_path(row[1]) == expected_markdown
+        and _normalized_absolute_path(row[2]) == expected_json
+    ]
+    if len(linked_rows) != 1:
+        raise ValueError("premarket archive not found")
+    database_run_id = linked_rows[0][0]
+    payload = archive["json"]
     archived_advice = payload.get("advice") if isinstance(payload, dict) else None
     archived_ids = payload.get("advice_ids") if isinstance(payload, dict) else None
     if not isinstance(archived_advice, list) or not isinstance(archived_ids, list):
@@ -670,11 +697,10 @@ def _load_morning_advice(
                 """
                 SELECT advice.advice_id, advice.code, advice.action, advice.confidence,
                        advice.rationale, advice.evidence_ids_json
-                FROM advice JOIN advisor_runs ON advisor_runs.run_id = advice.run_id
-                WHERE advice.advice_id = ? AND advisor_runs.run_type = 'premarket'
-                  AND advisor_runs.status = 'passed' AND date(advisor_runs.as_of) = ?
+                FROM advice
+                WHERE advice.advice_id = ? AND advice.run_id = ?
                 """,
-                (item.advice_id, report_date),
+                (item.advice_id, database_run_id),
             ).fetchone()
             if row is None:
                 raise ValueError
@@ -689,6 +715,12 @@ def _load_morning_advice(
     if archived_ids != [item.advice_id for item in items]:
         raise ValueError("morning advice does not match premarket archive")
     return items
+
+
+def _normalized_absolute_path(value: object) -> Path | None:
+    if not isinstance(value, (str, os.PathLike)):
+        return None
+    return Path(os.path.abspath(value))
 
 
 def _evaluate_review_item(
