@@ -216,3 +216,97 @@ No live smoke test, browser screenshot QA, MX page operation, collector start, R
 ### Concerns
 
 Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched and are not included in either boundedness commit.
+
+## Task 17 Review Fixes
+
+Implementation commit: `6c89a95`
+
+Required commit subject: `fix: persist ledger review projections`
+
+### Summary
+
+- Split review snapshot materialization so historical snapshots use the review `as_of`, while current `positions` are refreshed from full ledger history and do not regress after later trades.
+- Added durable `advice_trade_matches` projection rows linking same-day ledger transactions to advice by code/date/run, without broker or order capability.
+- Added raw request byte caps before JSON decoding for `/api/ledger/transactions` and `/api/ledger/import`, while preserving parsed-shape bounds.
+- Removed the unused duplicate API candidate replay validator.
+
+### TDD Evidence
+
+Initial regression RED:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_historical_review_snapshot_does_not_regress_current_positions tests/advisor/test_coordinator.py::test_review_versions_snapshots_for_every_active_ledger_account tests/advisor/test_web_api.py::test_ledger_transaction_rejects_oversized_raw_body_before_json_decode tests/advisor/test_web_api.py::test_ledger_import_rejects_oversized_raw_body_before_json_decode -q
+FFFF                                                                     [100%]
+4 failed in 1.69s
+```
+
+Focused regression GREEN:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_historical_review_snapshot_does_not_regress_current_positions tests/advisor/test_coordinator.py::test_review_versions_snapshots_for_every_active_ledger_account tests/advisor/test_web_api.py::test_ledger_transaction_rejects_oversized_raw_body_before_json_decode tests/advisor/test_web_api.py::test_ledger_import_rejects_oversized_raw_body_before_json_decode -q
+....                                                                     [100%]
+4 passed in 1.48s
+```
+
+### Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 40%]
+........................................................................ [ 80%]
+..................................                                       [100%]
+178 passed in 5.73s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 16%]
+........................................................................ [ 32%]
+........................................................................ [ 49%]
+........................................................................ [ 65%]
+........................................................................ [ 82%]
+........................................................................ [ 98%]
+......                                                                   [100%]
+438 passed in 7.83s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 508.506
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
+### Changed Files
+
+- `advisor/db/schema.sql`
+- `advisor/ledger/importer.py`
+- `advisor/coordinator.py`
+- `advisor/web/api.py`
+- `tests/advisor/test_ledger.py`
+- `tests/advisor/test_coordinator.py`
+- `tests/advisor/test_web_api.py`
+- `.superpowers/sdd/task-17-report.md`
+
+### Concerns
+
+Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched and are not included in the review-fix commits.
