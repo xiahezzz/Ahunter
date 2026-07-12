@@ -30,7 +30,7 @@ from advisor.db.migrate import migrate_database
 from advisor.db.repository import connect
 from advisor.evidence.mx_adapter import CollectorSnapshot
 from advisor.evidence.service import EvidenceRecord, persist_evidence
-from advisor.ledger.importer import ledger_exposure_by_code
+from advisor.ledger.importer import ledger_exposure_by_code, materialize_ledger_snapshots
 from advisor.paths import repo_root
 from advisor.profiles.service import StockProfile, render_profile_markdown, upsert_profile
 from advisor.quality import (
@@ -232,6 +232,9 @@ def run_review(
             return _blocked_result(
                 connection, active_run_id, "review", report_day, output_dir, [failure], as_of
             )
+        ledger_impact = _review_ledger_context(
+            connection, morning, report_day, as_of
+        )
         reviews = [
             _evaluate_review_item(connection, active_run_id, report_day, as_of, item)
             for item in morning
@@ -251,6 +254,7 @@ def run_review(
                 "stock_profile_updates": [item.review_text for item in reviews],
                 "next_day_carryover": [f"{item.code}: reassess" for item in morning],
                 "market_outcome": warnings,
+                "ledger_impact": ledger_impact,
             },
             run_id=report_run_id,
             rerun_reason=rerun_reason,
@@ -902,6 +906,72 @@ def _evaluate_review_item(
         outcome,
         review_text,
     )
+
+
+def _review_ledger_context(
+    connection: sqlite3.Connection,
+    advice_items: Sequence[AdviceItem],
+    report_date: str,
+    as_of: datetime,
+) -> list[str]:
+    codes = tuple(dict.fromkeys(item.code for item in advice_items))
+    placeholders = ",".join("?" for _ in codes)
+    account_rows = connection.execute(
+        f"""
+        SELECT DISTINCT account_id FROM ledger_transactions
+        WHERE code IN ({placeholders})
+          AND date(trade_date) <= date(?)
+          AND julianday(created_at) <= julianday(?)
+        ORDER BY account_id
+        """,
+        (*codes, report_date, as_of.isoformat()),
+    ).fetchall()
+    account_ids = tuple(row[0] for row in account_rows)
+    snapshots = materialize_ledger_snapshots(
+        connection, account_ids, as_of=as_of
+    )
+    transaction_rows = connection.execute(
+        f"""
+        SELECT account_id, code, transaction_id, transaction_type
+        FROM ledger_transactions
+        WHERE code IN ({placeholders})
+          AND date(trade_date) = date(?)
+          AND julianday(created_at) <= julianday(?)
+        ORDER BY account_id, code, transaction_id
+        """,
+        (*codes, report_date, as_of.isoformat()),
+    ).fetchall()
+    context: list[str] = []
+    for advice in advice_items:
+        for account_id in account_ids:
+            matched = [
+                {
+                    "transaction_id": row[2],
+                    "transaction_type": row[3],
+                }
+                for row in transaction_rows
+                if row[0] == account_id and row[1] == advice.code
+            ]
+            snapshot = snapshots[account_id]
+            context.append(
+                json.dumps(
+                    {
+                        "account_id": account_id,
+                        "advice_id": advice.advice_id,
+                        "cash": snapshot["cash"],
+                        "exposure": snapshot["exposure"],
+                        "market_value": snapshot["market_value"],
+                        "realized_pnl": snapshot["realized_pnl"],
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "transactions": matched,
+                        "unrealized_pnl": snapshot["unrealized_pnl"],
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+    return context
 
 
 def _review_quality_checks(checks: tuple[QualityResult, ...]) -> tuple[QualityResult, ...]:

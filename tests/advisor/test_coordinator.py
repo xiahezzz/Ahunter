@@ -480,6 +480,57 @@ def test_review_links_morning_advice_and_persists_review(tmp_path: Path):
     assert query_all(paths["db_path"], "SELECT COUNT(*) FROM stock_profile_history")[0][0] >= 2
 
 
+def test_review_creates_snapshot_and_links_advice_to_same_day_transactions(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    morning = run_premarket(
+        collector_snapshot=collector(), analyst_runner=PassingRunner(), as_of=AS_OF,
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, evidence_persister=persist_fixture_evidence,
+        **paths,
+    )
+    advice_id = query_all(paths["db_path"], "SELECT advice_id FROM advice")[0][0]
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('review-account', 'Review', ?)",
+        (AS_OF.isoformat(),),
+    )
+    connection.executemany(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees, source, created_at) "
+        "VALUES (?, 'review-account', ?, ?, ?, ?, ?, ?, 0, 'fixture', ?)",
+        [
+            ("review-deposit", "2026-07-11", "cash_deposit", None, 0, 0, 20000, AS_OF.isoformat()),
+            ("review-buy", "2026-07-12", "buy", CODE, 100, 11.5, -1150, AS_OF.isoformat()),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    result = run_review(
+        collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, **paths,
+    )
+
+    assert morning.status == result.status == "passed"
+    snapshots = query_all(
+        paths["db_path"],
+        "SELECT snapshot_id, account_id, cash, market_value, realized_pnl, unrealized_pnl, exposure_json FROM portfolio_snapshots",
+    )
+    assert len(snapshots) == 1
+    assert snapshots[0][1:6] == ("review-account", 18850.0, 1150.0, 0.0, 0.0)
+    context = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))["context"]
+    impact = json.loads(context["ledger_impact"][0])
+    assert impact["advice_id"] == advice_id
+    assert impact["snapshot_id"] == snapshots[0][0]
+    assert impact["transactions"] == [
+        {"transaction_id": "review-buy", "transaction_type": "buy"}
+    ]
+    assert impact["exposure"][CODE]["quantity"] == 100
+
+
 @pytest.mark.parametrize("module", [premarket_reporting, review_reporting])
 def test_declared_report_cli_entrypoint_has_minimal_argparse_path(module):
     assert hasattr(module, "main")
@@ -949,7 +1000,7 @@ def test_review_outcome_uses_decline_and_same_day_ledger_activity(tmp_path: Path
     connection.execute(
         "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, "
         "transaction_type, code, quantity, price, amount, fees, source, created_at) "
-        "VALUES ('t1', 'a1', '2026-07-12', 'buy', ?, 1, 9, 9, 0, 'fixture', ?)",
+        "VALUES ('t1', 'a1', '2026-07-12', 'buy', ?, 1, 9, -9, 0, 'fixture', ?)",
         (CODE, AS_OF.isoformat()),
     )
     connection.commit()
@@ -993,8 +1044,11 @@ def test_review_treats_decline_as_favorable_for_reduce_and_lists_ledger_types(tm
     connection.executemany(
         "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, "
         "transaction_type, code, quantity, price, amount, fees, source, created_at) "
-        "VALUES (?, 'a1', '2026-07-12', ?, ?, 1, 9, 9, 0, 'fixture', ?)",
-        [("t1", "sell", CODE, AS_OF.isoformat()), ("t2", "fee", CODE, AS_OF.isoformat())],
+        "VALUES (?, 'a1', '2026-07-12', ?, ?, 100, 9, ?, 0, 'fixture', ?)",
+        [
+            ("t1", "buy", CODE, -900, AS_OF.isoformat()),
+            ("t2", "sell", CODE, 900, AS_OF.isoformat()),
+        ],
     )
     connection.commit()
     connection.close()
@@ -1008,7 +1062,7 @@ def test_review_treats_decline_as_favorable_for_reduce_and_lists_ledger_types(tm
     review = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))["reviews"][0]
     assert review["outcome"] == "followed_strength"
     assert "2 ledger transactions" in review["review_text"]
-    assert "fee=1" in review["review_text"]
+    assert "buy=1" in review["review_text"]
     assert "sell=1" in review["review_text"]
 
 

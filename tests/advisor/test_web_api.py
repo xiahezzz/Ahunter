@@ -1303,6 +1303,97 @@ def test_ledger_capacity_crossing_rejects_before_commit(tmp_path, monkeypatch):
     assert count == 1
 
 
+def test_api_import_materializes_positions_snapshot_and_profile_exposure(tmp_path):
+    from advisor.ledger.importer import ledger_exposure_by_code
+
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    client = TestClient(create_app(tmp_path, db_path=db_path))
+    transactions = [
+        {"transaction_id": "deposit", "account_id": "api", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 20000, "fees": 0},
+        {"transaction_id": "buy", "account_id": "api", "trade_date": "2026-07-10", "transaction_type": "buy", "code": "600519", "quantity": 100, "price": 100, "amount": -10000, "fees": 0},
+    ]
+
+    response = client.post("/api/ledger/import", json=transactions)
+
+    assert response.status_code == 201
+    connection = sqlite3.connect(db_path)
+    assert connection.execute(
+        "SELECT account_id, code, quantity, cost_basis FROM positions"
+    ).fetchall() == [("api", "600519", 100, 10000.0)]
+    snapshot = connection.execute(
+        "SELECT cash, exposure_json FROM portfolio_snapshots WHERE account_id = 'api'"
+    ).fetchone()
+    assert snapshot[0] == 10000.0
+    assert json.loads(snapshot[1])["positions"]["600519"]["quantity"] == 100
+    connection.row_factory = sqlite3.Row
+    assert ledger_exposure_by_code(connection, ("600519",))["600519"]["quantity"] == 100
+    connection.close()
+
+
+def test_api_import_materializes_multiple_accounts_atomically(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    client = TestClient(create_app(tmp_path, db_path=db_path))
+
+    response = client.post("/api/ledger/import", json=[
+        {"transaction_id": "deposit-a", "account_id": "a", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 2000, "fees": 0},
+        {"transaction_id": "buy-a", "account_id": "a", "trade_date": "2026-07-10", "transaction_type": "buy", "code": "600519", "quantity": 100, "price": 10, "amount": -1000, "fees": 0},
+        {"transaction_id": "deposit-b", "account_id": "b", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 3000, "fees": 0},
+        {"transaction_id": "buy-b", "account_id": "b", "trade_date": "2026-07-10", "transaction_type": "buy", "code": "000001", "quantity": 100, "price": 20, "amount": -2000, "fees": 0},
+    ])
+
+    assert response.status_code == 201
+    connection = sqlite3.connect(db_path)
+    assert connection.execute(
+        "SELECT account_id, code, quantity FROM positions ORDER BY account_id"
+    ).fetchall() == [("a", "600519", 100), ("b", "000001", 100)]
+    assert connection.execute(
+        "SELECT account_id, cash FROM portfolio_snapshots ORDER BY account_id"
+    ).fetchall() == [("a", 1000.0), ("b", 1000.0)]
+    connection.close()
+
+
+def test_api_and_cli_imports_materialize_equivalent_account_state(tmp_path):
+    from advisor.ledger.importer import import_ledger_csv
+
+    cli_db = tmp_path / "cli.sqlite"
+    api_db = tmp_path / "api.sqlite"
+    csv_path = tmp_path / "ledger.csv"
+    csv_path.write_text(
+        "transaction_id,trade_date,transaction_type,code,quantity,price,amount,fees\n"
+        "deposit,2026-07-10,cash_deposit,,0,0,20000,0\n"
+        "buy,2026-07-10,buy,600519,100,100,-10000,0\n",
+        encoding="utf-8",
+    )
+    as_of = datetime(2026, 7, 12, 8, 30, tzinfo=web_api._SHANGHAI)
+    import_ledger_csv(csv_path, cli_db, account_id="same", source="import", as_of=as_of)
+    monkeypatch_time = pytest.MonkeyPatch()
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return as_of
+    monkeypatch_time.setattr(web_api, "datetime", FixedDatetime)
+    try:
+        response = TestClient(create_app(tmp_path, db_path=api_db)).post("/api/ledger/import", json=[
+            {"transaction_id": "deposit", "account_id": "same", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 20000, "fees": 0},
+            {"transaction_id": "buy", "account_id": "same", "trade_date": "2026-07-10", "transaction_type": "buy", "code": "600519", "quantity": 100, "price": 100, "amount": -10000, "fees": 0},
+        ])
+    finally:
+        monkeypatch_time.undo()
+
+    assert response.status_code == 201
+    def state(db):
+        connection = sqlite3.connect(db)
+        try:
+            return (
+                connection.execute("SELECT account_id, code, quantity, cost_basis FROM positions").fetchall(),
+                connection.execute("SELECT account_id, as_of, cash, market_value, realized_pnl, unrealized_pnl, exposure_json FROM portfolio_snapshots").fetchall(),
+            )
+        finally:
+            connection.close()
+    assert state(api_db) == state(cli_db)
+
+
 def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)

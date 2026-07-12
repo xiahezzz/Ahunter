@@ -20,6 +20,11 @@ from fastapi.responses import StreamingResponse
 
 from advisor import paths as advisor_paths
 from advisor.db.migrate import migrate_database
+from advisor.ledger.importer import (
+    LedgerCapacityError,
+    LedgerConflictError,
+    import_ledger_entries,
+)
 from advisor.ledger.model import LedgerTransaction, apply_transactions
 from advisor.reporting.contracts import (
     StaleArchiveCursorError,
@@ -37,9 +42,9 @@ _ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _TRANSACTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _CHART_TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-_MAX_IMPORT_TRANSACTIONS = 500
 _LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
 _MAX_LEDGER_REPLAY_ROWS = 10_000
+_MAX_IMPORT_TRANSACTIONS = _MAX_LEDGER_REPLAY_ROWS
 _MAX_CHART_BYTES = 5 * 1024 * 1024
 _MAX_CURRENT_RUN_CANDIDATES = 100
 _MAX_CURRENT_QUALITY_CHECKS = 100
@@ -502,54 +507,28 @@ def _write_ledger_transactions(
 ) -> dict:
     if not transactions:
         raise _LedgerValidationError("transactions are required")
-    transaction_ids = [transaction.transaction_id for _, transaction in transactions]
-    if len(set(transaction_ids)) != len(transaction_ids):
-        raise _LedgerValidationError("duplicate transaction id")
     try:
-        migrate_database(db_path)
+        imports = import_ledger_entries(
+            transactions,
+            db_path,
+            source=source,
+            as_of=datetime.now(_SHANGHAI),
+            max_rows=_MAX_LEDGER_REPLAY_ROWS,
+        )
+    except LedgerCapacityError as error:
+        raise _LedgerCapacityError(str(error)) from error
+    except LedgerConflictError as error:
+        raise _LedgerConflictError(str(error)) from error
+    except ValueError as error:
+        raise _LedgerValidationError(str(error)) from error
+    try:
         connection = sqlite3.connect(db_path, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("BEGIN IMMEDIATE")
     except sqlite3.Error as error:
         raise _LedgerConflictError("ledger unavailable") from error
     try:
-        existing_rows = _read_capped_ledger_history(connection)
-        if len(existing_rows) + len(transactions) > _MAX_LEDGER_REPLAY_ROWS:
-            raise _LedgerCapacityError("ledger history exceeds replay limit")
-        existing_ids = {row["transaction_id"] for row in existing_rows}
-        if existing_ids.intersection(transaction_ids):
-            raise _LedgerConflictError("duplicate transaction id")
-        _validate_candidate_ledger_state(existing_rows, transactions)
-        for account_id, transaction in transactions:
-            now = datetime.now(_SHANGHAI).isoformat()
-            connection.execute(
-                "INSERT OR IGNORE INTO ledger_accounts (account_id, name, currency, created_at) VALUES (?, ?, 'CNY', ?)",
-                (account_id, account_id, now),
-            )
-            connection.execute(
-                """
-                INSERT INTO ledger_transactions (
-                  transaction_id, account_id, trade_date, transaction_type, code, quantity, price,
-                  amount, fees, source, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    transaction.transaction_id,
-                    account_id,
-                    transaction.trade_date,
-                    transaction.transaction_type,
-                    transaction.code,
-                    transaction.quantity,
-                    transaction.price,
-                    transaction.amount,
-                    transaction.fees,
-                    source,
-                    now,
-                ),
-            )
-        connection.commit()
         rows = [
             {
                 "transaction_id": transaction.transaction_id,
@@ -567,16 +546,11 @@ def _write_ledger_transactions(
                 key=lambda item: (item[0], item[1].trade_date, item[1].transaction_id),
             )
         ]
-        result = {"transactions": rows, "ledger": _read_ledger_state(connection)}
-    except _LedgerConflictError:
-        connection.rollback()
-        raise
-    except _LedgerCapacityError:
-        connection.rollback()
-        raise
-    except (sqlite3.Error, ValueError) as error:
-        connection.rollback()
-        raise _LedgerValidationError("invalid transaction") from error
+        result = {
+            "transactions": rows,
+            "ledger": _read_ledger_state(connection),
+            "quality_flags": [flag for item in imports for flag in item.quality_flags],
+        }
     finally:
         connection.close()
     return result
