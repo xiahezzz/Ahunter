@@ -32,6 +32,7 @@ _A_SHARE_HOLIDAYS = frozenset(
         dt.date(2025, 10, 7),
         dt.date(2025, 10, 8),
         dt.date(2026, 1, 1),
+        dt.date(2026, 1, 2),
         dt.date(2026, 2, 16),
         dt.date(2026, 2, 17),
         dt.date(2026, 2, 18),

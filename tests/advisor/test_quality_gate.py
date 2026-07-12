@@ -134,7 +134,7 @@ def request(**changes) -> QualityRequest:
         ("2026-07-13T22:30:00+08:00", date(2026, 7, 13)),
         ("2026-07-12T22:30:00+08:00", date(2026, 7, 10)),
         ("2026-01-01T22:30:00+08:00", date(2025, 12, 31)),
-        ("2026-01-02T22:30:00+08:00", date(2026, 1, 2)),
+        ("2026-01-02T22:30:00+08:00", date(2025, 12, 31)),
     ],
 )
 def test_latest_expected_session_uses_completed_a_share_exchange_sessions(
@@ -147,6 +147,7 @@ def test_latest_expected_session_uses_completed_a_share_exchange_sessions(
     ("closed_session", "reopen_session"),
     [
         (date(2025, 5, 5), date(2025, 5, 6)),
+        (date(2026, 1, 2), date(2026, 1, 5)),
         (date(2026, 2, 23), date(2026, 2, 24)),
         (date(2026, 5, 4), date(2026, 5, 6)),
         (date(2026, 5, 5), date(2026, 5, 6)),
