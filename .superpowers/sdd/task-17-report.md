@@ -204,6 +204,97 @@ git diff --check
 
 No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
 
+## Final Interface/Boundary Fixes
+
+### RED Evidence
+
+Plan-contract positional import order initially failed because `import_ledger_csv(db_path, csv_path, ...)` treated the database path as the CSV:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q -k 'plan_contract'
+F                                                                        [100%]
+FileNotFoundError: [Errno 2] No such file or directory: '.../advisor.sqlite'
+1 failed, 25 deselected in 0.19s
+```
+
+Ledger API bounded malformed JSON bodies initially escaped as parser exceptions instead of deterministic 4xx responses:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py -q -k 'json_value_errors or json_recursion_errors'
+FFFF                                                                     [100%]
+ValueError: Exceeds the limit (4300 digits) for integer string conversion
+RecursionError: maximum recursion depth exceeded while decoding a JSON array from a unicode string
+4 failed, 88 deselected in 1.87s
+```
+
+### GREEN Evidence
+
+Focused plan-contract import test:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q -k 'plan_contract'
+.                                                                        [100%]
+1 passed, 25 deselected in 0.31s
+```
+
+Focused malformed JSON decode tests:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py -q -k 'json_value_errors or json_recursion_errors'
+....                                                                     [100%]
+4 passed, 88 deselected in 0.36s
+```
+
+Ledger and web coverage:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py -q
+........................................................................ [ 61%]
+..............................................                           [100%]
+118 passed in 2.39s
+```
+
+### Final Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 38%]
+........................................................................ [ 77%]
+...........................................                              [100%]
+187 passed in 5.58s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 16%]
+........................................................................ [ 32%]
+........................................................................ [ 48%]
+........................................................................ [ 64%]
+........................................................................ [ 80%]
+........................................................................ [ 96%]
+...............                                                          [100%]
+447 passed in 7.74s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 513.71975
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
 ### Changed Files
 
 - `advisor/ledger/model.py`
