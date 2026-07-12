@@ -1,5 +1,8 @@
 """Read-local-state FastAPI endpoints for the advisor dashboard."""
 
+import base64
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -20,8 +23,6 @@ from advisor.db.migrate import migrate_database
 from advisor.ledger.model import LedgerTransaction, apply_transactions
 from advisor.reporting.contracts import (
     StaleArchiveCursorError,
-    list_verified_archives,
-    page_verified_archives,
     read_active_verified_archive,
     read_verified_archive,
 )
@@ -81,8 +82,10 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> dict:
+        connection = _read_connection(resolved_db_path)
         try:
-            page = page_verified_archives(
+            page = _page_db_backed_archives(
+                connection,
                 advisor_paths.reports_dir(),
                 limit=limit,
                 cursor=cursor,
@@ -94,20 +97,9 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
             raise HTTPException(status_code=409, detail="report cursor stale") from None
         except ValueError:
             raise HTTPException(status_code=503, detail="report listing unavailable") from None
-        connection = _read_connection(resolved_db_path)
-        try:
-            eligible = _eligible_report_keys(
-                connection,
-                advisor_paths.reports_dir(),
-                candidate_keys={_report_key(item) for item in page["items"]},
-            )
         finally:
             if connection is not None:
                 connection.close()
-        page["items"] = [
-            item for item in page["items"]
-            if _report_key(item) in eligible
-        ]
         page["reports"] = [
             {
                 **item,
@@ -288,22 +280,28 @@ def _current_state(state_dir: Path, db_path: Path, report_cursor_secret: bytes) 
         report_start = (
             date.fromisoformat(today) - timedelta(days=_CURRENT_REPORT_LOOKBACK_DAYS)
         ).isoformat()
-        try:
-            report_candidates = list_verified_archives(
-                advisor_paths.reports_dir(), start_date=report_start, end_date=today
-            )
-        except (OSError, ValueError, RuntimeError):
-            report_candidates = []
-        eligible_reports = _eligible_report_keys(
+        report_keys = _eligible_report_keys(
             connection,
             advisor_paths.reports_dir(),
-            candidate_keys={_report_key(item) for item in report_candidates},
+            start_date=report_start,
+            end_date=today,
         )
+        try:
+            eligible_reports = {
+                _report_key(item)
+                for item in _read_verified_report_items(advisor_paths.reports_dir(), report_keys)
+            }
+            report_verification_failed = False
+        except (OSError, ValueError, RuntimeError):
+            eligible_reports = set()
+            report_verification_failed = True
     finally:
         if connection is not None:
             connection.close()
 
     reports, report_list = _read_report_links(today, report_cursor_secret, eligible_reports)
+    if report_verification_failed:
+        reports, report_list = [], {"status": "degraded", "truncated": True}
     premarket = _read_today_report(today, "premarket", eligible_reports)
     review = _read_today_report(today, "review", eligible_reports)
     premarket_status = _report_status(premarket)
@@ -1182,14 +1180,11 @@ def _eligible_report_keys(
         filters.append("report_archive.report_date <= ?")
         parameters.append(end_date)
     bounded_filter = f" AND {' AND '.join(filters)}" if filters else ""
-    row_limit = (
-        ""
-        if candidate_keys is not None
-        else "ORDER BY report_archive.report_date DESC, "
-        "report_archive.created_at DESC LIMIT ?"
+    row_order = (
+        "ORDER BY report_archive.report_date DESC, report_archive.created_at DESC"
+        if candidate_keys is None
+        else ""
     )
-    if candidate_keys is None:
-        parameters.append(_MAX_REPORT_ARCHIVE_ROWS)
     try:
         rows = connection.execute(
             f"""
@@ -1202,7 +1197,7 @@ def _eligible_report_keys(
                OR (report_archive.report_type = 'failure'
                    AND advisor_runs.status = 'blocked'))
               {bounded_filter}
-            {row_limit}
+            {row_order}
             """,
             parameters,
         )
@@ -1263,21 +1258,146 @@ def _report_key(report: dict) -> tuple[str, str, str]:
     return report["report_date"], report["report_type"], report["run_id"]
 
 
+def _page_db_backed_archives(
+    connection: sqlite3.Connection | None,
+    reports_root: Path,
+    *,
+    limit: int,
+    cursor: str | None,
+    start_date: str | None,
+    end_date: str | None,
+    cursor_secret: bytes,
+) -> dict:
+    if not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("invalid report page limit")
+    today = _shanghai_today()
+    start = date.fromisoformat(start_date) if start_date else today - timedelta(days=365)
+    end = date.fromisoformat(end_date) if end_date else today
+    if start > end or (end - start).days > 365:
+        raise ValueError("invalid report date window")
+    requested_start = start.isoformat()
+    requested_end = end.isoformat()
+    after, expected_snapshot = _decode_report_cursor(
+        cursor, cursor_secret, requested_start, requested_end
+    ) if cursor else (None, None)
+    eligible = _eligible_report_keys(
+        connection,
+        reports_root,
+        start_date=requested_start,
+        end_date=requested_end,
+    )
+    items = _read_verified_report_items(reports_root, eligible)
+    snapshot_digest = hashlib.sha256(
+        json.dumps(items, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if expected_snapshot is not None and not hmac.compare_digest(
+        expected_snapshot, snapshot_digest
+    ):
+        raise StaleArchiveCursorError("stale report cursor")
+    available = [item for item in items if after is None or _report_key(item) < after]
+    page_items = available[:limit]
+    truncated = len(available) > limit
+    next_cursor = (
+        _encode_report_cursor(
+            page_items[-1], cursor_secret, requested_start, requested_end, snapshot_digest
+        )
+        if truncated
+        else None
+    )
+    return {
+        "items": page_items,
+        "next_cursor": next_cursor,
+        "truncated": truncated,
+        "requested_start_date": requested_start,
+        "requested_end_date": requested_end,
+        "verified_candidate_count": len(items),
+    }
+
+
+def _read_verified_report_items(
+    reports_root: Path,
+    eligible: set[tuple[str, str, str]],
+) -> list[dict]:
+    items = []
+    for report_date, report_type, run_id in eligible:
+        if report_type not in {"premarket", "review"}:
+            continue
+        try:
+            archive = read_verified_archive(reports_root, report_date, report_type, run_id)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        items.append(
+            {
+                "report_date": report_date,
+                "report_type": report_type,
+                "run_id": run_id,
+                "quality_status": archive["json"].get("quality_status", "unknown"),
+            }
+        )
+    return sorted(items, key=_report_key, reverse=True)
+
+
+def _encode_report_cursor(
+    item: dict,
+    secret: bytes,
+    start_date: str,
+    end_date: str,
+    snapshot_digest: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "v": 1,
+            "s": start_date,
+            "e": end_date,
+            "k": list(_report_key(item)),
+            "g": snapshot_digest,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.digest(secret, payload, "sha256")
+    return base64.urlsafe_b64encode(payload + signature).decode("ascii").rstrip("=")
+
+
+def _decode_report_cursor(
+    cursor: str,
+    secret: bytes,
+    start_date: str,
+    end_date: str,
+) -> tuple[tuple[str, str, str], str]:
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
+        raise ValueError("invalid report cursor")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload, signature = raw[:-32], raw[-32:]
+        if not hmac.compare_digest(signature, hmac.digest(secret, payload, "sha256")):
+            raise ValueError("invalid report cursor")
+        values = json.loads(payload)
+        report_date, report_type, run_id = values["k"]
+        if (
+            values.get("v") != 1
+            or values.get("s") != start_date
+            or values.get("e") != end_date
+            or report_type not in {"premarket", "review"}
+            or not isinstance(run_id, str)
+            or _report_run_id(report_type, f"{report_type}.{run_id}.json") != run_id
+            or date.fromisoformat(report_date).isoformat() != report_date
+            or not isinstance(values.get("g"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", values["g"])
+        ):
+            raise ValueError("invalid report cursor")
+        return (report_date, report_type, run_id), values["g"]
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid report cursor") from error
+
+
 def _read_report_links(
     today: str,
     cursor_secret: bytes,
     eligible: set[tuple[str, str, str]],
 ) -> tuple[list[dict], dict]:
-    end = date.fromisoformat(today)
-    start = end - timedelta(days=_CURRENT_REPORT_LOOKBACK_DAYS)
+    del today, cursor_secret
     try:
-        page = page_verified_archives(
-            advisor_paths.reports_dir(),
-            start_date=start.isoformat(),
-            end_date=end.isoformat(),
-            limit=_MAX_CURRENT_REPORT_LINKS,
-            cursor_secret=cursor_secret,
-        )
+        items = _read_verified_report_items(advisor_paths.reports_dir(), eligible)
     except (OSError, ValueError, RuntimeError):
         return [], {"status": "degraded", "truncated": True}
     links = [
@@ -1285,10 +1405,9 @@ def _read_report_links(
             **archive,
             "href": f"/api/reports/{archive['report_date']}/{archive['report_type']}?run_id={archive['run_id']}",
         }
-        for archive in page["items"]
-        if _report_key(archive) in eligible
+        for archive in items[:_MAX_CURRENT_REPORT_LINKS]
     ]
-    return links, {"status": "ok", "truncated": page["truncated"]}
+    return links, {"status": "ok", "truncated": len(items) > _MAX_CURRENT_REPORT_LINKS}
 
 
 def _read_today_report(

@@ -359,16 +359,91 @@ def test_current_state_keeps_active_chain_after_same_day_archive_capacity(tmp_pa
     assert any(report["run_id"] == "rerun1" for report in payload["reports"])
 
 
+def test_report_apis_keep_db_backed_archive_when_same_day_directory_exceeds_scan_limit(
+    tmp_path, monkeypatch
+):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    advice = [AdviceItem("advice-current", "600519", "watch", 0.7, "current", [])]
+    report_paths = write_premarket_report(
+        "2026-07-12",
+        advice,
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "current")],
+    )
+    report_directory = reports_root / "2026-07-12"
+    for index in range(168):
+        for suffix in ("md", "json", "complete.json"):
+            (report_directory / f"premarket.noise{index:03d}.{suffix}").write_text(
+                "noise", encoding="utf-8"
+            )
+
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+        "VALUES ('current-run', 'premarket', '2026-07-12T08:30:00+08:00', "
+        "'passed', '2026-07-12T08:30:00+08:00')"
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks "
+        "(check_id, run_id, check_name, severity, status, details_json, created_at) "
+        "VALUES ('current-check', 'current-run', 'market', 'blocking', 'passed', '{}', "
+        "'2026-07-12T08:31:00+08:00')"
+    )
+    insert_report_archive(
+        connection,
+        database_run_id="current-run",
+        report_type="premarket",
+        report_date="2026-07-12",
+        markdown_path=report_paths.markdown_path,
+        json_path=report_paths.json_path,
+    )
+    connection.commit()
+    connection.close()
+    client = TestClient(create_app(tmp_path))
+
+    current = client.get("/api/current-state")
+    listing = client.get("/api/reports?start_date=2026-07-12&end_date=2026-07-12")
+    detail = client.get("/api/reports/2026-07-12/premarket?run_id=initial")
+
+    assert current.status_code == 200
+    assert current.json()["advice"] == [advice[0].to_dict()]
+    assert [item["run_id"] for item in current.json()["reports"]] == ["initial"]
+    assert listing.status_code == 200
+    assert [item["run_id"] for item in listing.json()["reports"]] == ["initial"]
+    assert detail.status_code == 200
+    assert detail.json()["json"]["advice"] == [advice[0].to_dict()]
+
+
 def test_report_cursor_cannot_be_replayed_after_app_restart(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
-    for report_date in ("2026-07-10", "2026-07-11"):
-        write_premarket_report(
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    for index, report_date in enumerate(("2026-07-10", "2026-07-11")):
+        paths = write_premarket_report(
             report_date,
             [],
             reports_root,
             quality_results=[QualityResult("market_data", "blocking", True, "current")],
         )
+        run_id = f"cursor-run-{index}"
+        connection.execute(
+            "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+            "VALUES (?, 'premarket', ?, 'passed', ?)",
+            (run_id, report_date, f"{report_date}T08:30:00+08:00"),
+        )
+        insert_report_archive(
+            connection, database_run_id=run_id, report_type="premarket",
+            report_date=report_date, markdown_path=paths.markdown_path,
+            json_path=paths.json_path,
+        )
+    connection.commit()
+    connection.close()
     first = TestClient(create_app(tmp_path)).get(
         "/api/reports?start_date=2026-07-10&end_date=2026-07-11&limit=1"
     ).json()
@@ -390,23 +465,50 @@ def test_report_cursor_cannot_be_replayed_after_app_restart(tmp_path, monkeypatc
 def test_report_cursor_returns_explicit_stale_error_after_archive_addition(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
-    for report_date in ("2026-07-09", "2026-07-11"):
-        write_premarket_report(
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    for index, report_date in enumerate(("2026-07-09", "2026-07-11")):
+        paths = write_premarket_report(
             report_date,
             [],
             reports_root,
             quality_results=[QualityResult("market_data", "blocking", True, "current")],
         )
+        run_id = f"cursor-run-{index}"
+        connection.execute(
+            "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+            "VALUES (?, 'premarket', ?, 'passed', ?)",
+            (run_id, report_date, f"{report_date}T08:30:00+08:00"),
+        )
+        insert_report_archive(
+            connection, database_run_id=run_id, report_type="premarket",
+            report_date=report_date, markdown_path=paths.markdown_path,
+            json_path=paths.json_path,
+        )
+    connection.commit()
     client = TestClient(create_app(tmp_path))
     first = client.get(
         "/api/reports?start_date=2026-07-09&end_date=2026-07-11&limit=1"
     ).json()
-    write_premarket_report(
+    added_paths = write_premarket_report(
         "2026-07-10",
         [],
         reports_root,
         quality_results=[QualityResult("market_data", "blocking", True, "current")],
     )
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+        "VALUES ('cursor-added', 'premarket', '2026-07-10', 'passed', "
+        "'2026-07-10T08:30:00+08:00')"
+    )
+    insert_report_archive(
+        connection, database_run_id="cursor-added", report_type="premarket",
+        report_date="2026-07-10", markdown_path=added_paths.markdown_path,
+        json_path=added_paths.json_path,
+    )
+    connection.commit()
+    connection.close()
 
     response = client.get(
         "/api/reports",
@@ -450,22 +552,14 @@ def test_report_api_listing_contains_no_failure_links(tmp_path, monkeypatch):
     assert payload["reports"] == []
 
 
-def test_current_state_uses_bounded_report_page_and_degrades_on_overflow(tmp_path, monkeypatch):
-    calls = []
+def test_current_state_degrades_when_db_backed_archive_verification_fails(tmp_path, monkeypatch):
+    def failed_verification(*args, **kwargs):
+        raise ValueError("archive verification unavailable")
 
-    def overflowing_page(*args, **kwargs):
-        calls.append(kwargs)
-        raise ValueError("archive candidate limit exceeded")
-
-    monkeypatch.setattr(web_api, "page_verified_archives", overflowing_page)
+    monkeypatch.setattr(web_api, "_read_verified_report_items", failed_verification)
 
     payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
 
-    assert len(calls) == 1
-    assert calls[0]["limit"] <= 20
-    assert calls[0]["start_date"] is not None
-    assert calls[0]["end_date"] is not None
-    assert len(calls[0]["cursor_secret"]) >= 32
     assert payload["reports"] == []
     assert payload["report_list"] == {"status": "degraded", "truncated": True}
 

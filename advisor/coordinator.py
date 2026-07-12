@@ -205,6 +205,7 @@ def run_review(
                 connection, active_run_id, "review", report_day, output_dir, blocking, as_of
             )
 
+        connection.execute("BEGIN IMMEDIATE")
         morning = _load_morning_advice(
             connection, output_dir, report_day, premarket_run_id
         )
@@ -228,7 +229,6 @@ def run_review(
             _evaluate_review_item(connection, active_run_id, report_day, as_of, item)
             for item in morning
         ]
-        connection.execute("BEGIN IMMEDIATE")
         _persist_reviews(connection, active_run_id, as_of, reviews)
         warnings = _project_review_profiles(
             connection, db_path, chart_dir, profile_dir, report_day, as_of,

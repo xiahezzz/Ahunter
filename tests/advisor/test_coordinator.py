@@ -440,6 +440,43 @@ def test_review_rejects_archive_missing_advice_from_linked_premarket_run(tmp_pat
     assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
 
 
+def test_review_linkage_cannot_change_between_validation_and_publication(
+    tmp_path: Path, monkeypatch
+):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    advice = AdviceItem("initial-advice", CODE, "watch", 0.5, "initial", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[advice]
+    )
+    real_load = coordinator_module._load_morning_advice
+
+    def load_then_mutate_linkage(connection, *args):
+        items = real_load(connection, *args)
+        racer = sqlite3.connect(paths["db_path"], timeout=0.01)
+        try:
+            racer.execute("DELETE FROM report_archive WHERE run_id = 'morning-initial'")
+            racer.commit()
+        finally:
+            racer.close()
+        return items
+
+    monkeypatch.setattr(coordinator_module, "_load_morning_advice", load_then_mutate_linkage)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE,),
+            quality_evaluator=passed_quality, **paths,
+        )
+
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
+    assert query_all(
+        paths["db_path"], "SELECT COUNT(*) FROM report_archive WHERE run_id = 'morning-initial'"
+    ) == [(1,)]
+
+
 def test_review_rolls_back_rows_when_selected_archive_linkage_fails(tmp_path: Path):
     paths = coordinator_paths(tmp_path)
     from advisor.db.migrate import migrate_database
