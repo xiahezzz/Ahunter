@@ -10,6 +10,7 @@ from advisor.db.migrate import migrate_database
 from advisor.ledger import importer as ledger_importer
 from advisor.ledger.importer import import_ledger_csv, load_ledger_csv, main
 from advisor.ledger.model import LedgerTransaction, apply_transactions
+from advisor.ledger.store import LedgerStore
 
 
 AS_OF = datetime(2026, 7, 12, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -556,3 +557,62 @@ def test_ledger_exposure_code_filter_is_explicitly_bounded(tmp_path: Path, monke
             ledger_exposure_by_code(connection, ("600519", "000001", "300001"), as_of=AS_OF)
     finally:
         connection.close()
+
+
+def test_ledger_store_append_import_many_replay_and_snapshot_use_canonical_paths(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "advisor.sqlite"
+    seed_market_prices(db_path)
+    store = LedgerStore(db_path)
+
+    appended = store.append(
+        "facade",
+        LedgerTransaction("deposit", "2026-07-10", "cash_deposit", None, 0, 0, 20000, 0),
+        source="manual",
+        as_of=AS_OF,
+    )
+    imported = store.import_many(
+        [
+            (
+                "facade",
+                LedgerTransaction("buy", "2026-07-10", "buy", "600519", 100, 100, -10000, 0),
+            )
+        ],
+        source="import",
+        as_of=AS_OF,
+    )
+
+    replayed = store.replay()
+    snapshot = store.snapshot(("facade",), as_of=AS_OF.replace(hour=22, minute=30))
+
+    assert appended.account_id == "facade"
+    assert appended.imported_count == 1
+    assert imported[0].account_id == "facade"
+    assert replayed["facade"].cash == 10000
+    assert replayed["facade"].positions == {"600519": 100}
+    assert snapshot["facade"]["cash"] == 10000
+    assert snapshot["facade"]["market_value"] == 11000
+    assert sorted(query_all(
+        db_path,
+        "SELECT transaction_id, account_id, source FROM ledger_transactions "
+        "ORDER BY trade_date, transaction_id",
+    )) == [
+        ("buy", "facade", "import"),
+        ("deposit", "facade", "manual"),
+    ]
+
+
+def test_ledger_store_rejects_duplicate_import_atomically(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    store = LedgerStore(db_path)
+    deposit = LedgerTransaction(
+        "deposit", "2026-07-10", "cash_deposit", None, 0, 0, 20000, 0
+    )
+
+    store.append("facade", deposit, as_of=AS_OF)
+
+    with pytest.raises(ledger_importer.LedgerConflictError, match="duplicate transaction id"):
+        store.import_many([("facade", deposit)], as_of=AS_OF)
+
+    assert query_all(db_path, "SELECT COUNT(*) FROM ledger_transactions") == [(1,)]

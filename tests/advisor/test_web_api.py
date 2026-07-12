@@ -21,6 +21,47 @@ from advisor.web.api import create_app
 import advisor.web.api as web_api
 
 
+def run_streamed_request(app, path: str, chunks: list[bytes]) -> tuple[int, dict, int]:
+    messages = [
+        {"type": "http.request", "body": chunk, "more_body": index < len(chunks) - 1}
+        for index, chunk in enumerate(chunks)
+    ]
+    sent: list[dict] = []
+    receive_count = 0
+
+    async def receive():
+        nonlocal receive_count
+        receive_count += 1
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "root_path": "",
+    }
+
+    asyncio.run(app(scope, receive, send))
+    status = next(message["status"] for message in sent if message["type"] == "http.response.start")
+    body = b"".join(
+        message.get("body", b"") for message in sent if message["type"] == "http.response.body"
+    )
+    return status, json.loads(body), receive_count
+
+
 def insert_report_archive(
     connection: sqlite3.Connection,
     *,
@@ -1324,6 +1365,25 @@ def test_ledger_import_rejects_oversized_raw_body_before_json_decode(
 
     assert response.status_code == 413
     assert response.json()["detail"] == "ledger request body is too large"
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("path", ["/api/ledger/transactions", "/api/ledger/import"])
+def test_ledger_routes_reject_streamed_body_over_limit_without_content_length(
+    tmp_path, monkeypatch, path
+):
+    monkeypatch.setattr(web_api, "_MAX_LEDGER_REQUEST_BYTES", 8, raising=False)
+    db_path = tmp_path / "advisor.sqlite"
+
+    status, payload, receive_count = run_streamed_request(
+        create_app(tmp_path, db_path=db_path),
+        path,
+        [b'{"x":"123', b'456789"}'],
+    )
+
+    assert status == 413
+    assert payload["detail"] == "ledger request body is too large"
+    assert receive_count == 1
     assert not db_path.exists()
 
 

@@ -23,7 +23,6 @@ from advisor.db.migrate import migrate_database
 from advisor.ledger.importer import (
     LedgerCapacityError,
     LedgerConflictError,
-    import_ledger_entries,
 )
 from advisor.ledger.model import (
     LedgerTransaction,
@@ -31,6 +30,7 @@ from advisor.ledger.model import (
     ledger_transaction_sort_key,
     validate_ledger_transaction,
 )
+from advisor.ledger.store import LedgerStore
 from advisor.reporting.contracts import (
     StaleArchiveCursorError,
     read_active_verified_archive,
@@ -518,11 +518,13 @@ async def _ledger_request_payload(request: Request) -> object:
                 )
         except ValueError:
             raise HTTPException(status_code=422, detail="invalid ledger request body") from None
-    body = await request.body()
-    if len(body) > _MAX_LEDGER_REQUEST_BYTES:
-        raise HTTPException(status_code=413, detail="ledger request body is too large")
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _MAX_LEDGER_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="ledger request body is too large")
+        body.extend(chunk)
     try:
-        return json.loads(body)
+        return json.loads(bytes(body))
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(status_code=422, detail="invalid ledger request body") from None
 
@@ -562,12 +564,9 @@ def _write_ledger_transactions(
     if not transactions:
         raise _LedgerValidationError("transactions are required")
     try:
-        imports = import_ledger_entries(
-            transactions,
-            db_path,
-            source=source,
-            as_of=datetime.now(_SHANGHAI),
-            max_rows=_MAX_LEDGER_REPLAY_ROWS,
+        imports = LedgerStore(db_path).import_many(
+            transactions, source=source, as_of=datetime.now(_SHANGHAI),
+            max_rows=_MAX_LEDGER_REPLAY_ROWS
         )
     except LedgerCapacityError as error:
         raise _LedgerCapacityError(str(error)) from error
