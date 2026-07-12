@@ -1,38 +1,48 @@
-# Task 17 Report: Unified Ledger Materialization
+# Task 17 Report: Ledger Replay Parity Fix
 
 ## Status
 
 DONE
 
-Implementation commit: `5620ab058a81b0e95512e1702ad7bc216b2bf1cd`
+Implementation commit: `e7e2ea3f9717ff9dbbeb73ed6b9156b383357e5e`
 
-Required commit subject: `fix: unify ledger materialization`
+Required commit subject: `fix: harden ledger replay parity`
 
 ## Summary
 
-- Routed API manual and JSON imports plus CLI CSV imports through one bounded, atomic ledger import/replay/materialization path.
-- Replayed affected accounts canonically, replaced stale positions, and upserted stable as-of portfolio snapshots with cash, market value, realized/unrealized PnL, exposure, pricing status, and ledger quality flags.
-- Added non-blocking A-share lot-size and T+1 consistency flags without rejecting otherwise structurally valid trades.
-- Added 10,000-row import/replay caps before unbounded CSV or SQLite loading and removed the candidate-ID placeholder query.
-- Materialized relevant account snapshots inside the review transaction and published JSON ledger-impact context linking snapshot IDs, advice IDs, and same-day transaction IDs/types.
-- Preserved passive collector behavior and made no schema, RID configuration, broker/order, or frontend visual changes.
+- Added one shared deterministic replay key ordered by trade date, cash, buy, sell, then fee/tax, with transaction ID only breaking ties inside a transaction type.
+- Same-day buys now replay before lexically earlier sells, allowing imports to complete while retaining the non-blocking A-share T+1 quality flag.
+- Review runs materialize snapshots for every account with eligible ledger activity, including cash-only and unrelated accounts.
+- Review snapshot IDs include the review run source so repeated account/as-of materializations remain separate durable rows; import snapshots retain their existing stable upsert behavior.
+- Review ledger context now includes `pricing_status` and `quality_flags` for every materialized account.
+- Removed the API's duplicate ledger validator and routed API and CSV imports through the shared model rules, including Beijing `430047` support.
+- Added a 5 MiB CSV limit, a 4096-character CSV field limit, and a 4096-character API ledger field limit before transaction construction.
+- Preserved passive collector behavior and made no RID configuration, broker/order, frontend visual, schema, or unrelated changes.
 
 ## TDD Evidence
 
-Initial reviewer regression RED:
+Initial regression RED:
 
 ```text
-.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py::test_api_import_materializes_positions_snapshot_and_profile_exposure tests/advisor/test_web_api.py::test_api_and_cli_imports_materialize_equivalent_account_state tests/advisor/test_coordinator.py::test_review_creates_snapshot_and_links_advice_to_same_day_transactions -q
-..........FF...FFF
-5 failed, 13 passed in 1.92s
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_same_day_buy_replays_before_lexically_earlier_sell_and_flags_t_plus_one tests/advisor/test_ledger.py::test_csv_import_rejects_file_over_byte_limit_before_database_write tests/advisor/test_ledger.py::test_csv_import_rejects_oversized_field_before_database_write tests/advisor/test_web_api.py::test_api_and_csv_share_beijing_stock_code_validation tests/advisor/test_web_api.py::test_api_ledger_rejects_oversized_string_field_before_database_write tests/advisor/test_coordinator.py::test_review_versions_snapshots_for_every_active_ledger_account -q
+FFFFFF                                                                   [100%]
+6 failed in 2.03s
 ```
 
-Bounded exposure RED:
+After correcting the unrelated-account fixture, the review regression failed on the missing snapshot coverage:
 
 ```text
-.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_duplicate_transaction_ids_within_csv_fail_before_database_write tests/advisor/test_ledger.py::test_ledger_exposure_code_filter_is_explicitly_bounded tests/advisor/test_web_api.py::test_api_import_materializes_multiple_accounts_atomically tests/advisor/test_web_api.py::test_api_import_materializes_positions_snapshot_and_profile_exposure -q
-.F..
-1 failed, 3 passed in 0.45s
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_review_versions_snapshots_for_every_active_ledger_account -q
+F                                                                        [100%]
+1 failed in 1.47s
+```
+
+Focused regression GREEN:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_same_day_buy_replays_before_lexically_earlier_sell_and_flags_t_plus_one tests/advisor/test_ledger.py::test_csv_import_rejects_file_over_byte_limit_before_database_write tests/advisor/test_ledger.py::test_csv_import_rejects_oversized_field_before_database_write tests/advisor/test_web_api.py::test_api_and_csv_share_beijing_stock_code_validation tests/advisor/test_web_api.py::test_api_ledger_rejects_oversized_string_field_before_database_write tests/advisor/test_coordinator.py::test_review_versions_snapshots_for_every_active_ledger_account -q
+......                                                                   [100%]
+6 passed in 1.39s
 ```
 
 ## Verification
@@ -41,26 +51,26 @@ Required focused matrix:
 
 ```text
 .venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
-........................................................................ [ 44%]
-........................................................................ [ 88%]
-...................                                                      [100%]
-163 passed in 5.41s
+........................................................................ [ 42%]
+........................................................................ [ 85%]
+........................                                                 [100%]
+168 passed in 5.37s
 ```
 
 Complete advisor suite:
 
 ```text
 .venv311/bin/python -m pytest tests/advisor -q
-........................................................................ [ 17%]
-........................................................................ [ 34%]
-........................................................................ [ 51%]
-........................................................................ [ 68%]
-........................................................................ [ 85%]
-...............................................................          [100%]
-423 passed in 7.66s
+........................................................................ [ 16%]
+........................................................................ [ 33%]
+........................................................................ [ 50%]
+........................................................................ [ 67%]
+........................................................................ [ 84%]
+....................................................................     [100%]
+428 passed in 7.61s
 ```
 
-Offline collector self-test:
+Offline collector self-test after the final code edit:
 
 ```text
 /Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
@@ -70,7 +80,7 @@ fail 0
 cancelled 0
 skipped 0
 todo 0
-duration_ms 500.591459
+duration_ms 516.612041
 ```
 
 Static verification:
@@ -84,6 +94,7 @@ No live smoke test, Chrome operation, MX page operation, collector start, RID ch
 
 ## Changed Files
 
+- `advisor/ledger/model.py`
 - `advisor/ledger/importer.py`
 - `advisor/web/api.py`
 - `advisor/coordinator.py`
