@@ -235,6 +235,18 @@ def test_premarket_happy_path_persists_complete_projection(tmp_path: Path):
     from advisor.db.migrate import migrate_database
     migrate_database(paths["db_path"])
     seed_market(paths["db_path"])
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('a1', 'fixture', ?)",
+        (AS_OF.isoformat(),),
+    )
+    connection.execute(
+        "INSERT INTO positions (account_id, code, quantity, cost_basis, updated_at) "
+        "VALUES ('a1', ?, 100, 1000, ?)",
+        (CODE, AS_OF.isoformat()),
+    )
+    connection.commit()
+    connection.close()
 
     result = run_premarket(
         collector_snapshot=collector(), analyst_runner=PassingRunner(), as_of=AS_OF,
@@ -255,6 +267,17 @@ def test_premarket_happy_path_persists_complete_projection(tmp_path: Path):
     assert query_all(paths["db_path"], "SELECT report_type FROM report_archive") == [("premarket",)]
     assert len(query_all(paths["db_path"], "SELECT path FROM chart_assets")) == 1
     assert query_all(paths["db_path"], "SELECT code FROM stock_profiles") == [(CODE,)]
+    ledger_exposure = json.loads(
+        query_all(paths["db_path"], "SELECT ledger_exposure_json FROM stock_profiles")[0][0]
+    )
+    assert ledger_exposure == {
+        "cost_basis": 1000.0,
+        "market_price": 11.5,
+        "market_value": 1150.0,
+        "pricing_status": "passed",
+        "quantity": 100,
+        "unrealized_pnl": 150.0,
+    }
     assert query_all(paths["db_path"], "SELECT run_id FROM stock_profile_history") == [(result.run_id,)]
     assert (paths["profile_dir"] / f"{CODE}.md").exists()
     assert next(paths["chart_dir"].rglob("*.png")).stat().st_size > 1000

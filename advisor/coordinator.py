@@ -30,6 +30,7 @@ from advisor.db.migrate import migrate_database
 from advisor.db.repository import connect
 from advisor.evidence.mx_adapter import CollectorSnapshot
 from advisor.evidence.service import EvidenceRecord, persist_evidence
+from advisor.ledger.importer import ledger_exposure_by_code
 from advisor.paths import repo_root
 from advisor.profiles.service import StockProfile, render_profile_markdown, upsert_profile
 from advisor.quality import (
@@ -691,18 +692,22 @@ def _write_profile(
 def _upsert_profile_without_commit(
     connection: sqlite3.Connection, profile: StockProfile, as_of: datetime
 ) -> None:
+    ledger_exposure = ledger_exposure_by_code(connection, (profile.code,), as_of=as_of).get(
+        profile.code, {}
+    )
     connection.execute(
         """
         INSERT INTO stock_profiles (
           code, thesis_json, information_flow_json, capital_flow_json,
           fundamentals_json, analyst_flow_json, ledger_exposure_json,
           assets_json, updated_at
-        ) VALUES (?, ?, ?, ?, '{}', ?, '{}', ?, ?)
+        ) VALUES (?, ?, ?, ?, '{}', ?, ?, ?, ?)
         ON CONFLICT(code) DO UPDATE SET
           thesis_json = excluded.thesis_json,
           information_flow_json = excluded.information_flow_json,
           capital_flow_json = excluded.capital_flow_json,
           analyst_flow_json = excluded.analyst_flow_json,
+          ledger_exposure_json = excluded.ledger_exposure_json,
           assets_json = excluded.assets_json,
           updated_at = excluded.updated_at
         """,
@@ -719,6 +724,7 @@ def _upsert_profile_without_commit(
             json.dumps(profile.information_flow, ensure_ascii=False),
             json.dumps(profile.capital_flow, ensure_ascii=False),
             json.dumps(profile.analyst_flow, ensure_ascii=False),
+            json.dumps(ledger_exposure, ensure_ascii=True, sort_keys=True),
             json.dumps(profile.assets, ensure_ascii=False),
             as_of.isoformat(),
         ),
