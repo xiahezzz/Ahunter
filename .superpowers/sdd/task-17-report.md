@@ -764,3 +764,107 @@ No live smoke test, browser screenshot QA, MX page operation, collector start, R
 ### Concerns
 
 Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched.
+
+## Final CSV Byte-Bound and Snapshot Interface Fix
+
+Implementation commit: `e90437073e790ed49b615692809af03b64edb06f`
+
+Required code commit subject: `fix: expose bounded portfolio snapshots`
+
+Required report commit subject: `docs: record task 17 snapshot interface fix`
+
+### Summary
+
+- Rejects non-regular ledger CSV inputs deterministically before opening or importing.
+- Enforces the configured CSV byte cap while reading, so inputs that grow or exceed the cap after `stat()` fail before any database writes.
+- Preserves existing CSV parser error, row limit, field limit, and invalid UTF-8 normalization behavior.
+- Adds public `create_portfolio_snapshot(connection, account_id: str, as_of: datetime) -> PortfolioSnapshot`.
+- The public snapshot API reuses existing materialization/accounting logic, uses local close at or before `as_of`, persists a versioned snapshot, and exposes cash, market value, realized/unrealized PnL, exposure, pricing status, and quality flags.
+
+### RED Evidence
+
+Initial CSV byte-bound and snapshot interface regressions:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_csv_import_rejects_non_regular_input_before_database_write tests/advisor/test_ledger.py::test_csv_import_rejects_stream_that_exceeds_byte_limit_before_database_write tests/advisor/test_ledger.py::test_create_portfolio_snapshot_public_interface_persists_typed_snapshot -q
+FFF                                                                      [100%]
+3 failed in 0.23s
+```
+
+Failures were the expected missing behaviors: directory input raised `IsADirectoryError`, the grown stream did not raise, and `create_portfolio_snapshot` was absent.
+
+### GREEN Evidence
+
+Focused regression GREEN:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_csv_import_rejects_non_regular_input_before_database_write tests/advisor/test_ledger.py::test_csv_import_rejects_stream_that_exceeds_byte_limit_before_database_write tests/advisor/test_ledger.py::test_create_portfolio_snapshot_public_interface_persists_typed_snapshot -q
+...                                                                      [100%]
+3 passed in 0.24s
+```
+
+Full ledger file:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q
+....................................                                     [100%]
+36 passed in 0.53s
+```
+
+### Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 36%]
+........................................................................ [ 73%]
+.....................................................                    [100%]
+197 passed in 5.61s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 15%]
+........................................................................ [ 31%]
+........................................................................ [ 47%]
+........................................................................ [ 63%]
+........................................................................ [ 78%]
+........................................................................ [ 94%]
+.........................                                                [100%]
+457 passed in 7.84s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 507.114042
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
+### Changed Files
+
+- `advisor/ledger/importer.py`
+- `tests/advisor/test_ledger.py`
+- `.superpowers/sdd/task-17-report.md`
+
+### Concerns
+
+Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched.
