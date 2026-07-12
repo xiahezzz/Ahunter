@@ -855,3 +855,95 @@ git diff --check
 ### Concerns
 
 The deterministic provider intentionally models weekdays only, as permitted for this task. Exchange holidays and makeup sessions will require a root-contained code/config calendar extension before those dates are used operationally. No collector behavior, RID values, frontend, broker/order code, live smoke test, Chrome session, or MX page operation was changed or invoked. Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched.
+
+## Final Narrow Fix: Compound Sensitive Identifiers
+
+### Status
+
+DONE
+
+Implementation commit: `dfaef96`
+
+Required commit subject: `fix: reject compound sensitive ids`
+
+### Fix Summary
+
+- Generalized delimiter-bounded opaque-ID compound detection to reject concatenations built from token, session, debug, auth, cookie, socket, API-key, password, credential, and secret terms.
+- Added direct identifier regressions for the reported access-token, refresh-token, session-token, authorization-token, cookie-token, and debug-ID variants plus representative related compounds.
+- Added benign controls that preserve `evt-authorized-1` and avoid substring rejection of ordinary words.
+
+### TDD Evidence
+
+The new identifier regressions initially produced:
+
+```text
+FFFFFFFFFFFF....                                                         [100%]
+12 failed, 4 passed, 100 deselected in 0.25s
+```
+
+After implementation, the same focused regressions and the complete MX evidence-quality file produced:
+
+```text
+................                                                         [100%]
+16 passed, 100 deselected in 0.05s
+........................................................................ [ 62%]
+............................................                             [100%]
+116 passed in 0.55s
+```
+
+### Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+........................................................................ [ 28%]
+........................................................................ [ 57%]
+........................................................................ [ 86%]
+..................................                                       [100%]
+250 passed in 2.82s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 19%]
+........................................................................ [ 38%]
+........................................................................ [ 58%]
+........................................................................ [ 77%]
+........................................................................ [ 97%]
+..........                                                               [100%]
+370 passed in 4.62s
+```
+
+Offline collector self-test aggregate:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+ℹ tests 133
+ℹ suites 0
+ℹ pass 133
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 558.872458
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+### Changed Files
+
+- `advisor/evidence/mx_adapter.py`
+- `tests/advisor/test_mx_evidence_quality.py`
+- `.superpowers/sdd/task-15-report.md`
+
+### Concerns
+
+None. No collector behavior, RID values, frontend, broker/order code, database/calendar/quality logic, live smoke test, Chrome session, or MX page operation was changed or invoked. Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched.
