@@ -26,6 +26,7 @@ def collector(*, passed: bool = True) -> CollectorSnapshot:
             "collector snapshot is valid" if passed else "collector inactive",
         ),
         as_of=AS_OF,
+        allowed_rids=(),
     )
 
 
@@ -263,6 +264,51 @@ def test_trading_calendar_passes_when_candidate_covers_latest_expected_session(t
     assert "2026-07-10" in check.details
 
 
+def test_clearly_named_local_calendar_source_is_trusted(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    details = json.loads(
+        connection.execute(
+            "SELECT details_json FROM market_sources WHERE source_key = 'calendar-proof'"
+        ).fetchone()[0]
+    )
+    details["calendar_source"] = "local_calendar"
+    connection.execute(
+        "UPDATE market_sources SET source = 'local_calendar', details_json = ? "
+        "WHERE source_key = 'calendar-proof'",
+        (json.dumps(details),),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.passed
+
+
+@pytest.mark.parametrize("market_provider", ["sina", "eastmoney", "unknown_market_provider"])
+def test_market_provider_cannot_self_declare_trading_calendar_authority(
+    tmp_path: Path, market_provider: str
+):
+    connection = quality_connection(tmp_path)
+    details = json.loads(
+        connection.execute(
+            "SELECT details_json FROM market_sources WHERE source_key = 'calendar-proof'"
+        ).fetchone()[0]
+    )
+    details["calendar_source"] = market_provider
+    connection.execute(
+        "UPDATE market_sources SET source = ?, details_json = ? WHERE source_key = 'calendar-proof'",
+        (market_provider, json.dumps(details)),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "calendar" in check.details
+
+
 def test_incomplete_historical_fetch_cannot_self_authorize_calendar_freshness(tmp_path: Path):
     connection = quality_connection(tmp_path)
     connection.execute("DELETE FROM market_sources")
@@ -360,14 +406,14 @@ def test_conflicting_current_calendar_claims_block(tmp_path: Path):
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('other-proof', 'other_calendar', 'bounded', 'other', ?, 'passed', ?)
+        ) VALUES ('other-proof', 'local_trading_calendar', 'bounded', 'other', ?, 'passed', ?)
         """,
         (
             AS_OF.isoformat(),
             json.dumps(
                 {
                     "as_of": AS_OF.isoformat(),
-                    "calendar_source": "other_calendar",
+                    "calendar_source": "local_trading_calendar",
                     "coverage_codes": ["600519"],
                     "latest_expected_session": "2026-07-09",
                     "proof_type": "trading_calendar",
@@ -461,14 +507,14 @@ def test_calendar_proof_current_in_run_timezone_conflicts_across_timezones(tmp_p
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('cross-timezone-proof', 'other_calendar', 'bounded', 'timezone', ?, 'passed', ?)
+        ) VALUES ('cross-timezone-proof', 'local_trading_calendar', 'bounded', 'timezone', ?, 'passed', ?)
         """,
         (
             proof_as_of.isoformat(),
             json.dumps(
                 {
                     "as_of": proof_as_of.isoformat(),
-                    "calendar_source": "other_calendar",
+                    "calendar_source": "local_trading_calendar",
                     "coverage_codes": ["600519"],
                     "latest_expected_session": "2026-07-09",
                     "proof_type": "trading_calendar",

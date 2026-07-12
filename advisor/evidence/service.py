@@ -59,8 +59,17 @@ def persist_evidence(
 
     if not isinstance(snapshot.events, tuple) or len(snapshot.events) > 100:
         raise ValueError("invalid snapshot events")
+    if (
+        not isinstance(snapshot.allowed_rids, tuple)
+        or len(snapshot.allowed_rids) > 1_000
+        or len(set(snapshot.allowed_rids)) != len(snapshot.allowed_rids)
+        or any(type(rid) is not int or rid <= 0 for rid in snapshot.allowed_rids)
+    ):
+        raise ValueError("invalid snapshot allowed_rids")
     for event in snapshot.events:
         _validate_event(event, as_of)
+        if event.rid not in snapshot.allowed_rids:
+            raise ValueError("event rid is not an allowlisted rid")
     events = list(snapshot.events)
     records = [_record(run_id, event) for event in events]
     owns_transaction = not connection.in_transaction

@@ -22,6 +22,14 @@ _VALID_RUN_TYPES = frozenset({"premarket", "review"})
 _CODE_RE = re.compile(r"[03468]\d{5}\Z")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+_TRUSTED_CALENDAR_SOURCES = frozenset(
+    {
+        "exchange_calendar",
+        "local_calendar",
+        "local_trading_calendar",
+        "trading_calendar",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -214,6 +222,7 @@ def _authoritative_expected_session(
                 or not isinstance(calendar_source, str)
                 or not _IDENTIFIER_RE.fullmatch(calendar_source)
                 or source != calendar_source
+                or source not in _TRUSTED_CALENDAR_SOURCES
             ):
                 raise ValueError("invalid calendar source")
             claimed = dt.date.fromisoformat(details.get("latest_expected_session"))

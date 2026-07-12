@@ -144,6 +144,7 @@ def test_only_allowlisted_accepted_rows_become_bounded_evidence(
 
     snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF, limit=1)
 
+    assert snapshot.allowed_rids == (123,)
     assert [event.rid for event in snapshot.events] == [123]
     assert snapshot.events[0].content_hash == expected_hash
     assert len(snapshot.events[0].summary) <= 800
@@ -332,6 +333,41 @@ def test_secret_or_unsafe_collector_source_id_fails_closed(
     connection.execute(
         "UPDATE events SET event_id = ? WHERE event_id = 'evt-authorized-2'",
         ("token=source-secret\n../debug",),
+    )
+    connection.commit()
+    connection.close()
+
+    snapshot = read_collector_snapshot(
+        db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF, limit=1
+    )
+
+    assert snapshot.events == ()
+    assert snapshot.quality.blocking_failure
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        "session_abcdefgh",
+        "SESSION-ID.abcdefgh",
+        "sess-abcdefgh",
+        "socket_id_abcdefgh",
+        "token.abcdefgh",
+        "access_token_foo",
+        "refresh-token.foo",
+        "debug_identifier",
+        "debugger-id",
+        "cdp.identifier",
+    ],
+)
+def test_sensitive_opaque_collector_source_id_fails_closed(
+    tmp_path, create_collector_db, write_allowed_rids, source_id
+):
+    db, _ = create_collector_db(tmp_path)
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "UPDATE events SET event_id = ? WHERE event_id = 'evt-authorized-2'",
+        (source_id,),
     )
     connection.commit()
     connection.close()
@@ -607,7 +643,7 @@ def test_persistence_rejects_forged_sensitive_source_id_without_writing():
         media=(),
     )
     snapshot = mx_adapter.CollectorSnapshot(
-        events=(event,), quality=object(), as_of=AS_OF
+        events=(event,), quality=object(), as_of=AS_OF, allowed_rids=(123,)
     )
     connection = sqlite3.connect(":memory:")
     _advisor_evidence_tables(connection)
@@ -615,6 +651,70 @@ def test_persistence_rejects_forged_sensitive_source_id_without_writing():
     with pytest.raises(ValueError, match="source_id"):
         persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
 
+    assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        "session_abcdefgh",
+        "debug_identifier",
+        "access_token_foo",
+        "socket-id.foo",
+        "CDP.identifier",
+    ],
+)
+def test_persistence_rejects_sensitive_opaque_source_id_before_transaction(source_id: str):
+    content_hash = "c" * 64
+    event = MxEvidence(
+        evidence_id=hashlib.sha256(
+            f"a-hunter:evidence:v1\0mx\0{source_id}\0{content_hash}".encode()
+        ).hexdigest(),
+        source_type="mx",
+        source_id=source_id,
+        rid=123,
+        content_hash=content_hash,
+        summary="关注 600519",
+        received_at=AS_OF,
+        source_created_at=None,
+        media=(),
+    )
+    snapshot = mx_adapter.CollectorSnapshot(
+        events=(event,), quality=object(), as_of=AS_OF, allowed_rids=(123,)
+    )
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    with pytest.raises(ValueError, match="source_id"):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    assert not any(statement.startswith(("BEGIN", "SAVEPOINT")) for statement in statements)
+    assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+def test_persist_evidence_rejects_non_allowlisted_rid_before_transaction(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    snapshot = read_collector_snapshot(
+        db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF, limit=1
+    )
+    authorized = snapshot.events[0]
+    forged = replace(authorized, rid=456)
+    snapshot = replace(snapshot, events=(forged,))
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    with pytest.raises(ValueError, match="allowlisted rid"):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    assert not any(statement.startswith(("BEGIN", "SAVEPOINT")) for statement in statements)
     assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
 
@@ -649,7 +749,9 @@ def test_persist_evidence_rejects_forged_identity_before_transaction(
         media=(),
     )
     event = replace(event, **{field: forged})
-    snapshot = mx_adapter.CollectorSnapshot(events=(event,), quality=object(), as_of=AS_OF)
+    snapshot = mx_adapter.CollectorSnapshot(
+        events=(event,), quality=object(), as_of=AS_OF, allowed_rids=(123,)
+    )
     connection = sqlite3.connect(":memory:")
     _advisor_evidence_tables(connection)
     statements: list[str] = []
@@ -698,7 +800,10 @@ def test_persist_evidence_rejects_forged_payload_fields_without_writing(changes,
             connection,
             "advisor-run",
             mx_adapter.CollectorSnapshot(
-                events=(replace(event, **changes),), quality=object(), as_of=AS_OF
+                events=(replace(event, **changes),),
+                quality=object(),
+                as_of=AS_OF,
+                allowed_rids=(123,),
             ),
             as_of=AS_OF,
         )
@@ -727,7 +832,9 @@ def test_persistence_rejects_forged_unsafe_media_path(local_path: str):
         source_created_at=None,
         media=(MediaMetadata("d" * 64, "image/jpeg", local_path, AS_OF),),
     )
-    snapshot = mx_adapter.CollectorSnapshot(events=(event,), quality=object(), as_of=AS_OF)
+    snapshot = mx_adapter.CollectorSnapshot(
+        events=(event,), quality=object(), as_of=AS_OF, allowed_rids=(123,)
+    )
     connection = sqlite3.connect(":memory:")
     _advisor_evidence_tables(connection)
 

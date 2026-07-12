@@ -41,6 +41,11 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 )
 _SECRET_PREFIX = re.compile(r"\b(?:sk|pk|sess)_[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_SENSITIVE_OPAQUE_PREFIX = re.compile(
+    r"(?:session(?:[_.-]?id)?|sess|socket(?:[_.-]?id)?|token|"
+    r"access[_.-]?token|refresh[_.-]?token|debug(?:ger)?|cdp)(?:[_.-]|$)",
+    re.IGNORECASE,
+)
 _MEDIA_CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\Z")
 _URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 _MEDIA_NAMESPACE = ("data", "events", "media")
@@ -124,6 +129,7 @@ class CollectorSnapshot:
     events: tuple[MxEvidence, ...]
     quality: object
     as_of: datetime
+    allowed_rids: tuple[int, ...]
 
 
 def read_collector_snapshot(
@@ -139,19 +145,23 @@ def read_collector_snapshot(
     except (OSError, UnicodeError, yaml.YAMLError, ValueError):
         return _blocked(as_of, "allowed RID configuration is invalid")
     if not allowed_rids:
-        return _blocked(as_of, "collector is intentionally inactive: no allowed RIDs")
+        return _blocked(
+            as_of, "collector is intentionally inactive: no allowed RIDs", allowed_rids
+        )
 
     try:
         connection = _open_read_only(events_db)
     except (OSError, sqlite3.Error):
-        return _blocked(as_of, "collector database is unavailable")
+        return _blocked(as_of, "collector database is unavailable", allowed_rids)
     try:
         connection.row_factory = sqlite3.Row
         if not _valid_schema(connection):
-            return _blocked(as_of, "collector schema is missing required columns")
+            return _blocked(
+                as_of, "collector schema is missing required columns", allowed_rids
+            )
         return _snapshot_from_connection(connection, allowed_rids, as_of, limit)
     except (sqlite3.Error, TypeError, ValueError, OverflowError):
-        return _blocked(as_of, "collector data is invalid or ambiguous")
+        return _blocked(as_of, "collector data is invalid or ambiguous", allowed_rids)
     finally:
         connection.close()
 
@@ -361,7 +371,9 @@ def _snapshot_from_connection(
         passed=not problems,
         details="; ".join(problems) if problems else f"collector snapshot valid for {len(events)} authorized events",
     )
-    return CollectorSnapshot(events=events, quality=quality, as_of=as_of)
+    return CollectorSnapshot(
+        events=events, quality=quality, as_of=as_of, allowed_rids=allowed_rids
+    )
 
 
 def _read_media(
@@ -485,6 +497,7 @@ def valid_opaque_identifier(value: object) -> bool:
     return (
         isinstance(value, str)
         and bool(_OPAQUE_ID.fullmatch(value))
+        and not _SENSITIVE_OPAQUE_PREFIX.match(value)
         and redact_sensitive_text(value) == value
     )
 
@@ -519,9 +532,12 @@ def redact_sensitive_text(value: str) -> str:
     return _SECRET_PREFIX.sub("[redacted]", redacted)
 
 
-def _blocked(as_of: datetime, details: str) -> CollectorSnapshot:
+def _blocked(
+    as_of: datetime, details: str, allowed_rids: tuple[int, ...] = ()
+) -> CollectorSnapshot:
     return CollectorSnapshot(
         events=(),
         quality=CollectorQuality("collector_state", "blocking", False, details),
         as_of=as_of,
+        allowed_rids=allowed_rids,
     )
