@@ -404,6 +404,42 @@ def test_review_rejects_archive_with_advice_from_multiple_premarket_runs(tmp_pat
     assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
 
 
+def test_review_rejects_archive_missing_advice_from_linked_premarket_run(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    archived = AdviceItem("advice-1", CODE, "watch", 0.5, "archived", [])
+    seed_premarket_report(
+        paths,
+        database_run_id="morning-initial",
+        report_run_id="initial",
+        advice=[archived],
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.execute(
+        "INSERT INTO securities (code, name, exchange, created_at, updated_at) "
+        "VALUES ('000001', '000001', 'SZSE', ?, ?)",
+        (AS_OF.isoformat(), AS_OF.isoformat()),
+    )
+    connection.execute(
+        "INSERT INTO advice (advice_id, run_id, code, action, confidence, rationale, "
+        "evidence_ids_json, created_at) VALUES "
+        "('advice-2', 'morning-initial', '000001', 'watch', 0.5, 'omitted', '[]', ?)",
+        (AS_OF.isoformat(),),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ValueError, match="morning advice does not match premarket archive"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE,),
+            quality_evaluator=passed_quality, **paths,
+        )
+
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
+
+
 def test_review_rolls_back_rows_when_selected_archive_linkage_fails(tmp_path: Path):
     paths = coordinator_paths(tmp_path)
     from advisor.db.migrate import migrate_database
@@ -458,6 +494,40 @@ def test_review_rolls_back_all_projection_rows_when_report_write_fails(
     assert query_all(
         paths["db_path"],
         "SELECT status FROM advisor_runs WHERE run_type = 'review'",
+    ) == [("failed",)]
+
+
+def test_premarket_archive_failure_rolls_back_all_projection_rows(
+    tmp_path: Path, monkeypatch
+):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+
+    def fail_archive(*_args, **_kwargs):
+        raise sqlite3.IntegrityError("fixture premarket archive failure")
+
+    monkeypatch.setattr(coordinator_module, "_archive_report", fail_archive)
+    with pytest.raises(sqlite3.IntegrityError, match="fixture premarket archive failure"):
+        run_premarket(
+            collector_snapshot=collector(), analyst_runner=PassingRunner(), as_of=AS_OF,
+            report_date="2026-07-12", candidate_codes=(CODE,), run_id="premarket-failed",
+            quality_evaluator=passed_quality, evidence_persister=persist_fixture_evidence,
+            **paths,
+        )
+
+    for table in (
+        "advice",
+        "chart_assets",
+        "stock_profiles",
+        "stock_profile_history",
+        "report_archive",
+    ):
+        assert query_all(paths["db_path"], f"SELECT COUNT(*) FROM {table}") == [(0,)]
+    assert query_all(
+        paths["db_path"],
+        "SELECT status FROM advisor_runs WHERE run_id = 'premarket-failed'",
     ) == [("failed",)]
 
 

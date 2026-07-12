@@ -20,6 +20,7 @@ from advisor.db.migrate import migrate_database
 from advisor.ledger.model import LedgerTransaction, apply_transactions
 from advisor.reporting.contracts import (
     StaleArchiveCursorError,
+    list_verified_archives,
     page_verified_archives,
     read_active_verified_archive,
     read_verified_archive,
@@ -287,11 +288,16 @@ def _current_state(state_dir: Path, db_path: Path, report_cursor_secret: bytes) 
         report_start = (
             date.fromisoformat(today) - timedelta(days=_CURRENT_REPORT_LOOKBACK_DAYS)
         ).isoformat()
+        try:
+            report_candidates = list_verified_archives(
+                advisor_paths.reports_dir(), start_date=report_start, end_date=today
+            )
+        except (OSError, ValueError, RuntimeError):
+            report_candidates = []
         eligible_reports = _eligible_report_keys(
             connection,
             advisor_paths.reports_dir(),
-            start_date=report_start,
-            end_date=today,
+            candidate_keys={_report_key(item) for item in report_candidates},
         )
     finally:
         if connection is not None:

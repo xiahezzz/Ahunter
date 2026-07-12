@@ -267,6 +267,98 @@ def test_current_report_remains_eligible_after_archive_history_exceeds_capacity(
     assert [report["report_date"] for report in current_state.json()["reports"]] == ["2026-07-12"]
 
 
+def test_current_state_keeps_active_chain_after_same_day_archive_capacity(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    initial_advice = AdviceItem("advice-initial", "600519", "watch", 0.6, "initial", [])
+    rerun_advice = AdviceItem("advice-rerun", "000001", "watch", 0.8, "rerun", [])
+    initial_paths = write_premarket_report(
+        "2026-07-12",
+        [initial_advice],
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "initial")],
+    )
+    rerun_paths = write_premarket_report(
+        "2026-07-12",
+        [rerun_advice],
+        reports_root,
+        quality_results=[QualityResult("market", "blocking", True, "rerun")],
+        run_id="rerun1",
+        rerun_reason="candidate update",
+        supersedes="initial",
+    )
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    noisy_runs = [
+        (
+            f"noise-{index}",
+            "premarket",
+            "2020-01-01T08:30:00+08:00",
+            "passed",
+            "2020-01-01T08:30:00+08:00",
+        )
+        for index in range(web_api._MAX_REPORT_ARCHIVE_ROWS + 1)
+    ]
+    connection.executemany(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        noisy_runs,
+    )
+    connection.executemany(
+        "INSERT INTO report_archive "
+        "(report_id, run_id, report_type, report_date, markdown_path, json_path, created_at) "
+        "VALUES (?, ?, 'premarket', '2026-07-12', ?, ?, '2026-07-12T09:00:00+08:00')",
+        [
+            (
+                f"noise-report-{index}",
+                run_id,
+                str(reports_root / "2026-07-12" / f"premarket.noise-{index}.md"),
+                str(reports_root / "2026-07-12" / f"premarket.noise-{index}.json"),
+            )
+            for index, (run_id, *_rest) in enumerate(noisy_runs)
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+        "VALUES (?, 'premarket', '2026-07-12T08:30:00+08:00', 'passed', ?)",
+        [
+            ("current-initial", "2026-07-12T08:30:00+08:00"),
+            ("current-rerun", "2026-07-12T08:31:00+08:00"),
+        ],
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks "
+        "(check_id, run_id, check_name, severity, status, details_json, created_at) "
+        "VALUES ('current-check', 'current-rerun', 'market', 'blocking', 'passed', '{}', "
+        "'2026-07-12T08:32:00+08:00')"
+    )
+    insert_report_archive(
+        connection,
+        database_run_id="current-initial",
+        report_type="premarket",
+        report_date="2026-07-12",
+        markdown_path=initial_paths.markdown_path,
+        json_path=initial_paths.json_path,
+    )
+    insert_report_archive(
+        connection,
+        database_run_id="current-rerun",
+        report_type="premarket",
+        report_date="2026-07-12",
+        markdown_path=rerun_paths.markdown_path,
+        json_path=rerun_paths.json_path,
+    )
+    connection.commit()
+    connection.close()
+
+    payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
+
+    assert payload["advice"] == [rerun_advice.to_dict()]
+    assert any(report["run_id"] == "rerun1" for report in payload["reports"])
+
+
 def test_report_cursor_cannot_be_replayed_after_app_restart(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)

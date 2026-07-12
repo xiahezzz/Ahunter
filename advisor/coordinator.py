@@ -129,7 +129,6 @@ def run_premarket(
         advice_items = _advice_items(active_run_id, codes, outputs, evidence)
         _upsert_securities(connection, codes, as_of)
         _persist_advice(connection, active_run_id, as_of, advice_items)
-        connection.commit()
 
         warnings, _ = _project_premarket_profiles(
             connection, db_path, chart_dir, profile_dir, report_day, as_of,
@@ -462,7 +461,8 @@ def _project_premarket_profiles(
             assets,
         )
         _write_profile(
-            connection, profile_dir, profile, as_of, run_id, "premarket projection"
+            connection, profile_dir, profile, as_of, run_id, "premarket projection",
+            transactional=True,
         )
         profiles.append(profile)
     return warnings, profiles
@@ -684,32 +684,31 @@ def _load_morning_advice(
     if not isinstance(archived_advice, list) or not isinstance(archived_ids, list):
         raise ValueError("invalid premarket archive")
 
-    items: list[AdviceItem] = []
     try:
-        for archived in archived_advice:
-            if not isinstance(archived, dict):
-                raise ValueError
-            item = AdviceItem(
+        items = [
+            AdviceItem(
                 archived["advice_id"], archived["code"], archived["action"],
                 archived["confidence"], archived["rationale"], archived["evidence_ids"],
             )
-            row = connection.execute(
+            for archived in archived_advice
+            if isinstance(archived, dict)
+        ]
+        if len(items) != len(archived_advice):
+            raise ValueError
+        stored_items = [
+            AdviceItem(row[0], row[1], row[2], row[3], row[4], json.loads(row[5]))
+            for row in connection.execute(
                 """
-                SELECT advice.advice_id, advice.code, advice.action, advice.confidence,
-                       advice.rationale, advice.evidence_ids_json
+                SELECT advice_id, code, action, confidence, rationale, evidence_ids_json
                 FROM advice
-                WHERE advice.advice_id = ? AND advice.run_id = ?
+                WHERE run_id = ?
+                ORDER BY rowid
                 """,
-                (item.advice_id, database_run_id),
-            ).fetchone()
-            if row is None:
-                raise ValueError
-            stored = AdviceItem(
-                row[0], row[1], row[2], row[3], row[4], json.loads(row[5])
-            )
-            if stored != item:
-                raise ValueError
-            items.append(stored)
+                (database_run_id,),
+            ).fetchall()
+        ]
+        if stored_items != items:
+            raise ValueError
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise ValueError("morning advice does not match premarket archive") from error
     if archived_ids != [item.advice_id for item in items]:
