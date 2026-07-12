@@ -6,7 +6,13 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
-from advisor.evidence.mx_adapter import CollectorSnapshot, MxEvidence, redact_sensitive_text
+from advisor.evidence.mx_adapter import (
+    CollectorSnapshot,
+    MxEvidence,
+    redact_sensitive_text,
+    valid_media_metadata,
+    valid_opaque_identifier,
+)
 
 
 _STOCK_CODE_RE = re.compile(r"\b([03468]\d{5})\b")
@@ -46,6 +52,11 @@ def persist_evidence(
     ):
         raise ValueError("snapshot as_of exceeds run as_of")
 
+    for event in snapshot.events:
+        if not valid_opaque_identifier(getattr(event, "source_id", None)):
+            raise ValueError("invalid source_id")
+        if any(not valid_media_metadata(item) for item in getattr(event, "media", ())):
+            raise ValueError("invalid media metadata")
     events = [event for event in snapshot.events if _event_is_bounded(event, as_of)]
     records = [_record(run_id, event) for event in events]
     owns_transaction = not connection.in_transaction

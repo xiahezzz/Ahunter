@@ -76,6 +76,21 @@ def record_market_source_attempt(
     params = {"code": code, "start": start.isoformat(), "end": end.isoformat()}
     params_json = json.dumps(params, sort_keys=True, separators=(",", ":"))
     details = {**params, "error": error}
+    if status == "passed":
+        latest = connection.execute(
+            """
+            SELECT MAX(trade_date) FROM market_daily
+            WHERE code = ? AND source = ? AND quality_status = 'passed'
+              AND trade_date BETWEEN ? AND ?
+            """,
+            (code, provider.source, start.isoformat(), end.isoformat()),
+        ).fetchone()[0]
+        if not isinstance(latest, str):
+            raise ValueError("successful market source attempt requires persisted bars")
+        details.update(
+            proof_type="historical_market_fetch",
+            latest_expected_session=latest,
+        )
     connection.execute(
         """
         INSERT INTO market_sources (

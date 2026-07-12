@@ -127,7 +127,7 @@ def _collector_check(snapshot: CollectorSnapshot | None) -> QualityResult:
 def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
     rows = connection.execute(
         """
-        SELECT details_json FROM market_sources
+        SELECT source, details_json FROM market_sources
         WHERE status = 'passed' AND julianday(fetched_at) IS NOT NULL
           AND julianday(fetched_at) <= julianday(?)
         ORDER BY fetched_at DESC, source_key DESC
@@ -137,32 +137,57 @@ def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequ
     ).fetchall()
     if len(rows) > _MAX_SOURCE_ROWS:
         return _blocked_check("trading_calendar", "trading calendar proof scan limit exceeded")
-    expected_sessions: list[dt.date] = []
-    for (raw_details,) in rows:
+    latest_proofs: dict[tuple[str, str], dt.date] = {}
+    for source, raw_details in rows:
         try:
             details = json.loads(raw_details)
-            value = details.get("latest_expected_session") if isinstance(details, dict) else None
-            if value is not None:
-                expected_sessions.append(dt.date.fromisoformat(value))
+            if not isinstance(details, dict) or details.get("proof_type") != "historical_market_fetch":
+                continue
+            code = details.get("code")
+            value = details.get("latest_expected_session")
+            if not isinstance(source, str) or not _CODE_RE.fullmatch(code or "") or not isinstance(value, str):
+                raise ValueError("invalid calendar proof")
+            if code not in request.candidate_codes:
+                continue
+            key = (code, source)
+            if key not in latest_proofs:
+                latest_proofs[key] = dt.date.fromisoformat(value)
         except (TypeError, ValueError, json.JSONDecodeError):
             return _blocked_check("trading_calendar", "trading calendar proof is invalid")
-    if not expected_sessions:
+
+    claims_by_code: dict[str, set[dt.date]] = defaultdict(set)
+    for (code, source), claimed in latest_proofs.items():
+        if claimed > request.as_of.date():
+            return _blocked_check("trading_calendar", "latest expected trading session is future-dated")
+        row = connection.execute(
+            """
+            SELECT MAX(trade_date) FROM market_daily
+            WHERE code = ? AND source = ? AND trade_date <= ? AND quality_status = 'passed'
+            """,
+            (code, source, request.as_of.date().isoformat()),
+        ).fetchone()
+        try:
+            latest_bar = dt.date.fromisoformat(row[0]) if row and row[0] else None
+        except (TypeError, ValueError):
+            latest_bar = None
+        if latest_bar != claimed:
+            return _blocked_check(
+                "trading_calendar",
+                f"latest expected trading session {claimed.isoformat()} is not covered by selected source",
+            )
+        claims_by_code[code].add(claimed)
+
+    if any(code not in claims_by_code for code in request.candidate_codes):
         return _blocked_check("trading_calendar", "latest expected trading session is unavailable")
-    expected = max(expected_sessions)
-    if expected > request.as_of.date():
-        return _blocked_check("trading_calendar", "latest expected trading session is future-dated")
-    placeholders = ",".join("?" for _ in request.candidate_codes)
-    rows = connection.execute(
-        f"SELECT DISTINCT code FROM market_daily WHERE code IN ({placeholders}) AND trade_date = ? AND quality_status = 'passed'",
-        (*request.candidate_codes, expected.isoformat()),
-    ).fetchall()
-    found = {row[0] for row in rows}
-    missing = sorted(set(request.candidate_codes) - found)
+    if any(len(claims) != 1 for claims in claims_by_code.values()):
+        return _blocked_check("trading_calendar", "conflicting trading calendar proof")
+    expected_sessions = {next(iter(claims)) for claims in claims_by_code.values()}
+    if len(expected_sessions) != 1:
+        return _blocked_check("trading_calendar", "conflicting trading calendar proof")
+    expected = next(iter(expected_sessions))
     return QualityResult(
-        "trading_calendar", "blocking", not missing,
-        f"latest expected trading session {expected.isoformat()} is covered"
-        if not missing
-        else f"latest expected trading session {expected.isoformat()} missing for {len(missing)} candidates",
+        "trading_calendar", "blocking", True,
+        f"latest expected trading session {expected.isoformat()} is covered",
     )
 
 

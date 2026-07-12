@@ -9,7 +9,7 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PurePath
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 import yaml
@@ -23,11 +23,15 @@ _MAX_MEDIA_PER_EVENT = 20
 _HASH_CHARS = frozenset("0123456789abcdef")
 _COUNTER_KINDS = frozenset({"accepted", "duplicate", "failed", "ignored", "media_failed", "rejected"})
 _AUTHORIZATION = re.compile(
-    r"\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;]+",
+    r"\bauthorization\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n]*)",
     re.IGNORECASE,
 )
-_COOKIE = re.compile(r"\bcookie\s*[:=]\s*[^\r\n]+", re.IGNORECASE)
-_BEARER = re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
+_COOKIE = re.compile(
+    r"\bcookie\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n]*)",
+    re.IGNORECASE,
+)
+_BASIC = re.compile(r"\bbasic\s+(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[A-Za-z0-9_+/=-]+)", re.IGNORECASE)
+_BEARER = re.compile(r"\bbearer\s+(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[A-Za-z0-9._~+/=-]+)", re.IGNORECASE)
 _JWT = re.compile(
     r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
 )
@@ -36,6 +40,10 @@ _SENSITIVE_ASSIGNMENT = re.compile(
     re.IGNORECASE,
 )
 _SECRET_PREFIX = re.compile(r"\b(?:sk|pk|sess)_[A-Za-z0-9_-]{8,}", re.IGNORECASE)
+_OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_MEDIA_CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\Z")
+_URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+_MEDIA_NAMESPACE = ("data", "events", "media")
 _REQUIRED_COLUMNS = {
     "events": {
         "event_id", "schema_version", "rid", "source_message_id", "oid",
@@ -78,7 +86,7 @@ class MediaMetadata:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "content_hash": self.content_hash,
+            "content_hash": redact_sensitive_text(self.content_hash),
             "content_type": redact_sensitive_text(self.content_type),
             "local_path": redact_sensitive_text(self.local_path),
             "downloaded_at": self.downloaded_at.isoformat(),
@@ -99,12 +107,12 @@ class MxEvidence:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "evidence_id": self.evidence_id,
-            "source_type": self.source_type,
-            "source_id": self.source_id,
+            "evidence_id": redact_sensitive_text(self.evidence_id),
+            "source_type": redact_sensitive_text(self.source_type),
+            "source_id": safe_opaque_identifier(self.source_id),
             "rid": self.rid,
-            "content_hash": self.content_hash,
-            "summary": self.summary,
+            "content_hash": redact_sensitive_text(self.content_hash),
+            "summary": redact_sensitive_text(self.summary),
             "received_at": self.received_at.isoformat(),
             "source_created_at": self.source_created_at.isoformat() if self.source_created_at else None,
             "media": [item.to_dict() for item in self.media],
@@ -198,7 +206,9 @@ def _open_read_only(path: Path) -> sqlite3.Connection:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("collector database must be a regular file")
-        pin_dir = Path(tempfile.mkdtemp(prefix=".mx-read-", dir=path.parent))
+        pin_dir = Path(tempfile.mkdtemp(prefix=".mx-read-"))
+        if pin_dir.stat().st_dev != opened.st_dev:
+            raise OSError("private scratch directory is not on the collector filesystem")
         pinned_db = pin_dir / "events.sqlite"
         os.link(path, pinned_db, follow_symlinks=False)
         pinned = pinned_db.stat()
@@ -385,11 +395,9 @@ def _read_media(
         if (
             not _valid_hash(row["content_hash"])
             or not isinstance(row["content_type"], str)
-            or len(row["content_type"]) > 128
+            or not _MEDIA_CONTENT_TYPE.fullmatch(row["content_type"])
             or not isinstance(local_path, str)
-            or not local_path
-            or len(local_path) > _MAX_LOCAL_PATH_CHARS
-            or ".." in PurePath(local_path).parts
+            or not valid_local_media_path(local_path)
         ):
             raise ValueError("invalid media metadata")
         grouped.setdefault(row["event_id"], []).append(
@@ -408,7 +416,7 @@ def _event_from_row(row: sqlite3.Row, media: tuple[MediaMetadata, ...], as_of: d
     content_hash = row["content_hash"]
     rid = row["rid"]
     if (
-        not isinstance(source_id, str) or not source_id or len(source_id) > 256
+        not valid_opaque_identifier(source_id)
         or type(rid) is not int or rid <= 0
         or not _valid_hash(content_hash)
         or not isinstance(row["decoded_text"], str)
@@ -445,9 +453,55 @@ def _valid_hash(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value.lower()) <= _HASH_CHARS
 
 
+def valid_local_media_path(value: str) -> bool:
+    if (
+        not value
+        or len(value) > _MAX_LOCAL_PATH_CHARS
+        or "\\" in value
+        or _URI_SCHEME.match(value)
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and path.parts[:3] == _MEDIA_NAMESPACE
+        and len(path.parts) > 3
+        and all(part not in {"", ".", ".."} for part in path.parts)
+        and str(path) == value
+        and redact_sensitive_text(value) == value
+    )
+
+
+def valid_opaque_identifier(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(_OPAQUE_ID.fullmatch(value))
+        and redact_sensitive_text(value) == value
+    )
+
+
+def valid_media_metadata(value: object) -> bool:
+    return (
+        isinstance(value, MediaMetadata)
+        and _valid_hash(value.content_hash)
+        and isinstance(value.content_type, str)
+        and bool(_MEDIA_CONTENT_TYPE.fullmatch(value.content_type))
+        and isinstance(value.local_path, str)
+        and valid_local_media_path(value.local_path)
+    )
+
+
+def safe_opaque_identifier(value: object) -> str:
+    return value if valid_opaque_identifier(value) else "[redacted]"
+
+
 def redact_sensitive_text(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("sensitive text must be a string")
     redacted = _AUTHORIZATION.sub("[redacted]", value)
     redacted = _COOKIE.sub("[redacted]", redacted)
+    redacted = _BASIC.sub("[redacted]", redacted)
     redacted = _BEARER.sub("[redacted]", redacted)
     redacted = _JWT.sub("[redacted]", redacted)
     redacted = _SENSITIVE_ASSIGNMENT.sub("[redacted]", redacted)

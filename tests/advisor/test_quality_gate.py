@@ -65,7 +65,13 @@ def quality_connection(tmp_path: Path) -> sqlite3.Connection:
         """,
         (
             AS_OF.isoformat(),
-            json.dumps({"latest_expected_session": "2026-07-10"}),
+            json.dumps(
+                {
+                    "code": "600519",
+                    "latest_expected_session": "2026-07-10",
+                    "proof_type": "historical_market_fetch",
+                }
+            ),
         ),
     )
     connection.commit()
@@ -232,6 +238,115 @@ def test_trading_calendar_passes_when_candidate_covers_latest_expected_session(t
     check = next(check for check in result.checks if check.check_name == "trading_calendar")
     assert check.passed
     assert "2026-07-10" in check.details
+
+
+def test_unrelated_source_row_cannot_supply_calendar_proof(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM market_sources")
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('unrelated', 'news_feed', 'bounded', 'other', ?, 'passed', ?)
+        """,
+        (AS_OF.isoformat(), json.dumps({"latest_expected_session": "2026-07-10"})),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    assert next(
+        check for check in result.checks if check.check_name == "trading_calendar"
+    ).blocking_failure
+
+
+def test_authoritative_proof_for_unrelated_code_is_ignored(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('other-code', 'sina_http', 'bounded', 'other-code', ?, 'passed', ?)
+        """,
+        (
+            AS_OF.isoformat(),
+            json.dumps(
+                {
+                    "code": "000001",
+                    "latest_expected_session": "2026-07-10",
+                    "proof_type": "historical_market_fetch",
+                }
+            ),
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    assert next(
+        check for check in result.checks if check.check_name == "trading_calendar"
+    ).passed
+
+
+def test_conflicting_current_calendar_claims_block(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute(
+        """
+        INSERT INTO market_daily (
+          code, trade_date, open, high, low, close, volume, amount, source,
+          fetched_at, as_of_date, content_hash, quality_status
+        ) VALUES ('600519', '2026-07-09', 1, 1, 1, 1, 1, 1, 'other_source', ?,
+                  '2026-07-09', 'other-hash', 'passed')
+        """,
+        (AS_OF.isoformat(),),
+    )
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('other-proof', 'other_source', 'bounded', 'other', ?, 'passed', ?)
+        """,
+        (
+            AS_OF.isoformat(),
+            json.dumps(
+                {
+                    "code": "600519",
+                    "latest_expected_session": "2026-07-09",
+                    "proof_type": "historical_market_fetch",
+                }
+            ),
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "conflict" in check.details
+
+
+def test_calendar_proof_newer_than_selected_source_data_blocks(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute(
+        "UPDATE market_sources SET details_json = ? WHERE source_key = 'calendar-proof'",
+        (
+            json.dumps(
+                {
+                    "code": "600519",
+                    "latest_expected_session": "2026-07-11",
+                    "proof_type": "historical_market_fetch",
+                }
+            ),
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "2026-07-11" in check.details
 
 
 def test_invalid_ledger_replay_blocks(tmp_path: Path):

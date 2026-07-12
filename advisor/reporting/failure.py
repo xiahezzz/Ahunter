@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
+from advisor.evidence.mx_adapter import redact_sensitive_text
 from advisor.quality import QualityResult
 from advisor.reporting.contracts import ReportPaths, atomic_write_pair, validate_run_id
 
@@ -89,7 +90,7 @@ def _safe_failure(failure: QualityResult) -> dict[str, object]:
         if _SAFE_NAME.fullmatch(failure.check_name) and not _SENSITIVE.search(failure.check_name)
         else "quality_check"
     )
-    details = failure.details.strip()[:800]
+    details = redact_sensitive_text(failure.details.strip())[:800]
     if _SENSITIVE.search(details):
         details = "sensitive quality detail omitted"
     return {

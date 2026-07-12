@@ -118,6 +118,35 @@ def test_failure_report_archives_only_bounded_quality_metadata(tmp_path: Path):
     assert completion_marker(paths).exists()
 
 
+def test_failure_report_redacts_header_basic_bearer_jwt_and_session_values(tmp_path: Path):
+    secrets = (
+        "failure-auth-secret",
+        "ZmFpbHVyZTpwYXNzd29yZA==",
+        "failure-bearer-secret",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWlsdXJlIn0.failure-signature",
+        "failure-session-secret",
+    )
+    details = (
+        'Authorization: "Bearer failure-auth-secret"\n'
+        "Basic ZmFpbHVyZTpwYXNzd29yZA== Bearer failure-bearer-secret "
+        + secrets[3]
+        + " session=failure-session-secret"
+    )
+
+    paths = write_failure_report(
+        "2026-07-11",
+        "review",
+        [QualityResult("market_data", "blocking", False, details)],
+        tmp_path,
+        run_id="secret-redaction",
+    )
+
+    combined = paths.markdown_path.read_text(encoding="utf-8") + paths.json_path.read_text(
+        encoding="utf-8"
+    )
+    assert all(secret not in combined for secret in secrets)
+
+
 def test_failure_report_rejects_nonblocking_or_missing_failures(tmp_path: Path):
     with pytest.raises(ValueError, match="blocking quality"):
         write_failure_report(

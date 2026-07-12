@@ -85,6 +85,32 @@ def test_backfill_is_idempotent_but_records_every_attempt(tmp_path: Path):
         connection.close()
 
 
+def test_successful_backfill_records_authoritative_calendar_proof(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+
+    update_market_database(
+        db_path,
+        FakeProvider(),
+        ["600519"],
+        date(2023, 7, 12),
+        date(2026, 7, 12),
+        sleep=lambda _: None,
+    )
+
+    connection = connect(db_path)
+    try:
+        details = json.loads(
+            connection.execute(
+                "SELECT details_json FROM market_sources WHERE status = 'passed'"
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+    assert details["proof_type"] == "historical_market_fetch"
+    assert details["code"] == "600519"
+    assert details["latest_expected_session"] == "2026-07-10"
+
+
 def test_failed_second_code_preserves_committed_first_code(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
     provider = FakeProvider(failed_codes={"000001"})

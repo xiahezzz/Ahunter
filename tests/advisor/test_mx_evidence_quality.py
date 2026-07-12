@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from advisor.evidence import mx_adapter
-from advisor.evidence.mx_adapter import read_collector_snapshot
+from advisor.evidence.mx_adapter import MediaMetadata, MxEvidence, read_collector_snapshot
 from advisor.evidence.service import persist_evidence
 
 
@@ -274,8 +274,9 @@ def test_complete_auth_cookie_bearer_and_jwt_secrets_are_redacted(
         "assigned-secret",
     )
     decoded = (
-        "关注 600519 Authorization: Bearer super-secret-token "
+        "关注 600519 Authorization: \"Bearer super-secret-token\"\n"
         "Cookie: session=secret-cookie\n"
+        "Basic dXNlcjpwYXNzd29yZA== "
         "Bearer standalone-bearer-secret "
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signature-secret "
         "token=assigned-secret"
@@ -296,6 +297,89 @@ def test_complete_auth_cookie_bearer_and_jwt_secrets_are_redacted(
 
     assert all(secret not in serialized for secret in secrets)
     assert "Bearer" not in snapshot.events[0].summary
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "https://secret.invalid/media.jpg",
+        "/data/events/media/accepted.jpg",
+        "data/events/media/../secret.jpg",
+    ],
+)
+def test_media_path_outside_collector_namespace_fails_closed(
+    tmp_path, create_collector_db, write_allowed_rids, local_path
+):
+    db, _ = create_collector_db(tmp_path)
+    connection = sqlite3.connect(db)
+    connection.execute("UPDATE media SET local_path = ?", (local_path,))
+    connection.commit()
+    connection.close()
+
+    snapshot = read_collector_snapshot(
+        db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF
+    )
+
+    assert snapshot.events == ()
+    assert snapshot.quality.blocking_failure
+
+
+def test_secret_or_unsafe_collector_source_id_fails_closed(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    db, _ = create_collector_db(tmp_path)
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "UPDATE events SET event_id = ? WHERE event_id = 'evt-authorized-2'",
+        ("token=source-secret\n../debug",),
+    )
+    connection.commit()
+    connection.close()
+
+    snapshot = read_collector_snapshot(
+        db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF, limit=1
+    )
+
+    assert snapshot.events == ()
+    assert snapshot.quality.blocking_failure
+
+
+def test_snapshot_dto_redacts_forged_sensitive_values():
+    secrets = (
+        "dto-auth-secret",
+        "dto-basic-secret",
+        "dto-bearer-secret",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkdG8ifQ.dto-signature",
+        "dto-session-secret",
+        "dto-source-secret",
+        "dto-media-secret",
+    )
+    evidence = MxEvidence(
+        evidence_id="e" * 64,
+        source_type="mx",
+        source_id="token=dto-source-secret",
+        rid=123,
+        content_hash="c" * 64,
+        summary=(
+            'Authorization: "Bearer dto-auth-secret" Basic dto-basic-secret '
+            "Bearer dto-bearer-secret " + secrets[3] + " session=dto-session-secret"
+        ),
+        received_at=AS_OF,
+        source_created_at=None,
+        media=(
+            MediaMetadata(
+                "d" * 64,
+                "image/jpeg",
+                "data/events/media/token=dto-media-secret",
+                AS_OF,
+            ),
+        ),
+    )
+
+    serialized = json.dumps(evidence.to_dict())
+
+    assert all(secret not in serialized for secret in secrets)
+    assert evidence.to_dict()["source_id"] == "[redacted]"
 
 
 def test_collector_database_read_is_pinned_to_validated_descriptor(
@@ -329,6 +413,24 @@ def test_collector_database_read_is_pinned_to_validated_descriptor(
         "evt-authorized-1",
         "evt-authorized-2",
     }
+
+
+def test_snapshot_open_creates_no_files_in_read_only_collector_directory(
+    tmp_path, create_collector_db, write_allowed_rids
+):
+    collector_dir = tmp_path / "collector"
+    collector_dir.mkdir()
+    db, _ = create_collector_db(collector_dir)
+    allowed = write_allowed_rids(tmp_path, [123])
+    before = sorted(path.name for path in collector_dir.iterdir())
+    collector_dir.chmod(0o555)
+    try:
+        snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF)
+    finally:
+        collector_dir.chmod(0o755)
+
+    assert not snapshot.quality.blocking_failure
+    assert sorted(path.name for path in collector_dir.iterdir()) == before
 
 
 def _advisor_evidence_tables(connection: sqlite3.Connection) -> None:
@@ -422,10 +524,6 @@ def test_persisted_summary_and_raw_refs_contain_no_complete_secrets(
         "UPDATE events SET decoded_text = ? WHERE event_id = 'evt-authorized-2'",
         (f"关注 600519 Authorization: Bearer {secret}",),
     )
-    source.execute(
-        "UPDATE media SET local_path = ? WHERE event_id = 'evt-authorized-2'",
-        (f"data/events/media/token={secret}",),
-    )
     source.commit()
     source.close()
     snapshot = read_collector_snapshot(
@@ -436,13 +534,69 @@ def test_persisted_summary_and_raw_refs_contain_no_complete_secrets(
 
     persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
 
-    summary, raw_ref = connection.execute(
-        "SELECT summary, raw_ref_json FROM events_normalized"
+    source_id, summary, raw_ref = connection.execute(
+        "SELECT source_id, summary, raw_ref_json FROM events_normalized"
     ).fetchone()
-    evidence_summary = connection.execute("SELECT summary FROM evidence").fetchone()[0]
+    evidence_source_id, evidence_summary = connection.execute(
+        "SELECT source_id, summary FROM evidence"
+    ).fetchone()
+    assert secret not in source_id
+    assert secret not in evidence_source_id
     assert secret not in summary
     assert secret not in evidence_summary
     assert secret not in raw_ref
+
+
+def test_persistence_rejects_forged_sensitive_source_id_without_writing():
+    event = MxEvidence(
+        evidence_id="e" * 64,
+        source_type="mx",
+        source_id="Bearer persistence-source-secret",
+        rid=123,
+        content_hash="c" * 64,
+        summary="Authorization: Basic cGVyc2lzdGVuY2U6c2VjcmV0",
+        received_at=AS_OF,
+        source_created_at=None,
+        media=(),
+    )
+    snapshot = mx_adapter.CollectorSnapshot(
+        events=(event,), quality=object(), as_of=AS_OF
+    )
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+
+    with pytest.raises(ValueError, match="source_id"):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    ["https://secret.invalid/a.jpg", "/data/events/media/a.jpg", "data/events/media/../a.jpg"],
+)
+def test_persistence_rejects_forged_unsafe_media_path(local_path: str):
+    event = MxEvidence(
+        evidence_id="e" * 64,
+        source_type="mx",
+        source_id="event-safe",
+        rid=123,
+        content_hash="c" * 64,
+        summary="关注 600519",
+        received_at=AS_OF,
+        source_created_at=None,
+        media=(MediaMetadata("d" * 64, "image/jpeg", local_path, AS_OF),),
+    )
+    snapshot = mx_adapter.CollectorSnapshot(events=(event,), quality=object(), as_of=AS_OF)
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+
+    with pytest.raises(ValueError, match="media metadata"):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
 
 
 def test_persist_evidence_rolls_back_both_tables_on_failure(
