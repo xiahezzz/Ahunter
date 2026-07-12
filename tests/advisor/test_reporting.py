@@ -147,6 +147,33 @@ def test_failure_report_redacts_header_basic_bearer_jwt_and_session_values(tmp_p
     assert all(secret not in combined for secret in secrets)
 
 
+@pytest.mark.parametrize(
+    "unsafe_detail",
+    [
+        "Buy 600519 now",
+        "The analyst recommends accumulating after the breakout",
+        "access_token=failure-access-secret session_id=failure-session-secret",
+    ],
+)
+def test_failure_report_never_archives_caller_supplied_prose(
+    tmp_path: Path, unsafe_detail: str
+):
+    paths = write_failure_report(
+        "2026-07-11",
+        "premarket",
+        [QualityResult("market_staleness", "blocking", False, unsafe_detail)],
+        tmp_path,
+        run_id="safe-reason-codes",
+    )
+
+    payload = json.loads(paths.json_path.read_text(encoding="utf-8"))
+    combined = paths.markdown_path.read_text(encoding="utf-8") + json.dumps(payload)
+    assert unsafe_detail not in combined
+    assert payload["quality_results"][0]["details"] == "Market data freshness check failed."
+    for secret in ("failure-access-secret", "failure-session-secret"):
+        assert secret not in combined
+
+
 def test_failure_report_rejects_nonblocking_or_missing_failures(tmp_path: Path):
     with pytest.raises(ValueError, match="blocking quality"):
         write_failure_report(

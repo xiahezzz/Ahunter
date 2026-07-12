@@ -382,6 +382,37 @@ def test_snapshot_dto_redacts_forged_sensitive_values():
     assert evidence.to_dict()["source_id"] == "[redacted]"
 
 
+def test_media_dto_serialization_never_returns_unsafe_local_path():
+    media = MediaMetadata(
+        "d" * 64,
+        "image/jpeg",
+        "data/events/media/../access_token=media-secret.jpg",
+        AS_OF,
+    )
+
+    payload = media.to_dict()
+
+    assert payload["local_path"] == "[redacted]"
+    assert "media-secret" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "secret_text",
+    [
+        "access_token=access-secret",
+        "refresh_token=refresh-secret",
+        "session_id=session-secret",
+        "socket_id=socket-secret",
+    ],
+)
+def test_dto_redaction_covers_sensitive_compound_names(secret_text: str):
+    media = MediaMetadata("d" * 64, "image/jpeg", f"data/events/media/{secret_text}", AS_OF)
+
+    serialized = json.dumps(media.to_dict())
+
+    assert secret_text.split("=", 1)[1] not in serialized
+
+
 def test_collector_database_read_is_pinned_to_validated_descriptor(
     tmp_path, create_collector_db, write_allowed_rids, monkeypatch
 ):
@@ -473,7 +504,7 @@ def test_persist_evidence_is_idempotent_bounded_and_excludes_future(
     assert "source_url" not in normalized[1]
 
 
-def test_persist_evidence_excludes_future_source_and_media_timestamps(
+def test_persist_evidence_rejects_future_source_and_media_timestamps(
     tmp_path, create_collector_db, write_allowed_rids
 ):
     db, _ = create_collector_db(tmp_path)
@@ -491,9 +522,9 @@ def test_persist_evidence_excludes_future_source_and_media_timestamps(
     connection = sqlite3.connect(":memory:")
     _advisor_evidence_tables(connection)
 
-    records = persist_evidence(connection, "advisor-run", bounded_snapshot, as_of=AS_OF)
+    with pytest.raises(ValueError, match="source_created_at"):
+        persist_evidence(connection, "advisor-run", bounded_snapshot, as_of=AS_OF)
 
-    assert records == []
     assert connection.execute("SELECT count(*) FROM events_normalized").fetchone()[0] == 0
     assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 0
 
@@ -573,16 +604,108 @@ def test_persistence_rejects_forged_sensitive_source_id_without_writing():
 
 
 @pytest.mark.parametrize(
+    ("field", "forged", "message"),
+    [
+        ("evidence_id", "f" * 64, "evidence_id"),
+        ("source_type", "news", "source_type"),
+        ("rid", 0, "rid"),
+        ("content_hash", "C" * 64, "content_hash"),
+        ("source_id", "../forged-source", "source_id"),
+    ],
+)
+def test_persist_evidence_rejects_forged_identity_before_transaction(
+    field: str, forged: object, message: str
+):
+    source_id = "event-safe"
+    content_hash = "c" * 64
+    evidence_id = hashlib.sha256(
+        f"a-hunter:evidence:v1\0mx\0{source_id}\0{content_hash}".encode()
+    ).hexdigest()
+    event = MxEvidence(
+        evidence_id=evidence_id,
+        source_type="mx",
+        source_id=source_id,
+        rid=123,
+        content_hash=content_hash,
+        summary="关注 600519",
+        received_at=AS_OF,
+        source_created_at=None,
+        media=(),
+    )
+    event = replace(event, **{field: forged})
+    snapshot = mx_adapter.CollectorSnapshot(events=(event,), quality=object(), as_of=AS_OF)
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    with pytest.raises(ValueError, match=message):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    assert not any(statement.startswith(("BEGIN", "SAVEPOINT")) for statement in statements)
+    assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"summary": "token=forged-summary"}, "summary"),
+        ({"summary": "x" * 801}, "summary"),
+        ({"received_at": AS_OF + timedelta(seconds=1)}, "received_at"),
+        ({"source_created_at": datetime(2026, 7, 12, 8, 0)}, "source_created_at"),
+        ({"media": (MediaMetadata("D" * 64, "image/jpeg", "data/events/media/a.jpg", AS_OF),)}, "media"),
+        ({"media": (MediaMetadata("d" * 64, "image/jpeg", "data/events/media/a.jpg", AS_OF + timedelta(seconds=1)),)}, "media"),
+    ],
+)
+def test_persist_evidence_rejects_forged_payload_fields_without_writing(changes, message):
+    source_id = "event-safe"
+    content_hash = "c" * 64
+    event = MxEvidence(
+        evidence_id=hashlib.sha256(
+            f"a-hunter:evidence:v1\0mx\0{source_id}\0{content_hash}".encode()
+        ).hexdigest(),
+        source_type="mx",
+        source_id=source_id,
+        rid=123,
+        content_hash=content_hash,
+        summary="关注 600519",
+        received_at=AS_OF,
+        source_created_at=None,
+        media=(),
+    )
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+
+    with pytest.raises(ValueError, match=message):
+        persist_evidence(
+            connection,
+            "advisor-run",
+            mx_adapter.CollectorSnapshot(
+                events=(replace(event, **changes),), quality=object(), as_of=AS_OF
+            ),
+            as_of=AS_OF,
+        )
+
+    assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
     "local_path",
     ["https://secret.invalid/a.jpg", "/data/events/media/a.jpg", "data/events/media/../a.jpg"],
 )
 def test_persistence_rejects_forged_unsafe_media_path(local_path: str):
+    source_id = "event-safe"
+    content_hash = "c" * 64
     event = MxEvidence(
-        evidence_id="e" * 64,
+        evidence_id=hashlib.sha256(
+            f"a-hunter:evidence:v1\0mx\0{source_id}\0{content_hash}".encode()
+        ).hexdigest(),
         source_type="mx",
-        source_id="event-safe",
+        source_id=source_id,
         rid=123,
-        content_hash="c" * 64,
+        content_hash=content_hash,
         summary="关注 600519",
         received_at=AS_OF,
         source_created_at=None,

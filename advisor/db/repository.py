@@ -89,7 +89,7 @@ def record_market_source_attempt(
             raise ValueError("successful market source attempt requires persisted bars")
         details.update(
             proof_type="historical_market_fetch",
-            latest_expected_session=latest,
+            actual_latest_session=latest,
         )
     connection.execute(
         """

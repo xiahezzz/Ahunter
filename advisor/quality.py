@@ -125,6 +125,36 @@ def _collector_check(snapshot: CollectorSnapshot | None) -> QualityResult:
 
 
 def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
+    expected, error = _authoritative_expected_session(connection, request)
+    if error is not None or expected is None:
+        return _blocked_check("trading_calendar", error or "latest expected trading session is unavailable")
+    missing = [
+        code
+        for code in request.candidate_codes
+        if connection.execute(
+            """
+            SELECT 1 FROM market_daily
+            WHERE code = ? AND trade_date = ? AND quality_status = 'passed'
+            LIMIT 1
+            """,
+            (code, expected.isoformat()),
+        ).fetchone()
+        is None
+    ]
+    if missing:
+        return _blocked_check(
+            "trading_calendar",
+            f"latest expected trading session {expected.isoformat()} is not covered by candidate rows",
+        )
+    return QualityResult(
+        "trading_calendar", "blocking", True,
+        f"latest expected trading session {expected.isoformat()} is covered",
+    )
+
+
+def _authoritative_expected_session(
+    connection: sqlite3.Connection, request: QualityRequest
+) -> tuple[dt.date | None, str | None]:
     rows = connection.execute(
         """
         SELECT source, details_json FROM market_sources
@@ -136,59 +166,63 @@ def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequ
         (request.as_of.isoformat(), _MAX_SOURCE_ROWS + 1),
     ).fetchall()
     if len(rows) > _MAX_SOURCE_ROWS:
-        return _blocked_check("trading_calendar", "trading calendar proof scan limit exceeded")
-    latest_proofs: dict[tuple[str, str], dt.date] = {}
+        return None, "trading calendar proof scan limit exceeded"
+    claims_by_code: dict[str, set[dt.date]] = defaultdict(set)
     for source, raw_details in rows:
         try:
             details = json.loads(raw_details)
-            if not isinstance(details, dict) or details.get("proof_type") != "historical_market_fetch":
+            if not isinstance(details, dict) or details.get("proof_type") != "trading_calendar":
                 continue
-            code = details.get("code")
-            value = details.get("latest_expected_session")
-            if not isinstance(source, str) or not _CODE_RE.fullmatch(code or "") or not isinstance(value, str):
-                raise ValueError("invalid calendar proof")
-            if code not in request.candidate_codes:
+            coverage = details.get("coverage_codes")
+            scope = details.get("scope")
+            if coverage is not None:
+                if (
+                    not isinstance(coverage, list)
+                    or not coverage
+                    or len(coverage) > 200
+                    or len(set(coverage)) != len(coverage)
+                    or any(not isinstance(code, str) or not _CODE_RE.fullmatch(code) for code in coverage)
+                ):
+                    raise ValueError("invalid calendar coverage")
+                applicable_codes = set(request.candidate_codes).intersection(coverage)
+            elif scope == "a_share":
+                applicable_codes = set(request.candidate_codes)
+            else:
+                raise ValueError("invalid calendar coverage")
+            if not applicable_codes:
                 continue
-            key = (code, source)
-            if key not in latest_proofs:
-                latest_proofs[key] = dt.date.fromisoformat(value)
+            calendar_source = details.get("calendar_source")
+            if (
+                not isinstance(source, str)
+                or not isinstance(calendar_source, str)
+                or not _IDENTIFIER_RE.fullmatch(calendar_source)
+                or source != calendar_source
+            ):
+                raise ValueError("invalid calendar source")
+            proof_as_of = dt.datetime.fromisoformat(details.get("as_of"))
+            if (
+                proof_as_of.tzinfo is None
+                or proof_as_of.utcoffset() is None
+                or proof_as_of > request.as_of
+                or proof_as_of.date() != request.as_of.date()
+            ):
+                return None, "trading calendar proof is stale or not current for this run"
+            claimed = dt.date.fromisoformat(details.get("latest_expected_session"))
+            if claimed > request.as_of.date():
+                return None, "latest expected trading session is future-dated"
+            for code in applicable_codes:
+                claims_by_code[code].add(claimed)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return _blocked_check("trading_calendar", "trading calendar proof is invalid")
-
-    claims_by_code: dict[str, set[dt.date]] = defaultdict(set)
-    for (code, source), claimed in latest_proofs.items():
-        if claimed > request.as_of.date():
-            return _blocked_check("trading_calendar", "latest expected trading session is future-dated")
-        row = connection.execute(
-            """
-            SELECT MAX(trade_date) FROM market_daily
-            WHERE code = ? AND source = ? AND trade_date <= ? AND quality_status = 'passed'
-            """,
-            (code, source, request.as_of.date().isoformat()),
-        ).fetchone()
-        try:
-            latest_bar = dt.date.fromisoformat(row[0]) if row and row[0] else None
-        except (TypeError, ValueError):
-            latest_bar = None
-        if latest_bar != claimed:
-            return _blocked_check(
-                "trading_calendar",
-                f"latest expected trading session {claimed.isoformat()} is not covered by selected source",
-            )
-        claims_by_code[code].add(claimed)
+            return None, "trading calendar proof is invalid"
 
     if any(code not in claims_by_code for code in request.candidate_codes):
-        return _blocked_check("trading_calendar", "latest expected trading session is unavailable")
+        return None, "latest expected trading session is unavailable"
     if any(len(claims) != 1 for claims in claims_by_code.values()):
-        return _blocked_check("trading_calendar", "conflicting trading calendar proof")
+        return None, "conflicting trading calendar proof"
     expected_sessions = {next(iter(claims)) for claims in claims_by_code.values()}
     if len(expected_sessions) != 1:
-        return _blocked_check("trading_calendar", "conflicting trading calendar proof")
-    expected = next(iter(expected_sessions))
-    return QualityResult(
-        "trading_calendar", "blocking", True,
-        f"latest expected trading session {expected.isoformat()} is covered",
-    )
+        return None, "conflicting trading calendar proof"
+    return next(iter(expected_sessions)), None
 
 
 def _market_staleness_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
@@ -363,20 +397,25 @@ def _validate_ledger_row(account_id: object, transaction: LedgerTransaction) -> 
 
 def _optional_source_checks(connection: sqlite3.Connection, request: QualityRequest) -> tuple[QualityResult, ...]:
     rows = connection.execute(
-        "SELECT source, status, details_json FROM market_sources ORDER BY source, fetched_at DESC, source_key DESC LIMIT ?",
-        (_MAX_SOURCE_ROWS + 1,),
+        """
+        SELECT source, status, details_json FROM market_sources
+        WHERE julianday(fetched_at) IS NOT NULL AND julianday(fetched_at) <= julianday(?)
+        ORDER BY source, fetched_at DESC, source_key DESC LIMIT ?
+        """,
+        (request.as_of.isoformat(), _MAX_SOURCE_ROWS + 1),
     ).fetchall()
     if len(rows) > _MAX_SOURCE_ROWS:
         return (_blocked_check("optional_source_coverage", "market source scan limit exceeded"),)
     latest: dict[str, tuple[str, object]] = {}
+    parsed_rows: list[tuple[str, str, object]] = []
     for source, status, raw_details in rows:
-        if source in latest:
-            continue
         try:
             details = json.loads(raw_details)
         except (TypeError, json.JSONDecodeError):
             return (_blocked_check("optional_source_coverage", "market source details are invalid"),)
-        latest[source] = (status, details)
+        parsed_rows.append((source, status, details))
+        if source not in latest:
+            latest[source] = (status, details)
 
     passed_sources: set[str] = set()
     optional_failures: list[str] = []
@@ -394,16 +433,14 @@ def _optional_source_checks(connection: sqlite3.Connection, request: QualityRequ
         return (_blocked_check("market_source_state", f"{len(required_failures)} required market sources failed"),)
     if not optional_failures:
         return ()
-    source_marks = ",".join("?" for _ in passed_sources)
-    covered = bool(passed_sources) and all(
-        connection.execute(
-            f"""
-            SELECT 1 FROM market_daily
-            WHERE code = ? AND source IN ({source_marks}) AND quality_status = 'passed'
-            LIMIT 1
-            """,
-            (code, *sorted(passed_sources)),
-        ).fetchone()
+    expected, calendar_error = _authoritative_expected_session(connection, request)
+    if calendar_error is not None or expected is None:
+        return (_blocked_check("optional_source_coverage", "authoritative calendar coverage is unavailable"),)
+    cutoff = _three_year_cutoff(request.as_of.date())
+    covered = all(
+        _alternate_source_covers(
+            connection, code, cutoff, expected, passed_sources, parsed_rows
+        )
         for code in request.candidate_codes
     )
     if not covered:
@@ -414,6 +451,48 @@ def _optional_source_checks(connection: sqlite3.Connection, request: QualityRequ
             f"{len(optional_failures)} optional source failures covered by selected market source",
         ),
     )
+
+
+def _alternate_source_covers(
+    connection: sqlite3.Connection,
+    code: str,
+    cutoff: dt.date,
+    expected: dt.date,
+    passed_sources: set[str],
+    source_rows: list[tuple[str, str, object]],
+) -> bool:
+    for source, status, details in source_rows:
+        if (
+            status != "passed"
+            or source not in passed_sources
+            or not isinstance(details, dict)
+            or details.get("proof_type") != "historical_market_fetch"
+            or details.get("code") != code
+        ):
+            continue
+        try:
+            start = dt.date.fromisoformat(details.get("start"))
+            end = dt.date.fromisoformat(details.get("end"))
+            actual_latest = dt.date.fromisoformat(details.get("actual_latest_session"))
+        except (TypeError, ValueError):
+            continue
+        if start > cutoff or end < expected or actual_latest != expected:
+            continue
+        row = connection.execute(
+            """
+            SELECT MIN(trade_date), MAX(trade_date) FROM market_daily
+            WHERE code = ? AND source = ? AND trade_date <= ? AND quality_status = 'passed'
+            """,
+            (code, source, expected.isoformat()),
+        ).fetchone()
+        try:
+            earliest = dt.date.fromisoformat(row[0]) if row and row[0] else None
+            latest = dt.date.fromisoformat(row[1]) if row and row[1] else None
+        except (TypeError, ValueError):
+            continue
+        if earliest is not None and earliest <= cutoff and latest == expected:
+            return True
+    return False
 
 
 def _persist_checks(

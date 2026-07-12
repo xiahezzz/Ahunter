@@ -61,15 +61,36 @@ def quality_connection(tmp_path: Path) -> sqlite3.Connection:
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('calendar-proof', 'sina_http', 'bounded', 'calendar', ?, 'passed', ?)
+        ) VALUES ('calendar-proof', 'exchange_calendar', 'bounded', 'calendar', ?, 'passed', ?)
         """,
         (
             AS_OF.isoformat(),
             json.dumps(
                 {
-                    "code": "600519",
+                    "as_of": AS_OF.isoformat(),
+                    "calendar_source": "exchange_calendar",
+                    "coverage_codes": ["600519"],
                     "latest_expected_session": "2026-07-10",
+                    "proof_type": "trading_calendar",
+                }
+            ),
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('historical-fetch', 'sina_http', 'bounded', 'fetch', ?, 'passed', ?)
+        """,
+        (
+            AS_OF.isoformat(),
+            json.dumps(
+                {
+                    "actual_latest_session": "2026-07-10",
+                    "code": "600519",
+                    "end": "2026-07-12",
                     "proof_type": "historical_market_fetch",
+                    "start": "2023-07-11",
                 }
             ),
         ),
@@ -240,6 +261,37 @@ def test_trading_calendar_passes_when_candidate_covers_latest_expected_session(t
     assert "2026-07-10" in check.details
 
 
+def test_incomplete_historical_fetch_cannot_self_authorize_calendar_freshness(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM market_sources")
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('fetch-only', 'sina_http', 'bounded', 'fetch', ?, 'passed', ?)
+        """,
+        (
+            AS_OF.isoformat(),
+            json.dumps(
+                {
+                    "actual_latest_session": "2026-07-10",
+                    "code": "600519",
+                    "end": "2026-07-12",
+                    "proof_type": "historical_market_fetch",
+                    "start": "2023-07-11",
+                }
+            ),
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    assert next(
+        check for check in result.checks if check.check_name == "trading_calendar"
+    ).blocking_failure
+
+
 def test_unrelated_source_row_cannot_supply_calendar_proof(tmp_path: Path):
     connection = quality_connection(tmp_path)
     connection.execute("DELETE FROM market_sources")
@@ -272,9 +324,11 @@ def test_authoritative_proof_for_unrelated_code_is_ignored(tmp_path: Path):
             AS_OF.isoformat(),
             json.dumps(
                 {
-                    "code": "000001",
+                    "as_of": AS_OF.isoformat(),
+                    "calendar_source": "exchange_calendar",
+                    "coverage_codes": ["000001"],
                     "latest_expected_session": "2026-07-10",
-                    "proof_type": "historical_market_fetch",
+                    "proof_type": "trading_calendar",
                 }
             ),
         ),
@@ -304,15 +358,17 @@ def test_conflicting_current_calendar_claims_block(tmp_path: Path):
         """
         INSERT INTO market_sources (
           source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('other-proof', 'other_source', 'bounded', 'other', ?, 'passed', ?)
+        ) VALUES ('other-proof', 'other_calendar', 'bounded', 'other', ?, 'passed', ?)
         """,
         (
             AS_OF.isoformat(),
             json.dumps(
                 {
-                    "code": "600519",
+                    "as_of": AS_OF.isoformat(),
+                    "calendar_source": "other_calendar",
+                    "coverage_codes": ["600519"],
                     "latest_expected_session": "2026-07-09",
-                    "proof_type": "historical_market_fetch",
+                    "proof_type": "trading_calendar",
                 }
             ),
         ),
@@ -333,9 +389,11 @@ def test_calendar_proof_newer_than_selected_source_data_blocks(tmp_path: Path):
         (
             json.dumps(
                 {
-                    "code": "600519",
+                    "as_of": AS_OF.isoformat(),
+                    "calendar_source": "exchange_calendar",
+                    "coverage_codes": ["600519"],
                     "latest_expected_session": "2026-07-11",
-                    "proof_type": "historical_market_fetch",
+                    "proof_type": "trading_calendar",
                 }
             ),
         ),
@@ -347,6 +405,27 @@ def test_calendar_proof_newer_than_selected_source_data_blocks(tmp_path: Path):
     check = next(check for check in result.checks if check.check_name == "trading_calendar")
     assert check.blocking_failure
     assert "2026-07-11" in check.details
+
+
+def test_stale_calendar_proof_blocks_current_run(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    details = json.loads(
+        connection.execute(
+            "SELECT details_json FROM market_sources WHERE source_key = 'calendar-proof'"
+        ).fetchone()[0]
+    )
+    details["as_of"] = (AS_OF - timedelta(days=1)).isoformat()
+    connection.execute(
+        "UPDATE market_sources SET details_json = ? WHERE source_key = 'calendar-proof'",
+        (json.dumps(details),),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "current" in check.details or "stale" in check.details
 
 
 def test_invalid_ledger_replay_blocks(tmp_path: Path):
@@ -429,7 +508,15 @@ def test_optional_source_failure_is_warning_only_when_selected_source_covers_req
                 "p2",
                 AS_OF.isoformat(),
                 "passed",
-                json.dumps({"code": "600519", "start": "2023-07-11", "end": "2026-07-12"}),
+                json.dumps(
+                    {
+                        "actual_latest_session": "2026-07-10",
+                        "code": "600519",
+                        "end": "2026-07-12",
+                        "proof_type": "historical_market_fetch",
+                        "start": "2023-07-11",
+                    }
+                ),
             ),
         ],
     )
@@ -441,6 +528,82 @@ def test_optional_source_failure_is_warning_only_when_selected_source_covers_req
     warnings = [check for check in result.checks if check.severity == "warning"]
     assert len(warnings) == 1
     assert warnings[0].passed is False
+
+
+def test_optional_source_single_recent_row_does_not_prove_interval_coverage(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM market_daily WHERE trade_date = '2023-07-11'")
+    connection.executemany(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES (?, ?, 'bounded', ?, ?, ?, ?)
+        """,
+        [
+            ("optional-failed", "optional_news", "p1", AS_OF.isoformat(), "failed", '{"optional":true}'),
+            (
+                "selected-passed",
+                "sina_http",
+                "p2",
+                AS_OF.isoformat(),
+                "passed",
+                json.dumps(
+                    {
+                        "actual_latest_session": "2026-07-10",
+                        "code": "600519",
+                        "end": "2026-07-12",
+                        "proof_type": "historical_market_fetch",
+                        "start": "2026-07-10",
+                    }
+                ),
+            ),
+        ],
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    assert next(
+        check for check in result.checks if check.check_name == "optional_source_coverage"
+    ).blocking_failure
+
+
+def test_optional_source_unrelated_code_fetch_is_ignored(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute("UPDATE market_daily SET source = 'other_source'")
+    connection.executemany(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES (?, ?, 'bounded', ?, ?, ?, ?)
+        """,
+        [
+            ("optional-failed", "optional_news", "p1", AS_OF.isoformat(), "failed", '{"optional":true}'),
+            (
+                "unrelated-passed",
+                "other_source",
+                "p2",
+                AS_OF.isoformat(),
+                "passed",
+                json.dumps(
+                    {
+                        "actual_latest_session": "2026-07-10",
+                        "code": "000001",
+                        "end": "2026-07-12",
+                        "proof_type": "historical_market_fetch",
+                        "start": "2023-07-11",
+                    }
+                ),
+            ),
+        ],
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    assert next(
+        check for check in result.checks if check.check_name == "optional_source_coverage"
+    ).blocking_failure
 
 
 def test_optional_source_failure_blocks_when_passing_source_does_not_supply_candidate_data(tmp_path: Path):

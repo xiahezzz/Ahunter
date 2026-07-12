@@ -9,13 +9,17 @@ from datetime import datetime
 from advisor.evidence.mx_adapter import (
     CollectorSnapshot,
     MxEvidence,
+    evidence_id_for,
     redact_sensitive_text,
+    valid_content_hash,
     valid_media_metadata,
     valid_opaque_identifier,
 )
 
 
 _STOCK_CODE_RE = re.compile(r"\b([03468]\d{5})\b")
+_MAX_SUMMARY_CHARS = 800
+_MAX_MEDIA_PER_EVENT = 20
 
 
 @dataclass(frozen=True)
@@ -52,12 +56,11 @@ def persist_evidence(
     ):
         raise ValueError("snapshot as_of exceeds run as_of")
 
+    if not isinstance(snapshot.events, tuple) or len(snapshot.events) > 100:
+        raise ValueError("invalid snapshot events")
     for event in snapshot.events:
-        if not valid_opaque_identifier(getattr(event, "source_id", None)):
-            raise ValueError("invalid source_id")
-        if any(not valid_media_metadata(item) for item in getattr(event, "media", ())):
-            raise ValueError("invalid media metadata")
-    events = [event for event in snapshot.events if _event_is_bounded(event, as_of)]
+        _validate_event(event, as_of)
+    events = list(snapshot.events)
     records = [_record(run_id, event) for event in events]
     owns_transaction = not connection.in_transaction
     savepoint = "mx_evidence_handoff"
@@ -152,26 +155,49 @@ def _record(run_id: str, event: MxEvidence) -> EvidenceRecord:
     )
 
 
-def _event_is_bounded(event: MxEvidence, as_of: datetime) -> bool:
-    timestamps = (event.received_at, event.source_created_at)
+def _validate_event(event: object, as_of: datetime) -> None:
+    if not isinstance(event, MxEvidence):
+        raise ValueError("invalid evidence DTO")
+    if event.source_type != "mx":
+        raise ValueError("invalid source_type")
+    if type(event.rid) is not int or event.rid <= 0:
+        raise ValueError("invalid rid")
+    if not valid_content_hash(event.content_hash):
+        raise ValueError("invalid content_hash")
+    if not valid_opaque_identifier(event.source_id):
+        raise ValueError("invalid source_id")
+    if not valid_content_hash(event.evidence_id) or event.evidence_id != evidence_id_for(
+        event.source_id, event.content_hash
+    ):
+        raise ValueError("invalid evidence_id")
+    _validate_timestamp("received_at", event.received_at, as_of)
+    if event.source_created_at is not None:
+        _validate_timestamp("source_created_at", event.source_created_at, as_of)
+    if (
+        not isinstance(event.summary, str)
+        or len(event.summary) > _MAX_SUMMARY_CHARS
+        or any(ord(character) < 32 or ord(character) == 127 for character in event.summary)
+        or " ".join(event.summary.split()) != event.summary
+        or redact_sensitive_text(event.summary) != event.summary
+    ):
+        raise ValueError("invalid summary")
+    if not isinstance(event.media, tuple) or len(event.media) > _MAX_MEDIA_PER_EVENT:
+        raise ValueError("invalid media metadata")
+    for item in event.media:
+        if not valid_media_metadata(item):
+            raise ValueError("invalid media metadata")
+        _validate_timestamp("media downloaded_at", item.downloaded_at, as_of)
+
+
+def _validate_timestamp(name: str, value: object, as_of: datetime) -> None:
     try:
-        if any(
-            value is not None
-            and (
-                not isinstance(value, datetime)
-                or value.tzinfo is None
-                or value.utcoffset() is None
-                or value > as_of
-            )
-            for value in timestamps
-        ):
-            return False
-        return all(
-            isinstance(item.downloaded_at, datetime)
-            and item.downloaded_at.tzinfo is not None
-            and item.downloaded_at.utcoffset() is not None
-            and item.downloaded_at <= as_of
-            for item in event.media
+        valid = (
+            isinstance(value, datetime)
+            and value.tzinfo is not None
+            and value.utcoffset() is not None
+            and value <= as_of
         )
     except (TypeError, ValueError, OverflowError):
-        return False
+        valid = False
+    if not valid:
+        raise ValueError(f"invalid {name}")

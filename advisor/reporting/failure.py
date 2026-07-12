@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
-from advisor.evidence.mx_adapter import redact_sensitive_text
 from advisor.quality import QualityResult
 from advisor.reporting.contracts import ReportPaths, atomic_write_pair, validate_run_id
 
 
-_SAFE_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
-_SENSITIVE = re.compile(
-    r"(?:advice|review\s+conclusion|analyst|raw(?:_payload|\s+mx)?|credential|cookie|token|secret|password|authorization|session|socket|debug|cdp)",
-    re.IGNORECASE,
-)
+_SAFE_DESCRIPTIONS = {
+    "collector_state": "Collector state check failed.",
+    "trading_calendar": "Trading calendar check failed.",
+    "market_staleness": "Market data freshness check failed.",
+    "three_year_candidate_coverage": "Market history coverage check failed.",
+    "future_data_leakage": "Future-data boundary check failed.",
+    "ledger_replay": "Ledger replay check failed.",
+    "analyst_contract_readiness": "Required output readiness check failed.",
+    "market_source_state": "Market source state check failed.",
+    "optional_source_coverage": "Alternate source coverage check failed.",
+}
 
 
 def write_failure_report(
@@ -85,17 +89,10 @@ def _valid_blocking_failure(value: object) -> bool:
 
 
 def _safe_failure(failure: QualityResult) -> dict[str, object]:
-    check_name = (
-        failure.check_name
-        if _SAFE_NAME.fullmatch(failure.check_name) and not _SENSITIVE.search(failure.check_name)
-        else "quality_check"
-    )
-    details = redact_sensitive_text(failure.details.strip())[:800]
-    if _SENSITIVE.search(details):
-        details = "sensitive quality detail omitted"
+    check_name = failure.check_name if failure.check_name in _SAFE_DESCRIPTIONS else "quality_check"
     return {
         "check_name": check_name,
-        "details": details,
+        "details": _SAFE_DESCRIPTIONS.get(check_name, "Quality check failed."),
         "passed": False,
         "severity": "blocking",
     }

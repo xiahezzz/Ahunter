@@ -85,7 +85,7 @@ def test_backfill_is_idempotent_but_records_every_attempt(tmp_path: Path):
         connection.close()
 
 
-def test_successful_backfill_records_authoritative_calendar_proof(tmp_path: Path):
+def test_successful_backfill_records_fetch_metadata_without_self_authorizing_calendar(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
 
     update_market_database(
@@ -108,7 +108,9 @@ def test_successful_backfill_records_authoritative_calendar_proof(tmp_path: Path
         connection.close()
     assert details["proof_type"] == "historical_market_fetch"
     assert details["code"] == "600519"
-    assert details["latest_expected_session"] == "2026-07-10"
+    assert details["actual_latest_session"] == "2026-07-10"
+    assert "latest_expected_session" not in details
+    assert "calendar_source" not in details
 
 
 def test_failed_second_code_preserves_committed_first_code(tmp_path: Path):

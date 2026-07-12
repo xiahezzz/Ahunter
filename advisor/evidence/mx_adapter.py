@@ -36,7 +36,7 @@ _JWT = re.compile(
     r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
 )
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"\b(?:api[_-]?key|secret|password|credential|token|session|socket(?:[_.-]?id)?|debug(?:ger|[_.-]?id)?|cdp)\s*[:=]\s*[^\s,;]+",
+    r"\b(?:api[_-]?key|secret|password|credential|(?:access|refresh|id)?[_-]?token|session(?:[_.-]?id)?|socket(?:[_.-]?id)?|debug(?:ger|[_.-]?id)?|cdp)\s*[:=]\s*[^\s,;]+",
     re.IGNORECASE,
 )
 _SECRET_PREFIX = re.compile(r"\b(?:sk|pk|sess)_[A-Za-z0-9_-]{8,}", re.IGNORECASE)
@@ -88,7 +88,7 @@ class MediaMetadata:
         return {
             "content_hash": redact_sensitive_text(self.content_hash),
             "content_type": redact_sensitive_text(self.content_type),
-            "local_path": redact_sensitive_text(self.local_path),
+            "local_path": self.local_path if valid_local_media_path(self.local_path) else "[redacted]",
             "downloaded_at": self.downloaded_at.isoformat(),
         }
 
@@ -429,9 +429,8 @@ def _event_from_row(row: sqlite3.Row, media: tuple[MediaMetadata, ...], as_of: d
         if row["source_created_at"] is not None
         else None
     )
-    digest_input = f"a-hunter:evidence:v1\0mx\0{source_id}\0{content_hash}".encode("utf-8")
     return MxEvidence(
-        evidence_id=hashlib.sha256(digest_input).hexdigest(),
+        evidence_id=evidence_id_for(source_id, content_hash),
         source_type="mx",
         source_id=source_id,
         rid=rid,
@@ -450,7 +449,16 @@ def _timestamp(value: object, zone) -> datetime:
 
 
 def _valid_hash(value: object) -> bool:
-    return isinstance(value, str) and len(value) == 64 and set(value.lower()) <= _HASH_CHARS
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _HASH_CHARS
+
+
+def valid_content_hash(value: object) -> bool:
+    return _valid_hash(value)
+
+
+def evidence_id_for(source_id: str, content_hash: str) -> str:
+    digest_input = f"a-hunter:evidence:v1\0mx\0{source_id}\0{content_hash}".encode("utf-8")
+    return hashlib.sha256(digest_input).hexdigest()
 
 
 def valid_local_media_path(value: str) -> bool:
@@ -489,6 +497,9 @@ def valid_media_metadata(value: object) -> bool:
         and bool(_MEDIA_CONTENT_TYPE.fullmatch(value.content_type))
         and isinstance(value.local_path, str)
         and valid_local_media_path(value.local_path)
+        and isinstance(value.downloaded_at, datetime)
+        and value.downloaded_at.tzinfo is not None
+        and value.downloaded_at.utcoffset() is not None
     )
 
 
