@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from advisor.agents.astock_adapter import ANALYST_ROLES
 from advisor.db.migrate import migrate_database
 from advisor.evidence.mx_adapter import CollectorSnapshot, MediaMetadata, MxEvidence
@@ -380,6 +382,46 @@ def test_conflicting_current_calendar_claims_block(tmp_path: Path):
     check = next(check for check in result.checks if check.check_name == "trading_calendar")
     assert check.blocking_failure
     assert "conflict" in check.details
+
+
+def test_historical_calendar_proof_is_ignored_when_current_proof_is_available(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    historical_as_of = AS_OF - timedelta(days=1)
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('historical-calendar-proof', 'historical_calendar', 'bounded', 'historical', ?, 'passed', ?)
+        """,
+        (
+            historical_as_of.isoformat(),
+            json.dumps(
+                {
+                    "as_of": historical_as_of.isoformat(),
+                    "calendar_source": "historical_calendar",
+                    "coverage_codes": ["600519"],
+                    "latest_expected_session": "2026-07-09",
+                    "proof_type": "trading_calendar",
+                }
+            ),
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    assert next(check for check in result.checks if check.check_name == "trading_calendar").passed
+
+
+@pytest.mark.parametrize("run_id", ("token=secret", "../escape", "run\nid"))
+def test_unsafe_quality_request_run_id_blocks_without_persisting_checks(tmp_path: Path, run_id: str):
+    connection = quality_connection(tmp_path)
+
+    result = evaluate_run_quality(connection, request(run_id=run_id))
+
+    assert result.status == "blocked"
+    assert any(check.blocking_failure for check in result.checks)
+    assert connection.execute("SELECT count(*) FROM data_quality_checks").fetchone()[0] == 0
 
 
 def test_calendar_proof_newer_than_selected_source_data_blocks(tmp_path: Path):

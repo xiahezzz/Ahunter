@@ -504,6 +504,22 @@ def test_persist_evidence_is_idempotent_bounded_and_excludes_future(
     assert "source_url" not in normalized[1]
 
 
+@pytest.mark.parametrize("run_id", ("token=secret", "../escape", "run\nid"))
+def test_persist_evidence_rejects_unsafe_run_id_before_writing(
+    tmp_path, create_collector_db, write_allowed_rids, run_id: str
+):
+    db, _ = create_collector_db(tmp_path)
+    snapshot = read_collector_snapshot(db, write_allowed_rids(tmp_path, [123]), as_of=AS_OF)
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+
+    with pytest.raises(ValueError, match="invalid run_id"):
+        persist_evidence(connection, run_id, snapshot, as_of=AS_OF)
+
+    assert connection.execute("SELECT count(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM evidence").fetchone()[0] == 0
+
+
 def test_persist_evidence_rejects_future_source_and_media_timestamps(
     tmp_path, create_collector_db, write_allowed_rids
 ):

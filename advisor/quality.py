@@ -21,6 +21,7 @@ _MAX_STALENESS_DAYS = 7
 _VALID_RUN_TYPES = frozenset({"premarket", "review"})
 _CODE_RE = re.compile(r"[03468]\d{5}\Z")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,7 @@ def evaluate_run_quality(
         status="blocked" if any(check.blocking_failure for check in checks) else "passed",
         checks=tuple(checks),
     )
-    if isinstance(request, QualityRequest) and isinstance(request.run_id, str) and request.run_id:
+    if isinstance(request, QualityRequest) and _valid_run_id(request.run_id):
         _persist_checks(connection, request, result.checks)
     return result
 
@@ -91,7 +92,7 @@ def evaluate_run_quality(
 def _validate_request(request: object) -> tuple[bool, str]:
     if not isinstance(request, QualityRequest):
         return False, "quality request is missing or invalid"
-    if not isinstance(request.run_id, str) or not request.run_id or len(request.run_id) > 64:
+    if not _valid_run_id(request.run_id):
         return False, "quality request run ID is invalid"
     if request.run_type not in _VALID_RUN_TYPES:
         return False, "quality request run type is invalid"
@@ -109,6 +110,10 @@ def _validate_request(request: object) -> tuple[bool, str]:
     if not isinstance(request.collector, CollectorSnapshot):
         return False, "collector snapshot is missing or invalid"
     return True, "quality request is valid"
+
+
+def _valid_run_id(value: object) -> bool:
+    return isinstance(value, str) and _RUN_ID_RE.fullmatch(value) is not None
 
 
 def _collector_check(snapshot: CollectorSnapshot | None) -> QualityResult:
@@ -168,11 +173,20 @@ def _authoritative_expected_session(
     if len(rows) > _MAX_SOURCE_ROWS:
         return None, "trading calendar proof scan limit exceeded"
     claims_by_code: dict[str, set[dt.date]] = defaultdict(set)
+    saw_historical_proof = False
     for source, raw_details in rows:
         try:
             details = json.loads(raw_details)
             if not isinstance(details, dict) or details.get("proof_type") != "trading_calendar":
                 continue
+            proof_as_of = dt.datetime.fromisoformat(details.get("as_of"))
+            if proof_as_of.tzinfo is None or proof_as_of.utcoffset() is None:
+                raise ValueError("invalid calendar as_of")
+            if proof_as_of.date() < request.as_of.date():
+                saw_historical_proof = True
+                continue
+            if proof_as_of > request.as_of or proof_as_of.date() != request.as_of.date():
+                return None, "trading calendar proof is stale or not current for this run"
             coverage = details.get("coverage_codes")
             scope = details.get("scope")
             if coverage is not None:
@@ -199,14 +213,6 @@ def _authoritative_expected_session(
                 or source != calendar_source
             ):
                 raise ValueError("invalid calendar source")
-            proof_as_of = dt.datetime.fromisoformat(details.get("as_of"))
-            if (
-                proof_as_of.tzinfo is None
-                or proof_as_of.utcoffset() is None
-                or proof_as_of > request.as_of
-                or proof_as_of.date() != request.as_of.date()
-            ):
-                return None, "trading calendar proof is stale or not current for this run"
             claimed = dt.date.fromisoformat(details.get("latest_expected_session"))
             if claimed > request.as_of.date():
                 return None, "latest expected trading session is future-dated"
@@ -216,6 +222,8 @@ def _authoritative_expected_session(
             return None, "trading calendar proof is invalid"
 
     if any(code not in claims_by_code for code in request.candidate_codes):
+        if saw_historical_proof and not claims_by_code:
+            return None, "trading calendar proof is stale or not current for this run"
         return None, "latest expected trading session is unavailable"
     if any(len(claims) != 1 for claims in claims_by_code.values()):
         return None, "conflicting trading calendar proof"

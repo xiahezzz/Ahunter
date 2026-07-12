@@ -18,6 +18,7 @@ from advisor.evidence.mx_adapter import (
 
 
 _STOCK_CODE_RE = re.compile(r"\b([03468]\d{5})\b")
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _MAX_SUMMARY_CHARS = 800
 _MAX_MEDIA_PER_EVENT = 20
 
@@ -42,7 +43,7 @@ def persist_evidence(
 ) -> list[EvidenceRecord]:
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("connection must be sqlite3.Connection")
-    if not isinstance(run_id, str) or not run_id or len(run_id) > 64:
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
         raise ValueError("invalid run_id")
     if not isinstance(snapshot, CollectorSnapshot):
         raise TypeError("snapshot must be CollectorSnapshot")
