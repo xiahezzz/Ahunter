@@ -10,11 +10,15 @@ Archive consistency implementation commit: `280469b`
 
 Premarket linkage implementation commit: `9d326aa`
 
+Eligibility capacity implementation commit: `c71125d`
+
 Required commit subject: `fix: complete coordinator review paths`
 
 Archive consistency commit subject: `fix: hide orphan report archives`
 
 Premarket linkage commit subject: `fix: require archived premarket linkage`
+
+Eligibility capacity commit subject: `fix: bound report eligibility queries`
 
 ## Summary
 
@@ -30,8 +34,27 @@ Premarket linkage commit subject: `fix: require archived premarket linkage`
 - Review now requires the exact selected premarket filesystem archive to have one matching `report_archive` row joined to a `passed` premarket `advisor_runs` row.
 - The stored Markdown and JSON paths must normalize to the selected archive paths without resolving or trusting symlinks, and every archived advice item must belong to that one linked database run.
 - Orphan premarket archives and archives combining advice from multiple passed premarket runs fail closed before any review rows are written.
+- Report listing now checks only the verified filesystem candidates on the requested page, and report detail checks only its exact requested key.
+- Current-state eligibility is restricted to its existing 30-day lookback, ordered newest-first, and capped without failing all eligibility when older archive history exceeds the cap.
+- More than 500 historical passed archive rows, including rows whose archive files are absent, no longer hide a current database-backed verified report from list, detail, or current-state responses.
 
 ## TDD Evidence
+
+The eligibility capacity regression failed before implementation because the global 501-row query returned no eligible keys:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py::test_current_report_remains_eligible_after_archive_history_exceeds_capacity -q
+F                                                                        [100%]
+1 failed in 0.52s
+```
+
+After bounding eligibility by page candidates, exact detail key, and current-state lookback, the regression and existing orphan controls passed:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py::test_current_report_remains_eligible_after_archive_history_exceeds_capacity tests/advisor/test_web_api.py::test_report_routes_list_and_serve_only_verified_archives tests/advisor/test_web_api.py::test_report_routes_hide_verified_archive_without_committed_archive_row -q
+...                                                                      [100%]
+3 passed in 0.43s
+```
 
 The new coordinator regressions failed before implementation with the expected eight failures:
 
@@ -92,6 +115,53 @@ After requiring the archive row and single linked advice run, the targeted regre
 ```
 
 ## Verification
+
+Eligibility capacity required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_reporting.py tests/advisor/test_quality_gate.py tests/advisor/test_astock_adapter.py tests/advisor/test_profiles.py tests/advisor/test_kline_chart.py -q
+........................................................................ [ 32%]
+........................................................................ [ 64%]
+........................................................................ [ 96%]
+.......                                                                  [100%]
+223 passed in 4.26s
+```
+
+Eligibility capacity complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 18%]
+........................................................................ [ 36%]
+........................................................................ [ 55%]
+........................................................................ [ 73%]
+........................................................................ [ 92%]
+...............................                                          [100%]
+391 passed in 6.03s
+```
+
+Eligibility capacity offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+suites 0
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 509.462833
+```
+
+Eligibility capacity static check:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, Chrome operation, or MX page operation was performed.
 
 Premarket linkage required focused suite:
 
