@@ -681,3 +681,86 @@ No live smoke test, browser screenshot QA, MX page operation, collector start, R
 ### Concerns
 
 Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched and are not included in the final replay-fix commits.
+
+## Final CSV Decoder Normalization Fix
+
+Required code commit subject: `fix: normalize ledger csv decoder errors`
+
+Required report commit subject: `docs: record task 17 csv decoder fix`
+
+### Summary
+
+- Normalized `UnicodeDecodeError` from `load_ledger_csv` into deterministic `ValueError("invalid ledger CSV encoding: invalid UTF-8")`.
+- Preserved existing `_csv.Error` normalization and CLI `ValueError` usage-error handling.
+- Added direct loader and CLI regression coverage for invalid UTF-8 CSV input without traceback.
+
+### RED Evidence
+
+Invalid UTF-8 initially surfaced raw codec details instead of the deterministic ledger error:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_load_ledger_csv_normalizes_invalid_utf8 tests/advisor/test_ledger.py::test_cli_reports_invalid_utf8_as_usage_error_without_traceback -q
+FF                                                                       [100%]
+2 failed in 0.18s
+```
+
+### GREEN Evidence
+
+Focused decoder regressions after the fix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_load_ledger_csv_normalizes_invalid_utf8 tests/advisor/test_ledger.py::test_cli_reports_invalid_utf8_as_usage_error_without_traceback -q
+..                                                                       [100%]
+2 passed in 0.21s
+```
+
+### Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 37%]
+........................................................................ [ 74%]
+..................................................                       [100%]
+194 passed in 5.81s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 15%]
+........................................................................ [ 31%]
+........................................................................ [ 47%]
+........................................................................ [ 63%]
+........................................................................ [ 79%]
+........................................................................ [ 95%]
+......................                                                   [100%]
+454 passed in 7.82s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 512.937208
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
+### Changed Files
+
+- `advisor/ledger/importer.py`
+- `tests/advisor/test_ledger.py`
+- `.superpowers/sdd/task-17-report.md`
+
+### Concerns
+
+Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched.
