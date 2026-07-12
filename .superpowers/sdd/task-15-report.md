@@ -127,3 +127,81 @@ No collector, live smoke test, MX page operation, RID modification, market provi
 - `analyst_contract_readiness` intentionally requires one persisted output for every `ANALYST_ROLES` role and candidate before the quality gate can pass. Task 16 coordination must evaluate this gate after analyst outputs are staged, while still preventing advice/review publication until the gate passes.
 - The collector snapshot blocks when bounded event, counter, media, failure, or source scans exceed their caps. This is intentional fail-closed behavior; operational retention must keep the collector ledger within those review bounds.
 - Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched and were not included in the implementation commit.
+
+## Reviewer Fix: MX Quality Gate Hardening
+
+### Status
+
+DONE
+
+Implementation commit: `1e80a6eec04d3d984b5075d6786f8df725fa9efa`
+
+Required commit subject: `fix: harden mx quality gate`
+
+### Fix Summary
+
+- Enforced run `as_of` against snapshot, received, source-created, and media-download timestamps in evidence persistence; the quality gate independently detects forged future collector boundaries.
+- Expanded redaction for complete Authorization/Bearer, Cookie, standalone bearer, JWT-like, prefixed, and assignment secrets at returned-object and persistence boundaries.
+- Replaced each run's complete persisted quality-check set atomically with transaction/savepoint rollback behavior.
+- Required persisted `latest_expected_session` source metadata and exact candidate coverage of that session for the trading-calendar check.
+- Pinned SQLite reads to a private hard link verified against the held database descriptor, including descriptor-verified WAL/SHM sidecars, while retaining `mode=ro` and `query_only`.
+
+### RED Evidence
+
+The nine focused reviewer regressions initially produced:
+
+```text
+9 failed in 0.38s
+```
+
+Failures covered incomplete secret redaction, pathname reopening, future source/media persistence, future snapshot acceptance, future collector leakage, stale latest-session coverage, missing expected-session details, and stale persisted optional-source checks. After correcting a test-wrapper argument collision, the descriptor path-swap regression failed on the existing pathname identity check with:
+
+```text
+ValueError: collector database changed while opening
+1 failed in 0.15s
+```
+
+### GREEN Evidence
+
+The same nine focused reviewer regressions after implementation:
+
+```text
+9 passed in 0.14s
+```
+
+Required focused Task 15 and reporting suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py -q
+116 passed in 0.64s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+250 passed in 3.95s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 507.752416
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+A direct read-only inspection also confirmed that the pinned connection sees an uncheckpointed live WAL row and reports `PRAGMA query_only = 1`.
+
+### Concerns
+
+None. No collector implementation, RID values, Chrome session, market provider/backfill, reporting implementation, frontend, broker, or order behavior was changed or invoked.
