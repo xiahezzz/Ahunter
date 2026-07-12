@@ -14,6 +14,8 @@ Eligibility capacity implementation commit: `c71125d`
 
 Final consistency implementation commit: `9169090`
 
+Final race/capacity implementation commit: `683c086`
+
 Required commit subject: `fix: complete coordinator review paths`
 
 Archive consistency commit subject: `fix: hide orphan report archives`
@@ -23,6 +25,101 @@ Premarket linkage commit subject: `fix: require archived premarket linkage`
 Eligibility capacity commit subject: `fix: bound report eligibility queries`
 
 Final consistency commit subject: `fix: close coordinator consistency gaps`
+
+Final race/capacity commit subject: `fix: stabilize report visibility and review linkage`
+
+## Final Race/Capacity Summary
+
+- Current-state and report listing now select eligible report keys from `report_archive` joined to the required advisor run status, then verify each exact archive with `read_verified_archive`.
+- Report visibility no longer depends on scanning every entry in a report date directory. A DB-backed verified report remains available when 504 unrelated same-day files push the directory beyond the 500-entry scanner limit.
+- Report list cursors remain app-instance-signed and detect changes to the verified DB-backed snapshot. Filesystem-only orphans neither appear in listings nor affect cursor snapshots.
+- Review coordination now acquires `BEGIN IMMEDIATE` before loading and validating morning advice. Linkage validation, review projections, archive metadata, and passed run status remain in one write transaction.
+- No collector behavior, RID configuration, broker/order code, live Chrome state, or MX page was touched.
+
+## Final Race/Capacity TDD Evidence
+
+The two new regressions failed before implementation for the expected scanner-capacity collapse and stale linkage publication window:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py::test_report_apis_keep_db_backed_archive_when_same_day_directory_exceeds_scan_limit tests/advisor/test_coordinator.py::test_review_linkage_cannot_change_between_validation_and_publication -q
+FF                                                                       [100%]
+2 failed in 1.36s
+```
+
+After implementation, the same regressions passed:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py::test_report_apis_keep_db_backed_archive_when_same_day_directory_exceeds_scan_limit tests/advisor/test_coordinator.py::test_review_linkage_cannot_change_between_validation_and_publication -q
+..                                                                       [100%]
+2 passed in 1.12s
+```
+
+The complete coordinator and web API files passed before required verification:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py tests/advisor/test_web_api.py -q
+........................................................................ [ 79%]
+...................                                                      [100%]
+91 passed in 3.69s
+```
+
+## Final Race/Capacity Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py tests/advisor/test_web_api.py tests/advisor/test_reporting.py tests/advisor/test_quality_gate.py tests/advisor/test_astock_adapter.py tests/advisor/test_profiles.py tests/advisor/test_kline_chart.py -q
+........................................................................ [ 31%]
+........................................................................ [ 63%]
+........................................................................ [ 94%]
+............                                                             [100%]
+228 passed in 4.54s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 18%]
+........................................................................ [ 36%]
+........................................................................ [ 54%]
+........................................................................ [ 72%]
+........................................................................ [ 90%]
+....................................                                     [100%]
+396 passed in 6.35s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+suites 0
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 522.800917
+```
+
+Static check:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, Chrome operation, or MX page operation was performed.
+
+Files changed by the implementation commit:
+
+```text
+advisor/coordinator.py
+advisor/web/api.py
+tests/advisor/test_coordinator.py
+tests/advisor/test_web_api.py
+```
 
 ## Final Consistency Summary
 
