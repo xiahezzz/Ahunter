@@ -12,6 +12,8 @@ Premarket linkage implementation commit: `9d326aa`
 
 Eligibility capacity implementation commit: `c71125d`
 
+Final consistency implementation commit: `9169090`
+
 Required commit subject: `fix: complete coordinator review paths`
 
 Archive consistency commit subject: `fix: hide orphan report archives`
@@ -19,6 +21,93 @@ Archive consistency commit subject: `fix: hide orphan report archives`
 Premarket linkage commit subject: `fix: require archived premarket linkage`
 
 Eligibility capacity commit subject: `fix: bound report eligibility queries`
+
+Final consistency commit subject: `fix: close coordinator consistency gaps`
+
+## Final Consistency Summary
+
+- Review linkage now loads every advice row for the linked passed premarket database run in deterministic insertion order and requires exact equality with both the archived `advice` payload and `advice_ids`.
+- A truncated immutable premarket archive cannot publish a review even when its reduced code set matches the quality-checked candidates.
+- Premarket advice, chart metadata, current profiles, profile history, report archive metadata, and the passed run status now commit together only after report generation and archive insertion succeed.
+- Premarket report or archive failure rolls back all projection rows and then commits only the advisor run's `failed` status. Residual report, profile, and chart files remain hidden because no corresponding database projection rows are committed.
+- Current-state report eligibility is now scoped from bounded, verified filesystem candidates in the 30-day window. More than 500 newer unrelated same-day database rows cannot exclude a valid initial/rerun supersession chain.
+- No collector behavior, RID configuration, broker/order code, live Chrome state, or MX page was touched.
+
+## Final Consistency TDD Evidence
+
+The three new regressions failed before implementation for the expected missing completeness, rollback, and current-state eligibility behavior:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_review_rejects_archive_missing_advice_from_linked_premarket_run tests/advisor/test_coordinator.py::test_premarket_archive_failure_rolls_back_all_projection_rows tests/advisor/test_web_api.py::test_current_state_keeps_active_chain_after_same_day_archive_capacity -q
+FFF                                                                      [100%]
+3 failed in 1.66s
+```
+
+After implementation, the same regressions passed:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_review_rejects_archive_missing_advice_from_linked_premarket_run tests/advisor/test_coordinator.py::test_premarket_archive_failure_rolls_back_all_projection_rows tests/advisor/test_web_api.py::test_current_state_keeps_active_chain_after_same_day_archive_capacity -q
+...                                                                      [100%]
+3 passed in 1.25s
+```
+
+The complete coordinator and web API files also passed before required verification:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py tests/advisor/test_web_api.py -q
+........................................................................ [ 80%]
+.................                                                        [100%]
+89 passed in 3.57s
+```
+
+## Final Consistency Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py tests/advisor/test_web_api.py tests/advisor/test_reporting.py tests/advisor/test_quality_gate.py tests/advisor/test_astock_adapter.py tests/advisor/test_profiles.py tests/advisor/test_kline_chart.py -q
+........................................................................ [ 31%]
+........................................................................ [ 63%]
+........................................................................ [ 95%]
+..........                                                               [100%]
+226 passed in 5.02s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 18%]
+........................................................................ [ 36%]
+........................................................................ [ 54%]
+........................................................................ [ 73%]
+........................................................................ [ 91%]
+..................................                                       [100%]
+394 passed in 6.53s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+suites 0
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 670.734541
+```
+
+Static check:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, Chrome operation, or MX page operation was performed.
 
 ## Summary
 
