@@ -296,6 +296,100 @@ git diff --check
 
 None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
 
+## Fifth Reviewer Fix: Bound MX Authorization Proofs
+
+### Status
+
+DONE
+
+Implementation commit: `27a92e8c1f45d3d0a1d0a2b2dc18b76161c46892`
+
+Required commit subject: `fix: bind mx authorization proofs`
+
+### Fix Summary
+
+- `CollectorSnapshot` now carries immutable `allowed_rids` metadata populated from the parsed RID configuration on every reader outcome. Evidence persistence validates that metadata and rejects an event whose RID is absent before opening a transaction.
+- Opaque identifiers now reject case-insensitive session, socket, token, debug/debugger, and CDP prefixes across `_`, `-`, and `.` separators. The same validator protects collector adaptation and forged DTO persistence.
+- Trading-calendar proof now requires an exact trusted source contract. `exchange_calendar`, `trading_calendar`, `local_calendar`, and `local_trading_calendar` are trusted; self-declared `sina`, `eastmoney`, and unknown market providers block.
+
+### RED Evidence
+
+Initial focused RED command:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py -q -k 'only_allowlisted_accepted_rows_become_bounded_evidence or sensitive_opaque_collector_source_id_fails_closed or persistence_rejects_sensitive_opaque_source_id_before_transaction or persist_evidence_rejects_non_allowlisted_rid_before_transaction or market_provider_cannot_self_declare_trading_calendar_authority'
+20 failed, 83 deselected in 0.44s
+```
+
+The failures showed missing snapshot authorization metadata, accepted sensitive opaque IDs in both adapter and persistence paths, persistence of a forged non-allowlisted RID, and accepted market-provider calendar self-declarations.
+
+The explicit local-calendar trust case was also verified RED:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py::test_clearly_named_local_calendar_source_is_trusted -q
+1 failed in 0.13s
+```
+
+### GREEN Evidence
+
+Focused reviewer cases after implementation:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py -q -k 'only_allowlisted_accepted_rows_become_bounded_evidence or sensitive_opaque_collector_source_id_fails_closed or persistence_rejects_sensitive_opaque_source_id_before_transaction or persist_evidence_rejects_non_allowlisted_rid_before_transaction or market_provider_cannot_self_declare_trading_calendar_authority or trading_calendar_passes_when_candidate_covers_latest_expected_session'
+21 passed, 82 deselected in 0.27s
+```
+
+Owned suites after compatibility fixture updates:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py -q
+103 passed in 0.59s
+```
+
+Explicit local-calendar trust case after implementation:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py::test_clearly_named_local_calendar_source_is_trusted -q
+1 passed in 0.10s
+```
+
+### Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+198 passed in 2.46s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+318 passed in 4.34s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 545.628416
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+### Concerns
+
+None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
+
 ## Timezone Proof Fix
 
 ### Fix Summary
