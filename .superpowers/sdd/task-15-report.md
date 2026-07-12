@@ -295,3 +295,79 @@ git diff --check
 ### Concerns
 
 None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
+
+## Third Reviewer Fix: Authoritative MX Quality Proof
+
+### Status
+
+DONE
+
+Implementation commit: `e93ef78`
+
+Required commit subject: `fix: make mx quality proof authoritative`
+
+### Fix Summary
+
+- Replaced bar-derived calendar self-proof with an independent `trading_calendar` contract containing a bounded calendar source, proof `as_of`, latest expected session, and explicit candidate coverage or A-share scope. Current applicable claims must agree, and candidate rows must cover the independently expected session.
+- Kept successful backfill metadata non-authoritative by recording `historical_market_fetch` with `actual_latest_session`; production fetches no longer write `latest_expected_session` or calendar-source claims derived from their own bars.
+- Required optional-source alternates to prove candidate-specific requested interval coverage, persisted three-year boundaries, and the current authoritative expected session. One recent row and unrelated source/code metadata no longer qualify.
+- Added complete pre-transaction validation for every `MxEvidence` identity, timestamp, summary, and media field, including recomputation of the domain-separated evidence ID. Forged DTOs fail without entering a transaction or writing rows.
+- Enforced safe media-path serialization, expanded compound secret-name redaction, and replaced failure-report caller prose with fixed reason-code names and descriptions.
+
+### RED Evidence
+
+Calendar authority, alternate coverage, and backfill metadata regressions initially produced:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py tests/advisor/test_market_backfill.py -q
+12 failed, 28 passed in 1.83s
+```
+
+DTO validation, media serialization, compound secret names, and failure-report regressions initially produced:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_reporting.py -q
+18 failed, 111 passed in 0.88s
+```
+
+The failures were for the intended missing behaviors: independent calendar proof was unavailable, historical fetches self-authorized, single-row/unrelated alternates were accepted, forged DTOs persisted or were silently excluded, unsafe paths and compound secrets serialized, and caller advisory prose reached failure archives.
+
+### GREEN Evidence
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+169 passed in 2.15s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+289 passed in 4.11s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 486.681291
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+
+.venv311/bin/python -m compileall -q advisor/evidence advisor/quality.py advisor/reporting advisor/db/repository.py
+<no output; exit 0>
+```
+
+### Concerns
+
+None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
