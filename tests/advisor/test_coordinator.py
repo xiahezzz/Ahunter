@@ -76,7 +76,7 @@ class PassingRunner:
                 payload={
                     "quality_outcome": QualityOutcome(True, "hard checks passed")
                 } if role == "quality_gate"
-                else {"decision": {"action": "watch", "confidence": 0.7}}
+                else {"decision": {"action": "hold", "confidence": 0.5, "confidence_basis": "rating_strength"}}
                 if role == "portfolio_manager"
                 else {"signal": role},
             )
@@ -102,7 +102,7 @@ class DecisionRunner(PassingRunner):
                 item.role,
                 item.code,
                 summaries.get(item.role, item.summary),
-                {"decision": {"action": "buy", "confidence": 0.82}}
+                {"decision": {"action": "watch_buy", "confidence": 0.8, "confidence_basis": "rating_strength"}}
                 if item.role == "portfolio_manager"
                 else item.payload,
             )
@@ -127,7 +127,7 @@ class CandidateRunner:
                 f"{role} summary",
                 {"quality_outcome": QualityOutcome(True, "hard checks passed")}
                 if role == "quality_gate"
-                else {"decision": {"action": "watch", "confidence": 0.7}}
+                else {"decision": {"action": "hold", "confidence": 0.5, "confidence_basis": "rating_strength"}}
                 if role == "portfolio_manager"
                 else {"signal": role},
             )
@@ -269,7 +269,7 @@ def test_premarket_happy_path_persists_complete_projection(tmp_path: Path):
     assert {row[0] for row in outputs} == set(ANALYST_ROLES)
     assert all(isinstance(json.loads(row[1]), dict) for row in outputs)
     advice = query_all(paths["db_path"], "SELECT action, evidence_ids_json FROM advice")
-    assert advice == [("watch", json.dumps([EVIDENCE_ID], separators=(",", ":")))]
+    assert advice == [("hold", json.dumps([EVIDENCE_ID], separators=(",", ":")))]
     assert query_all(paths["db_path"], "SELECT report_type FROM report_archive") == [("premarket",)]
     assert len(query_all(paths["db_path"], "SELECT path FROM chart_assets")) == 1
     assert query_all(paths["db_path"], "SELECT code FROM stock_profiles") == [(CODE,)]
@@ -304,12 +304,12 @@ def test_premarket_uses_bounded_analyst_decision_and_role_rationale(tmp_path: Pa
 
     payload = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))
     item = payload["advice"][0]
-    assert item["action"] == "buy"
-    assert item["confidence"] == pytest.approx(0.82)
+    assert item["action"] == "watch_buy"
+    assert item["confidence"] == pytest.approx(0.8)
     assert "Portfolio favors" in item["rationale"]
     assert "Trader confirms" in item["rationale"]
     assert "Research case" in item["rationale"]
-    assert payload["context"]["chart_markers"] == [f"{CODE}: advice=buy at 2026-07-12"]
+    assert payload["context"]["chart_markers"] == [f"{CODE}: advice=watch_buy at 2026-07-12"]
 
 
 def test_premarket_expands_candidates_from_mx_summary_and_positions(tmp_path: Path):
@@ -460,8 +460,8 @@ def test_analyst_quality_error_publishes_no_partial_advice(tmp_path: Path):
     [
         {},
         {"decision": {"action": "watch"}},
-        {"decision": {"action": "watch", "confidence": 1.5}},
-        {"decision": {"action": "buy", "rating": "hold", "confidence": 0.8}},
+        {"decision": {"action": "hold", "confidence": 1.5, "confidence_basis": "rating_strength"}},
+        {"decision": {"action": "watch_buy", "rating": "hold", "confidence": 0.8, "confidence_basis": "rating_strength"}},
     ],
 )
 def test_missing_malformed_or_ambiguous_portfolio_decision_blocks_publication(
@@ -501,7 +501,7 @@ def test_ambiguous_duplicate_portfolio_decisions_block_publication(tmp_path: Pat
                     "portfolio_manager",
                     code,
                     "duplicate",
-                    {"decision": {"action": "buy", "confidence": 0.8}},
+                    {"decision": {"action": "watch_buy", "confidence": 0.8, "confidence_basis": "rating_strength"}},
                 )
             )
             return outputs

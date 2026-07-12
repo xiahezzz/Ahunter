@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from advisor.agents.astock_adapter import ANALYST_ROLES
+from advisor.calendar import latest_expected_session
 from advisor.db.migrate import migrate_database
 from advisor.db.repository import calendar_proof_content_hash, record_trading_calendar_proof
 from advisor.evidence.mx_adapter import CollectorSnapshot, MediaMetadata, MxEvidence
@@ -124,6 +125,22 @@ def request(**changes) -> QualityRequest:
     }
     values.update(changes)
     return QualityRequest(**values)
+
+
+@pytest.mark.parametrize(
+    ("as_of", "expected_session"),
+    [
+        ("2026-07-13T08:30:00+08:00", date(2026, 7, 10)),
+        ("2026-07-13T22:30:00+08:00", date(2026, 7, 13)),
+        ("2026-07-12T22:30:00+08:00", date(2026, 7, 10)),
+        ("2026-01-01T22:30:00+08:00", date(2025, 12, 31)),
+        ("2026-01-02T22:30:00+08:00", date(2026, 1, 2)),
+    ],
+)
+def test_latest_expected_session_uses_completed_a_share_exchange_sessions(
+    as_of: str, expected_session: date
+):
+    assert latest_expected_session(datetime.fromisoformat(as_of)) == expected_session
 
 
 def test_complete_quality_gate_passes_and_persists_all_required_checks(tmp_path: Path):

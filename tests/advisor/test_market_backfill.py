@@ -52,10 +52,23 @@ class HistoricalProvider(MarketDataProvider):
     source = "fake_free_source"
     endpoint = "http://free.example.test/kline"
 
+    def __init__(self):
+        self.calls = []
+
     def fetch_daily_bars(self, code: str, start: date, end: date) -> list[DailyBar]:
+        self.calls.append((code, start, end))
         return [
             make_bar(code, content_hash="start", trade_date=start),
             make_bar(code, content_hash="latest", trade_date=date(2026, 7, 10)),
+        ]
+
+
+class EndSessionProvider(HistoricalProvider):
+    def fetch_daily_bars(self, code: str, start: date, end: date) -> list[DailyBar]:
+        self.calls.append((code, start, end))
+        return [
+            make_bar(code, content_hash="start", trade_date=start),
+            make_bar(code, content_hash="latest", trade_date=end),
         ]
 
 
@@ -135,6 +148,58 @@ def test_successful_backfill_records_trusted_calendar_proof(tmp_path: Path):
         "candidate_codes",
         '["600519"]',
     )
+
+
+def test_weekday_morning_backfill_records_previous_completed_session_proof(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    as_of = datetime(2026, 7, 13, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    update_market_database(
+        db_path,
+        HistoricalProvider(),
+        ["600519"],
+        date(2023, 7, 13),
+        date(2026, 7, 13),
+        as_of=as_of,
+        sleep=lambda _: None,
+    )
+
+    connection = connect(db_path)
+    try:
+        proof_session = connection.execute(
+            "SELECT latest_expected_session FROM trading_calendar_proofs"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert proof_session == "2026-07-10"
+
+
+def test_backfill_fails_closed_without_expected_completed_session_bar(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    as_of = datetime(2026, 7, 13, 22, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    result = update_market_database(
+        db_path,
+        HistoricalProvider(),
+        ["600519"],
+        date(2023, 7, 13),
+        date(2026, 7, 13),
+        as_of=as_of,
+        sleep=lambda _: None,
+    )
+
+    connection = connect(db_path)
+    try:
+        proof_count = connection.execute("SELECT COUNT(*) FROM trading_calendar_proofs").fetchone()[0]
+        daily_count = connection.execute("SELECT COUNT(*) FROM market_daily").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert result.completed_codes == ()
+    assert result.failed_codes == ("600519",)
+    assert proof_count == 0
+    assert daily_count == 0
 
 
 def test_successful_backfill_calendar_proof_satisfies_premarket_quality_gate_without_test_seeding(
@@ -370,8 +435,10 @@ data_sources: {allow_tushare: false, free_sources: [sina]}
     connection.close()
     calls: list[tuple] = []
 
+    provider = HistoricalProvider()
+
     class Registry:
-        historical_provider = HistoricalProvider()
+        historical_provider = provider
 
     monkeypatch.setattr(scheduled_premarket.ConfiguredProviderRegistry, "from_yaml", lambda _: Registry())
     monkeypatch.setattr(
@@ -387,6 +454,7 @@ data_sources: {allow_tushare: false, free_sources: [sina]}
 
     def coordinator(**kwargs):
         calls.append(kwargs["candidate_codes"])
+        assert kwargs["report_date"] == "2026-07-12"
         proof_count = sqlite3.connect(db_path).execute(
             "SELECT COUNT(*) FROM trading_calendar_proofs"
         ).fetchone()[0]
@@ -417,3 +485,93 @@ data_sources: {allow_tushare: false, free_sources: [sina]}
 
     assert exit_code == 0
     assert calls == [("600519",)]
+    assert provider.calls == [("600519", date(2023, 7, 10), date(2026, 7, 10))]
+
+
+def test_scheduled_review_refreshes_market_data_before_review(tmp_path: Path, monkeypatch):
+    from advisor.scheduler import review as scheduled_review
+    from advisor.db.migrate import migrate_database
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "advisor.yaml"
+    config_path.write_text(
+        """
+market: {primary: A股}
+schedule: {premarket_time: "08:30", review_time: "22:30"}
+storage: {database: data/advisor/advisor.sqlite}
+data_sources: {allow_tushare: false, free_sources: [sina]}
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "data-sources.yaml").write_text(
+        "sources:\n  sina:\n    enabled: true\n    rate_limit_per_second: 100\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "data" / "advisor" / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('a1', 'fixture', ?)",
+        ("2026-07-13T22:30:00+08:00",),
+    )
+    connection.execute(
+        "INSERT INTO positions (account_id, code, quantity, cost_basis, updated_at) "
+        "VALUES ('a1', '600519', 100, 1000, ?)",
+        ("2026-07-13T22:30:00+08:00",),
+    )
+    connection.commit()
+    connection.close()
+    calls: list[tuple] = []
+    provider = EndSessionProvider()
+
+    class Registry:
+        historical_provider = provider
+
+    monkeypatch.setattr(scheduled_review.ConfiguredProviderRegistry, "from_yaml", lambda _: Registry())
+    monkeypatch.setattr(
+        scheduled_review,
+        "read_collector_snapshot",
+        lambda _events_db, _allowed_rids, *, as_of: CollectorSnapshot(
+            events=(),
+            quality=QualityResult("collector_state", "blocking", True, "collector ready"),
+            as_of=as_of,
+            allowed_rids=(),
+        ),
+    )
+
+    def coordinator(**kwargs):
+        calls.append(kwargs["candidate_codes"])
+        assert kwargs["report_date"] == "2026-07-13"
+        proof_count = sqlite3.connect(db_path).execute(
+            "SELECT COUNT(*) FROM trading_calendar_proofs"
+        ).fetchone()[0]
+        assert proof_count == 1
+        assert kwargs["premarket_run_id"] == "initial"
+        return type(
+            "Result",
+            (),
+            {
+                "run_id": "scheduled-review",
+                "status": "passed",
+                "warnings": (),
+                "report_paths": type(
+                    "Paths",
+                    (),
+                    {"json_path": tmp_path / "review.json", "markdown_path": tmp_path / "review.md"},
+                )(),
+            },
+        )()
+
+    exit_code = scheduled_review.main(
+        [
+            "--config", str(config_path),
+            "--as-of", "2026-07-13T22:30:00+08:00",
+            "--output-dir", str(tmp_path / "reports"),
+        ],
+        coordinator=coordinator,
+    )
+
+    assert exit_code == 0
+    assert calls == [("600519",)]
+    assert provider.calls == [("600519", date(2023, 7, 13), date(2026, 7, 13))]

@@ -28,6 +28,17 @@ def test_premarket_launchd_uses_composed_refresh_then_advice_command():
     assert "advisor.reporting.premarket" not in rendered
 
 
+def test_review_launchd_uses_composed_refresh_then_review_command():
+    rendered = render_launchd_template(
+        LAUNCHD_DIR / "com.ahunter.advisor-review.plist.template",
+        repo_root=Path("/repo"),
+        python=Path("/repo/.venv311/bin/python"),
+    )
+
+    assert "advisor.scheduler.review" in rendered
+    assert "advisor.reporting.review" not in rendered
+
+
 def test_invalid_launchd_template_returns_false(tmp_path):
     template = tmp_path / "invalid.plist.template"
     template.write_text(

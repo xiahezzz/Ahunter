@@ -27,7 +27,7 @@ def passing_outputs(code: str) -> list[AnalystOutput]:
             role=role,
             code=code,
             summary=f"{role} summary",
-            payload={"decision": {"action": "watch", "confidence": 0.7}}
+            payload={"decision": {"action": "hold", "confidence": 0.5, "confidence_basis": "rating_strength"}}
             if role == "portfolio_manager" else {},
         )
         for role in ANALYST_ROLES
@@ -139,8 +139,21 @@ def passing_state(code: str) -> dict:
             "neutral_history": "neutral",
             "conservative_history": "conservative",
         },
-        "final_trade_decision": {"action": "watch", "confidence": 0.7},
+        "final_trade_decision": production_portfolio_markdown("Overweight"),
     }
+
+
+def production_portfolio_markdown(rating: str) -> str:
+    return f"""### Portfolio Manager Decision
+
+**Rating**: {rating}
+
+## Executive Summary
+Positioning should be staged because liquidity and evidence are adequate.
+
+## Investment Thesis
+The setup has enough support for watchlist action while risk remains bounded.
+"""
 
 
 def quality_summary(failing_grade: str | None = None) -> str:
@@ -166,8 +179,77 @@ def test_external_runner_uses_full_analyst_set_and_maps_passing_staged_state():
     assert graph.finalized is True
     assert graph.closed is True
     assert [output.role for output in outputs] == list(ANALYST_ROLES)
-    assert outputs[-1].summary == '{"action":"watch","confidence":0.7}'
-    assert outputs[-1].payload == {"decision": {"action": "watch", "confidence": 0.7}}
+    assert outputs[-1].summary == (
+        '{"action":"watch_add","confidence":0.65,"confidence_basis":"rating_strength"}'
+    )
+    assert outputs[-1].payload == {
+        "decision": {
+            "action": "watch_add",
+            "confidence": 0.65,
+            "confidence_basis": "rating_strength",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("rating", "action", "confidence"),
+    [
+        ("Buy", "watch_buy", 0.8),
+        ("Overweight", "watch_add", 0.65),
+        ("Hold", "hold", 0.5),
+        ("Underweight", "watch_reduce", 0.65),
+        ("Sell", "watch_exit", 0.8),
+    ],
+)
+def test_external_runner_parses_production_markdown_portfolio_rating_contract(
+    rating: str, action: str, confidence: float
+):
+    state = passing_state("600519")
+    state["final_trade_decision"] = production_portfolio_markdown(rating)
+    graph = FakeGraph([state])
+
+    outputs = ExternalTradingAgentsRunner(graph_factory=lambda _, __: graph).run("600519", "2026-07-11", [])
+
+    assert outputs[-1].payload == {
+        "decision": {
+            "action": action,
+            "confidence": confidence,
+            "confidence_basis": "rating_strength",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    [
+        """### Portfolio Manager Decision
+
+## Executive Summary
+Summary is present.
+
+## Investment Thesis
+Thesis is present.
+""",
+        """### Portfolio Manager Decision
+
+**Rating**: Buy
+**Rating**: Sell
+
+## Executive Summary
+Summary is present.
+
+## Investment Thesis
+Thesis is present.
+""",
+    ],
+)
+def test_external_runner_blocks_missing_or_duplicate_markdown_rating(markdown: str):
+    state = passing_state("600519")
+    state["final_trade_decision"] = markdown
+    graph = FakeGraph([state])
+
+    with pytest.raises(DataQualityBlockedError, match="portfolio decision"):
+        ExternalTradingAgentsRunner(graph_factory=lambda _, __: graph).run("600519", "2026-07-11", [])
 
 
 def test_external_runner_stops_at_failing_quality_gate_before_downstream_state():
@@ -221,9 +303,30 @@ def test_missing_roles_or_quality_outcome_fail_closed(outputs):
     "portfolio_output",
     [
         AnalystOutput("portfolio_manager", "600519", "missing decision", {}),
-        AnalystOutput("portfolio_manager", "600519", "bad action", {"decision": {"action": "buy/watch", "confidence": 0.7}}),
-        AnalystOutput("portfolio_manager", "600519", "bad confidence", {"decision": {"action": "watch", "confidence": "high"}}),
-        AnalystOutput("portfolio_manager", "600519", "extra rating", {"decision": {"action": "watch", "rating": "buy", "confidence": 0.7}}),
+        AnalystOutput(
+            "portfolio_manager",
+            "600519",
+            "bad action",
+            {"decision": {"action": "buy/watch", "confidence": 0.7, "confidence_basis": "rating_strength"}},
+        ),
+        AnalystOutput(
+            "portfolio_manager",
+            "600519",
+            "bad confidence",
+            {"decision": {"action": "hold", "confidence": "high", "confidence_basis": "rating_strength"}},
+        ),
+        AnalystOutput(
+            "portfolio_manager",
+            "600519",
+            "bad basis",
+            {"decision": {"action": "hold", "confidence": 0.5, "confidence_basis": "model_guess"}},
+        ),
+        AnalystOutput(
+            "portfolio_manager",
+            "600519",
+            "extra rating",
+            {"decision": {"action": "hold", "rating": "buy", "confidence": 0.5, "confidence_basis": "rating_strength"}},
+        ),
     ],
 )
 def test_portfolio_manager_decision_contract_failures_block_outputs(portfolio_output):
@@ -246,7 +349,7 @@ def test_duplicate_portfolio_manager_decision_is_ambiguous_and_blocks_outputs():
                     "portfolio_manager",
                     code,
                     "second decision",
-                    {"decision": {"action": "buy", "confidence": 0.8}},
+                    {"decision": {"action": "watch_buy", "confidence": 0.8, "confidence_basis": "rating_strength"}},
                 )
             )
             return outputs

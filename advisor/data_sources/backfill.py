@@ -45,6 +45,7 @@ def update_market_database(
 ) -> BackfillResult:
     requested = _validate_backfill_request(codes, start, end)
     proof_as_of = as_of or datetime.now().astimezone()
+    expected_session = latest_expected_session(proof_as_of)
     migrate_database(db_path)
     completed: list[str] = []
     failed: list[str] = []
@@ -55,7 +56,7 @@ def update_market_database(
         attempted_at = proof_as_of.isoformat()
         try:
             bars = provider.fetch_daily_bars(code, start, end)
-            _validate_bars(code, bars, start, end)
+            _validate_bars(code, bars, start, end, expected_session)
         except MarketSourceError as error:
             _record_failed_attempt(db_path, provider, code, start, end, attempted_at, error)
             failed.append(code)
@@ -65,7 +66,7 @@ def update_market_database(
         if index + 1 < len(requested):
             sleep(1.0 / rate)
     if completed:
-        _record_calendar_proof(db_path, tuple(completed), proof_as_of)
+        _record_calendar_proof(db_path, tuple(completed), proof_as_of, expected_session)
     return BackfillResult(requested, tuple(completed), tuple(failed), inserted)
 
 
@@ -94,7 +95,9 @@ def _validate_backfill_request(codes: Sequence[str], start: date, end: date) -> 
     return requested
 
 
-def _validate_bars(code: str, bars: list[DailyBar], start: date, end: date) -> None:
+def _validate_bars(
+    code: str, bars: list[DailyBar], start: date, end: date, expected_session: date
+) -> None:
     if not isinstance(bars, list) or not bars:
         raise MarketSourceError("provider returned no daily bars")
     dates: list[date] = []
@@ -106,6 +109,8 @@ def _validate_bars(code: str, bars: list[DailyBar], start: date, end: date) -> N
         dates.append(bar.trade_date)
     if dates != sorted(dates) or len(dates) != len(set(dates)):
         raise MarketSourceError("provider returned duplicate or descending daily bars")
+    if start <= expected_session <= end and expected_session not in dates:
+        raise MarketSourceError("provider returned no bar for latest completed session")
 
 
 def _commit_code(
@@ -163,7 +168,9 @@ def _record_failed_attempt(
         connection.close()
 
 
-def _record_calendar_proof(db_path: Path, completed_codes: tuple[str, ...], as_of: datetime) -> None:
+def _record_calendar_proof(
+    db_path: Path, completed_codes: tuple[str, ...], as_of: datetime, expected_session: date
+) -> None:
     connection = connect(db_path)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -171,7 +178,7 @@ def _record_calendar_proof(db_path: Path, completed_codes: tuple[str, ...], as_o
             connection,
             calendar_source="local_trading_calendar",
             as_of=as_of,
-            latest_expected_session=latest_expected_session(as_of),
+            latest_expected_session=expected_session,
             coverage_codes=completed_codes,
         )
         connection.commit()

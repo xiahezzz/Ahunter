@@ -31,7 +31,24 @@ ANALYST_ROLES = UPSTREAM_ANALYST_ROLES + (
 )
 
 DEFAULT_TRADINGAGENTS_REPOSITORY = Path("/Users/mac/Documents/TradingAgents-astock")
-PORTFOLIO_DECISION_ACTIONS = frozenset({"buy", "watch", "hold", "reduce", "exit", "avoid"})
+PORTFOLIO_DECISION_ACTIONS = frozenset(
+    {"watch_buy", "watch_add", "hold", "watch_reduce", "watch_exit"}
+)
+_PORTFOLIO_CONFIDENCE_BASIS = "rating_strength"
+_PORTFOLIO_RATING_CONTRACT = {
+    "buy": ("watch_buy", 0.80),
+    "overweight": ("watch_add", 0.65),
+    "hold": ("hold", 0.50),
+    "underweight": ("watch_reduce", 0.65),
+    "sell": ("watch_exit", 0.80),
+}
+_PORTFOLIO_RATING = re.compile(
+    r"^\s*(?:\*\*)?\s*rating\s*(?:\*\*)?\s*:\s*"
+    r"(buy|overweight|hold|underweight|sell)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_MARKDOWN_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", re.MULTILINE)
+_MAX_PORTFOLIO_MARKDOWN_CHARS = 12_000
 _HARD_CHECKS_HEADER = "### 硬检查结果"
 _HARD_CHECK_GRADE = re.compile(r"\[([ABCDF])\]")
 _SAFE_EVIDENCE_FIELDS = (
@@ -365,7 +382,7 @@ def extract_portfolio_decision(output: AnalystOutput) -> tuple[str, float]:
     if not isinstance(payload, dict) or set(payload) != {"decision"}:
         raise DataQualityBlockedError("missing or ambiguous portfolio decision")
     decision = payload["decision"]
-    if not isinstance(decision, dict) or set(decision) != {"action", "confidence"}:
+    if not isinstance(decision, dict) or set(decision) != {"action", "confidence", "confidence_basis"}:
         raise DataQualityBlockedError("missing or ambiguous portfolio decision")
     action = decision.get("action")
     if not isinstance(action, str):
@@ -379,6 +396,8 @@ def extract_portfolio_decision(output: AnalystOutput) -> tuple[str, float]:
     normalized_confidence = float(confidence)
     if not math.isfinite(normalized_confidence) or not 0 <= normalized_confidence <= 1:
         raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    if decision.get("confidence_basis") != _PORTFOLIO_CONFIDENCE_BASIS:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
     return normalized_action, normalized_confidence
 
 
@@ -387,15 +406,65 @@ def _portfolio_decision_payload(value: Any) -> dict[str, dict[str, float | str]]
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-        except json.JSONDecodeError as error:
-            raise DataQualityBlockedError("missing or ambiguous portfolio decision") from error
+        except json.JSONDecodeError:
+            return _portfolio_markdown_decision_payload(value)
     if isinstance(parsed, dict) and "decision" not in parsed:
         payload = {"decision": parsed}
     else:
         payload = parsed
     probe = AnalystOutput("portfolio_manager", "", "", payload if isinstance(payload, dict) else {})
     action, confidence = extract_portfolio_decision(probe)
-    return {"decision": {"action": action, "confidence": confidence}}
+    return {
+        "decision": {
+            "action": action,
+            "confidence": confidence,
+            "confidence_basis": _PORTFOLIO_CONFIDENCE_BASIS,
+        }
+    }
+
+
+def _portfolio_markdown_decision_payload(markdown: str) -> dict[str, dict[str, float | str]]:
+    if not isinstance(markdown, str) or not markdown.strip():
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    bounded = markdown[:_MAX_PORTFOLIO_MARKDOWN_CHARS + 1]
+    if len(bounded) > _MAX_PORTFOLIO_MARKDOWN_CHARS:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+
+    ratings = [match.group(1).lower() for match in _PORTFOLIO_RATING.finditer(bounded)]
+    if len(ratings) != 1:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    _required_markdown_section(bounded, "executive summary")
+    _required_markdown_section(bounded, "investment thesis")
+
+    action, confidence = _PORTFOLIO_RATING_CONTRACT[ratings[0]]
+    return {
+        "decision": {
+            "action": action,
+            "confidence": confidence,
+            "confidence_basis": _PORTFOLIO_CONFIDENCE_BASIS,
+        }
+    }
+
+
+def _required_markdown_section(markdown: str, title: str) -> str:
+    headings = [
+        (match.start(), match.end(), _normalized_heading(match.group(1)))
+        for match in _MARKDOWN_HEADING.finditer(markdown)
+    ]
+    matches = [index for index, (_, _, heading) in enumerate(headings) if heading == title]
+    if len(matches) != 1:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    index = matches[0]
+    start = headings[index][1]
+    end = headings[index + 1][0] if index + 1 < len(headings) else len(markdown)
+    content = markdown[start:end].strip()
+    if not content:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    return content
+
+
+def _normalized_heading(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().strip("*").lower())
 
 
 def _outputs_from_state(

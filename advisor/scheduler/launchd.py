@@ -31,7 +31,7 @@ def validate_launchd_template(path: Path) -> bool:
     if label == "com.ahunter.advisor-premarket":
         return _valid_report_payload(payload, args, "advisor.scheduler.premarket", 8, 30)
     if label == "com.ahunter.advisor-review":
-        return _valid_report_payload(payload, args, "advisor.reporting.review", 22, 30)
+        return _valid_report_payload(payload, args, "advisor.scheduler.review", 22, 30)
     return False
 
 
