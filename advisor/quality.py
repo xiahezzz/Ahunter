@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 from advisor.agents.astock_adapter import ANALYST_ROLES
+from advisor.db.repository import (
+    CALENDAR_PROOF_PRODUCER,
+    CALENDAR_PROOF_VERSION,
+    TRUSTED_CALENDAR_SOURCES,
+    calendar_proof_content_hash,
+)
 from advisor.evidence.mx_adapter import CollectorSnapshot
 from advisor.ledger.model import LedgerTransaction, apply_transactions
 
@@ -22,19 +28,9 @@ _VALID_RUN_TYPES = frozenset({"premarket", "review"})
 _CODE_RE = re.compile(r"[03468]\d{5}\Z")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-_TRUSTED_CALENDAR_SOURCES = frozenset(
-    {
-        "exchange_calendar",
-        "local_calendar",
-        "local_trading_calendar",
-        "trading_calendar",
-    }
-)
 _CALENDAR_PROOF_KEY_RE = re.compile(
-    r"advisor-calendar-proof:v1:[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z"
+    r"advisor-calendar-proof:v1:[0-9a-f]{64}\Z"
 )
-_CALENDAR_PROOF_ENDPOINT = "advisor-internal:trading-calendar:v1"
-_CALENDAR_PROOF_PRODUCER = "a-hunter-advisor-calendar-producer-v1"
 
 
 @dataclass(frozen=True)
@@ -175,32 +171,45 @@ def _authoritative_expected_session(
 ) -> tuple[dt.date | None, str | None]:
     rows = connection.execute(
         """
-        SELECT source_key, source, endpoint, params_hash, details_json
-        FROM market_sources
-        WHERE status = 'passed' AND julianday(fetched_at) IS NOT NULL
-          AND julianday(fetched_at) <= julianday(?)
-        ORDER BY fetched_at DESC, source_key DESC
+        SELECT proof_id, contract_version, producer, calendar_source, as_of,
+               latest_expected_session, scope, coverage_codes_json, content_hash
+        FROM trading_calendar_proofs
+        ORDER BY as_of DESC, proof_id DESC
         LIMIT ?
         """,
-        (request.as_of.isoformat(), _MAX_SOURCE_ROWS + 1),
+        (_MAX_SOURCE_ROWS + 1,),
     ).fetchall()
     if len(rows) > _MAX_SOURCE_ROWS:
         return None, "trading calendar proof scan limit exceeded"
     claims_by_code: dict[str, set[dt.date]] = defaultdict(set)
     saw_historical_proof = False
-    for source_key, source, endpoint, producer, raw_details in rows:
+    for (
+        proof_id, contract_version, producer, calendar_source, proof_as_of_raw,
+        latest_expected_session, scope, raw_coverage, content_hash,
+    ) in rows:
         try:
             if (
-                not isinstance(source_key, str)
-                or not _CALENDAR_PROOF_KEY_RE.fullmatch(source_key)
-                or endpoint != _CALENDAR_PROOF_ENDPOINT
-                or producer != _CALENDAR_PROOF_PRODUCER
+                not isinstance(proof_id, str)
+                or not _CALENDAR_PROOF_KEY_RE.fullmatch(proof_id)
+                or contract_version != CALENDAR_PROOF_VERSION
+                or producer != CALENDAR_PROOF_PRODUCER
+                or not isinstance(calendar_source, str)
+                or calendar_source not in TRUSTED_CALENDAR_SOURCES
             ):
-                continue
-            details = json.loads(raw_details)
-            if not isinstance(details, dict) or details.get("proof_type") != "trading_calendar":
-                continue
-            proof_as_of = dt.datetime.fromisoformat(details.get("as_of"))
+                raise ValueError("invalid calendar proof contract")
+            coverage = json.loads(raw_coverage)
+            if not isinstance(coverage, list):
+                raise ValueError("invalid calendar coverage")
+            expected_hash = calendar_proof_content_hash(
+                calendar_source=calendar_source,
+                as_of=proof_as_of_raw,
+                latest_expected_session=latest_expected_session,
+                scope=scope,
+                coverage_codes=tuple(coverage),
+            )
+            if content_hash != expected_hash or proof_id != f"advisor-calendar-proof:v1:{expected_hash}":
+                raise ValueError("invalid calendar proof integrity")
+            proof_as_of = dt.datetime.fromisoformat(proof_as_of_raw)
             if proof_as_of.tzinfo is None or proof_as_of.utcoffset() is None:
                 raise ValueError("invalid calendar as_of")
             if proof_as_of > request.as_of:
@@ -211,9 +220,7 @@ def _authoritative_expected_session(
                 continue
             if proof_date != request.as_of.date():
                 return None, "trading calendar proof is stale or not current for this run"
-            coverage = details.get("coverage_codes")
-            scope = details.get("scope")
-            if coverage is not None:
+            if scope == "candidate_codes":
                 if (
                     not isinstance(coverage, list)
                     or not coverage
@@ -223,22 +230,13 @@ def _authoritative_expected_session(
                 ):
                     raise ValueError("invalid calendar coverage")
                 applicable_codes = set(request.candidate_codes).intersection(coverage)
-            elif scope == "a_share":
+            elif scope == "a_share" and coverage == []:
                 applicable_codes = set(request.candidate_codes)
             else:
                 raise ValueError("invalid calendar coverage")
             if not applicable_codes:
                 continue
-            calendar_source = details.get("calendar_source")
-            if (
-                not isinstance(source, str)
-                or not isinstance(calendar_source, str)
-                or not _IDENTIFIER_RE.fullmatch(calendar_source)
-                or source != calendar_source
-                or source not in _TRUSTED_CALENDAR_SOURCES
-            ):
-                raise ValueError("invalid calendar source")
-            claimed = dt.date.fromisoformat(details.get("latest_expected_session"))
+            claimed = dt.date.fromisoformat(latest_expected_session)
             if claimed > request.as_of.date():
                 return None, "latest expected trading session is future-dated"
             for code in applicable_codes:
@@ -324,6 +322,10 @@ def _future_data_check(connection: sqlite3.Connection, request: QualityRequest) 
         ),
         (
             "SELECT 1 FROM market_sources WHERE julianday(fetched_at) IS NULL OR julianday(fetched_at) > julianday(?) LIMIT 1",
+            (as_of,),
+        ),
+        (
+            "SELECT 1 FROM trading_calendar_proofs WHERE julianday(as_of) IS NULL OR julianday(as_of) > julianday(?) LIMIT 1",
             (as_of,),
         ),
     )

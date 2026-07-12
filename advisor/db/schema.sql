@@ -63,6 +63,24 @@ CREATE TABLE IF NOT EXISTS market_sources (
   details_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS trading_calendar_proofs (
+  proof_id TEXT PRIMARY KEY
+    CHECK(length(proof_id) = 90 AND proof_id GLOB 'advisor-calendar-proof:v1:*'),
+  contract_version INTEGER NOT NULL CHECK(contract_version = 1),
+  producer TEXT NOT NULL CHECK(producer = 'a-hunter-advisor-calendar-producer-v1'),
+  calendar_source TEXT NOT NULL CHECK(calendar_source IN (
+    'exchange_calendar', 'local_calendar', 'local_trading_calendar', 'trading_calendar'
+  )),
+  as_of TEXT NOT NULL CHECK(julianday(as_of) IS NOT NULL),
+  latest_expected_session TEXT NOT NULL
+    CHECK(date(latest_expected_session) = latest_expected_session),
+  scope TEXT NOT NULL CHECK(scope IN ('a_share', 'candidate_codes')),
+  coverage_codes_json TEXT NOT NULL
+    CHECK(json_valid(coverage_codes_json) AND json_type(coverage_codes_json) = 'array'),
+  content_hash TEXT NOT NULL UNIQUE
+    CHECK(length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*')
+);
+
 CREATE TABLE IF NOT EXISTS events_normalized (
   evidence_source_id TEXT PRIMARY KEY,
   source_type TEXT NOT NULL,

@@ -14,6 +14,8 @@ from urllib.parse import quote
 
 import yaml
 
+from advisor.paths import repo_root
+
 
 _MAX_CONFIG_BYTES = 64 * 1024
 _MAX_SUMMARY_CHARS = 800
@@ -45,6 +47,10 @@ _SENSITIVE_OPAQUE_COMPONENT = re.compile(
     r"(?:^|[_.:-])(?:api[_.:-]+key|access[_.:-]+token|refresh[_.:-]+token|"
     r"id[_.:-]+token|authorization|cookie|credentials?|password|secret|"
     r"session|sess|socket|token|debug|debugger|cdp)(?:[_.:-]|$)",
+    re.IGNORECASE,
+)
+_SENSITIVE_OPAQUE_COMPOUND = re.compile(
+    r"(?:^|[_.:-])(?:sessionid|socketid|debugidentifier|cdptoken|apikey|idtoken)(?:[_.:-]|$)",
     re.IGNORECASE,
 )
 _MEDIA_CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\Z")
@@ -222,6 +228,8 @@ def _validate_request(events_db: Path, config: Path, as_of: datetime, limit: int
             raise ValueError("symlinked collector input is not allowed")
         if not stat.S_ISREG(mode):
             raise ValueError("collector input must be a regular file")
+    if not _is_authoritative_allowed_rids_path(config):
+        raise ValueError("RID configuration must be the authoritative repository config")
     if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
         raise ValueError("as_of must be timezone-aware")
     if type(limit) is not int or not 1 <= limit <= 100:
@@ -542,6 +550,7 @@ def valid_opaque_identifier(value: object) -> bool:
         isinstance(value, str)
         and bool(_OPAQUE_ID.fullmatch(value))
         and not _SENSITIVE_OPAQUE_COMPONENT.search(value)
+        and not _SENSITIVE_OPAQUE_COMPOUND.search(value)
         and redact_sensitive_text(value) == value
     )
 
@@ -555,13 +564,39 @@ def valid_snapshot_authorization(snapshot: object) -> bool:
         or proof._issuer is not _AUTHORIZATION_ISSUER
         or not proof._allowed_rids
         or snapshot.allowed_rids != proof._allowed_rids
+        or not _is_authoritative_allowed_rids_path(proof._path)
     ):
         return False
     try:
-        current_allowed_rids = _read_allowed_rids(proof._path)
+        authoritative_path = _authoritative_allowed_rids_path()
+        current_allowed_rids = _read_allowed_rids(authoritative_path)
     except (OSError, UnicodeError, yaml.YAMLError, ValueError):
         return False
     return current_allowed_rids == proof._allowed_rids
+
+
+def _authoritative_allowed_rids_path() -> Path:
+    return repo_root().resolve(strict=True) / "config" / "allowed-rids.yaml"
+
+
+def _is_authoritative_allowed_rids_path(path: Path) -> bool:
+    try:
+        expected = _authoritative_allowed_rids_path()
+        if path.resolve(strict=False) != expected.resolve(strict=False):
+            return False
+        current = path
+        while True:
+            try:
+                if stat.S_ISLNK(current.lstat().st_mode):
+                    return False
+            except FileNotFoundError:
+                pass
+            if current.parent == current:
+                break
+            current = current.parent
+        return True
+    except (OSError, RuntimeError):
+        return False
 
 
 def valid_media_metadata(value: object) -> bool:

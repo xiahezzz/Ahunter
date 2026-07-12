@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -9,6 +9,7 @@ import pytest
 
 from advisor.agents.astock_adapter import ANALYST_ROLES
 from advisor.db.migrate import migrate_database
+from advisor.db.repository import record_trading_calendar_proof
 from advisor.evidence.mx_adapter import CollectorSnapshot, MediaMetadata, MxEvidence
 from advisor.quality import QualityRequest, QualityResult, evaluate_run_quality
 
@@ -39,6 +40,13 @@ def quality_connection(tmp_path: Path) -> sqlite3.Connection:
     connection.execute(
         "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, 'running', ?)",
         ("run-15", "premarket", AS_OF.isoformat(), AS_OF.isoformat()),
+    )
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="exchange_calendar",
+        as_of=AS_OF,
+        latest_expected_session=date(2026, 7, 10),
+        coverage_codes=("600519",),
     )
     rows = [
         ("600519", "2023-07-11"),
@@ -270,16 +278,13 @@ def test_trading_calendar_passes_when_candidate_covers_latest_expected_session(t
 
 def test_clearly_named_local_calendar_source_is_trusted(tmp_path: Path):
     connection = quality_connection(tmp_path)
-    details = json.loads(
-        connection.execute(
-            "SELECT details_json FROM market_sources WHERE source_key = 'advisor-calendar-proof:v1:primary'"
-        ).fetchone()[0]
-    )
-    details["calendar_source"] = "local_calendar"
-    connection.execute(
-        "UPDATE market_sources SET source = 'local_calendar', details_json = ? "
-        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
-        (json.dumps(details),),
+    connection.execute("DELETE FROM trading_calendar_proofs")
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="local_calendar",
+        as_of=AS_OF,
+        latest_expected_session=date(2026, 7, 10),
+        coverage_codes=("600519",),
     )
     connection.commit()
 
@@ -294,6 +299,7 @@ def test_market_provider_cannot_self_declare_trading_calendar_authority(
     tmp_path: Path, market_provider: str
 ):
     connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM trading_calendar_proofs")
     details = json.loads(
         connection.execute(
             "SELECT details_json FROM market_sources WHERE source_key = 'advisor-calendar-proof:v1:primary'"
@@ -316,6 +322,7 @@ def test_market_provider_cannot_self_declare_trading_calendar_authority(
 
 def test_whitelisted_labels_cannot_impersonate_trusted_calendar_producer(tmp_path: Path):
     connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM trading_calendar_proofs")
     connection.execute("DELETE FROM market_sources WHERE source_key LIKE 'advisor-calendar-proof:%'")
     connection.execute(
         """
@@ -346,8 +353,66 @@ def test_whitelisted_labels_cannot_impersonate_trusted_calendar_producer(tmp_pat
     assert "calendar" in check.details
 
 
+def test_exact_market_source_calendar_contract_is_non_authoritative(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM trading_calendar_proofs")
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "calendar" in check.details
+
+
+def test_direct_calendar_proof_with_invalid_content_hash_blocks(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    forged_hash = "a" * 64
+    connection.execute("DELETE FROM trading_calendar_proofs")
+    connection.execute(
+        """
+        INSERT INTO trading_calendar_proofs (
+          proof_id, contract_version, producer, calendar_source, as_of,
+          latest_expected_session, scope, coverage_codes_json, content_hash
+        ) VALUES (?, 1, ?, 'exchange_calendar', ?, '2026-07-10',
+                  'candidate_codes', '[\"600519\"]', ?)
+        """,
+        (
+            f"advisor-calendar-proof:v1:{forged_hash}",
+            CALENDAR_PROOF_PRODUCER,
+            AS_OF.isoformat(),
+            forged_hash,
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "invalid" in check.details
+
+
+def test_future_calendar_proof_blocks_future_data_check(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="local_calendar",
+        as_of=AS_OF + timedelta(seconds=1),
+        latest_expected_session=date(2026, 7, 10),
+        coverage_codes=("600519",),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "future_data_leakage")
+    assert check.blocking_failure
+
+
 def test_incomplete_historical_fetch_cannot_self_authorize_calendar_freshness(tmp_path: Path):
     connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM trading_calendar_proofs")
     connection.execute("DELETE FROM market_sources")
     connection.execute(
         """
@@ -379,6 +444,7 @@ def test_incomplete_historical_fetch_cannot_self_authorize_calendar_freshness(tm
 
 def test_unrelated_source_row_cannot_supply_calendar_proof(tmp_path: Path):
     connection = quality_connection(tmp_path)
+    connection.execute("DELETE FROM trading_calendar_proofs")
     connection.execute("DELETE FROM market_sources")
     connection.execute(
         """
@@ -439,26 +505,12 @@ def test_conflicting_current_calendar_claims_block(tmp_path: Path):
         """,
         (AS_OF.isoformat(),),
     )
-    connection.execute(
-        """
-        INSERT INTO market_sources (
-          source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('advisor-calendar-proof:v1:other', 'local_trading_calendar', ?, ?, ?, 'passed', ?)
-        """,
-        (
-            CALENDAR_PROOF_ENDPOINT,
-            CALENDAR_PROOF_PRODUCER,
-            AS_OF.isoformat(),
-            json.dumps(
-                {
-                    "as_of": AS_OF.isoformat(),
-                    "calendar_source": "local_trading_calendar",
-                    "coverage_codes": ["600519"],
-                    "latest_expected_session": "2026-07-09",
-                    "proof_type": "trading_calendar",
-                }
-            ),
-        ),
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="local_trading_calendar",
+        as_of=AS_OF,
+        latest_expected_session=date(2026, 7, 9),
+        coverage_codes=("600519",),
     )
     connection.commit()
 
@@ -472,26 +524,12 @@ def test_conflicting_current_calendar_claims_block(tmp_path: Path):
 def test_historical_calendar_proof_is_ignored_when_current_proof_is_available(tmp_path: Path):
     connection = quality_connection(tmp_path)
     historical_as_of = AS_OF - timedelta(days=1)
-    connection.execute(
-        """
-        INSERT INTO market_sources (
-          source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('advisor-calendar-proof:v1:historical', 'historical_calendar', ?, ?, ?, 'passed', ?)
-        """,
-        (
-            CALENDAR_PROOF_ENDPOINT,
-            CALENDAR_PROOF_PRODUCER,
-            historical_as_of.isoformat(),
-            json.dumps(
-                {
-                    "as_of": historical_as_of.isoformat(),
-                    "calendar_source": "historical_calendar",
-                    "coverage_codes": ["600519"],
-                    "latest_expected_session": "2026-07-09",
-                    "proof_type": "trading_calendar",
-                }
-            ),
-        ),
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="local_calendar",
+        as_of=historical_as_of,
+        latest_expected_session=date(2026, 7, 9),
+        coverage_codes=("600519",),
     )
     connection.commit()
 
@@ -503,37 +541,20 @@ def test_historical_calendar_proof_is_ignored_when_current_proof_is_available(tm
 def test_calendar_proof_future_instant_in_earlier_timezone_blocks(tmp_path: Path):
     connection = quality_connection(tmp_path)
     run_as_of = datetime(2026, 7, 12, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
-    details = json.loads(
-        connection.execute(
-            "SELECT details_json FROM market_sources WHERE source_key = 'advisor-calendar-proof:v1:primary'"
-        ).fetchone()[0]
+    connection.execute("DELETE FROM trading_calendar_proofs")
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="exchange_calendar",
+        as_of=run_as_of,
+        latest_expected_session=date(2026, 7, 10),
+        coverage_codes=("600519",),
     )
-    details["as_of"] = run_as_of.isoformat()
-    connection.execute(
-        "UPDATE market_sources SET fetched_at = ?, details_json = ? "
-        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
-        (run_as_of.isoformat(), json.dumps(details)),
-    )
-    connection.execute(
-        """
-        INSERT INTO market_sources (
-          source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('advisor-calendar-proof:v1:future-timezone', 'future_calendar', ?, ?, ?, 'passed', ?)
-        """,
-        (
-            CALENDAR_PROOF_ENDPOINT,
-            CALENDAR_PROOF_PRODUCER,
-            run_as_of.isoformat(),
-            json.dumps(
-                {
-                    "as_of": "2026-07-11T23:30:00-10:00",
-                    "calendar_source": "future_calendar",
-                    "coverage_codes": ["600519"],
-                    "latest_expected_session": "2026-07-10",
-                    "proof_type": "trading_calendar",
-                }
-            ),
-        ),
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="local_calendar",
+        as_of=datetime.fromisoformat("2026-07-11T23:30:00-10:00"),
+        latest_expected_session=date(2026, 7, 10),
+        coverage_codes=("600519",),
     )
     connection.commit()
 
@@ -547,26 +568,12 @@ def test_calendar_proof_future_instant_in_earlier_timezone_blocks(tmp_path: Path
 def test_calendar_proof_current_in_run_timezone_conflicts_across_timezones(tmp_path: Path):
     connection = quality_connection(tmp_path)
     proof_as_of = datetime(2026, 7, 11, 16, 30, tzinfo=ZoneInfo("Etc/GMT+4"))
-    connection.execute(
-        """
-        INSERT INTO market_sources (
-          source_key, source, endpoint, params_hash, fetched_at, status, details_json
-        ) VALUES ('advisor-calendar-proof:v1:cross-timezone', 'local_trading_calendar', ?, ?, ?, 'passed', ?)
-        """,
-        (
-            CALENDAR_PROOF_ENDPOINT,
-            CALENDAR_PROOF_PRODUCER,
-            proof_as_of.isoformat(),
-            json.dumps(
-                {
-                    "as_of": proof_as_of.isoformat(),
-                    "calendar_source": "local_trading_calendar",
-                    "coverage_codes": ["600519"],
-                    "latest_expected_session": "2026-07-09",
-                    "proof_type": "trading_calendar",
-                }
-            ),
-        ),
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="local_trading_calendar",
+        as_of=proof_as_of,
+        latest_expected_session=date(2026, 7, 9),
+        coverage_codes=("600519",),
     )
     connection.commit()
 
@@ -590,20 +597,13 @@ def test_unsafe_quality_request_run_id_blocks_without_persisting_checks(tmp_path
 
 def test_calendar_proof_newer_than_selected_source_data_blocks(tmp_path: Path):
     connection = quality_connection(tmp_path)
-    connection.execute(
-        "UPDATE market_sources SET details_json = ? "
-        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
-        (
-            json.dumps(
-                {
-                    "as_of": AS_OF.isoformat(),
-                    "calendar_source": "exchange_calendar",
-                    "coverage_codes": ["600519"],
-                    "latest_expected_session": "2026-07-11",
-                    "proof_type": "trading_calendar",
-                }
-            ),
-        ),
+    connection.execute("DELETE FROM trading_calendar_proofs")
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="exchange_calendar",
+        as_of=AS_OF,
+        latest_expected_session=date(2026, 7, 11),
+        coverage_codes=("600519",),
     )
     connection.commit()
 
@@ -616,16 +616,13 @@ def test_calendar_proof_newer_than_selected_source_data_blocks(tmp_path: Path):
 
 def test_stale_calendar_proof_blocks_current_run(tmp_path: Path):
     connection = quality_connection(tmp_path)
-    details = json.loads(
-        connection.execute(
-            "SELECT details_json FROM market_sources WHERE source_key = 'advisor-calendar-proof:v1:primary'"
-        ).fetchone()[0]
-    )
-    details["as_of"] = (AS_OF - timedelta(days=1)).isoformat()
-    connection.execute(
-        "UPDATE market_sources SET details_json = ? "
-        "WHERE source_key = 'advisor-calendar-proof:v1:primary'",
-        (json.dumps(details),),
+    connection.execute("DELETE FROM trading_calendar_proofs")
+    record_trading_calendar_proof(
+        connection,
+        calendar_source="exchange_calendar",
+        as_of=AS_OF - timedelta(days=1),
+        latest_expected_session=date(2026, 7, 10),
+        coverage_codes=("600519",),
     )
     connection.commit()
 

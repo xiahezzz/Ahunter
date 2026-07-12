@@ -25,9 +25,12 @@ def _millis(value: datetime) -> int:
 
 
 @pytest.fixture
-def write_allowed_rids():
+def write_allowed_rids(monkeypatch):
     def write(tmp_path: Path, values: list[object], *, content: str | None = None) -> Path:
-        path = tmp_path / "allowed-rids.yaml"
+        repo = tmp_path / "repo"
+        path = repo / "config" / "allowed-rids.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(mx_adapter, "repo_root", lambda: repo)
         if content is None:
             content = yaml.safe_dump({"allowed_rids": values}, sort_keys=True)
         path.write_text(content, encoding="utf-8")
@@ -368,6 +371,12 @@ def test_secret_or_unsafe_collector_source_id_fails_closed(
         "event-id-token-foo",
         "event_cookie_foo",
         "event.authorization.foo",
+        "event_sessionid_abcdefgh",
+        "event_socketid_foo",
+        "mx_debugidentifier",
+        "event_cdptoken_foo",
+        "event_apikey_foo",
+        "event_idtoken_foo",
     ],
 )
 def test_sensitive_opaque_collector_source_id_fails_closed(
@@ -779,6 +788,48 @@ def test_persist_evidence_revalidates_current_allowlist_before_transaction(
 
     assert not any(statement.startswith(("BEGIN", "SAVEPOINT")) for statement in statements)
     assert connection.execute("SELECT COUNT(*) FROM events_normalized").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+
+
+def test_alternate_allowlist_path_cannot_issue_authorization(
+    tmp_path, create_collector_db, write_allowed_rids, monkeypatch
+):
+    db, _ = create_collector_db(tmp_path)
+    write_allowed_rids(tmp_path, [123])
+    repo = tmp_path / "repo"
+    alternate = tmp_path / "alternate.yaml"
+    alternate.write_text("allowed_rids: [123]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authoritative"):
+        read_collector_snapshot(db, alternate, as_of=AS_OF, limit=1)
+
+
+def test_snapshot_authorization_revalidates_authoritative_repo_path_before_transaction(
+    tmp_path, create_collector_db, write_allowed_rids, monkeypatch
+):
+    db, _ = create_collector_db(tmp_path)
+    original_repo = tmp_path / "original-repo"
+    (original_repo / "config").mkdir(parents=True)
+    allowed = original_repo / "config" / "allowed-rids.yaml"
+    allowed.write_text("allowed_rids: [123]\n", encoding="utf-8")
+    monkeypatch.setattr(mx_adapter, "repo_root", lambda: original_repo, raising=False)
+    snapshot = read_collector_snapshot(db, allowed, as_of=AS_OF, limit=1)
+
+    replacement_repo = tmp_path / "replacement-repo"
+    (replacement_repo / "config").mkdir(parents=True)
+    (replacement_repo / "config" / "allowed-rids.yaml").write_text(
+        "allowed_rids: [123]\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(mx_adapter, "repo_root", lambda: replacement_repo, raising=False)
+    connection = sqlite3.connect(":memory:")
+    _advisor_evidence_tables(connection)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    with pytest.raises(ValueError, match="authorization provenance"):
+        persist_evidence(connection, "advisor-run", snapshot, as_of=AS_OF)
+
+    assert not any(statement.startswith(("BEGIN", "SAVEPOINT")) for statement in statements)
     assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
 
 

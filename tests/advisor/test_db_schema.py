@@ -9,6 +9,7 @@ REQUIRED_TABLES = {
     "securities",
     "market_daily",
     "market_sources",
+    "trading_calendar_proofs",
     "events_normalized",
     "evidence",
     "analyst_outputs",
