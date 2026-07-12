@@ -1,3 +1,4 @@
+import csv
 import json
 import sqlite3
 from datetime import datetime
@@ -9,7 +10,7 @@ import pytest
 from advisor.db.migrate import migrate_database
 from advisor.ledger import importer as ledger_importer
 from advisor.ledger.importer import import_ledger_csv, load_ledger_csv, main
-from advisor.ledger.model import LedgerTransaction, apply_transactions
+from advisor.ledger.model import LedgerTransaction, apply_transactions, ledger_transaction_sort_key
 from advisor.ledger.store import LedgerStore
 
 
@@ -77,6 +78,22 @@ def test_load_ledger_csv(tmp_path: Path):
     transactions = load_ledger_csv(filename)
     assert transactions[0].transaction_type == "cash_deposit"
     assert transactions[0].amount == 100000
+
+
+def test_load_ledger_csv_normalizes_parser_field_limit_error(tmp_path: Path):
+    filename = tmp_path / "ledger.csv"
+    filename.write_text(
+        "transaction_id,trade_date,transaction_type,code,quantity,price,amount,fees\n"
+        f"{'x' * 25},2026-07-10,cash_deposit,,0,0,100000,0\n",
+        encoding="utf-8",
+    )
+    previous_limit = csv.field_size_limit()
+    try:
+        csv.field_size_limit(20)
+        with pytest.raises(ValueError, match="invalid ledger CSV"):
+            load_ledger_csv(filename)
+    finally:
+        csv.field_size_limit(previous_limit)
 
 
 def test_import_ledger_csv_persists_account_transactions_positions_and_snapshot(tmp_path: Path):
@@ -336,6 +353,47 @@ data_sources:
     ]
 
 
+def test_cli_reports_csv_parser_errors_as_usage_errors(tmp_path: Path, capsys):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "advisor.yaml"
+    config_path.write_text(
+        """
+market:
+  primary: A股
+schedule:
+  premarket_time: "08:30"
+  review_time: "22:30"
+storage:
+  database: state/advisor.sqlite
+data_sources:
+  allow_tushare: false
+  free_sources: []
+""".strip(),
+        encoding="utf-8",
+    )
+    csv_path = write_ledger(
+        tmp_path / "parser-error.csv",
+        [f"{'x' * 25},2026-07-09,cash_deposit,,0,0,20000,0"],
+    )
+    previous_limit = csv.field_size_limit()
+    try:
+        csv.field_size_limit(20)
+        with pytest.raises(SystemExit) as error:
+            main([
+                str(csv_path),
+                "--config", str(config_path),
+                "--account-id", "cli-account",
+                "--as-of", AS_OF.isoformat(),
+            ])
+    finally:
+        csv.field_size_limit(previous_limit)
+
+    assert error.value.code == 2
+    assert "invalid ledger CSV" in capsys.readouterr().err
+    assert not (tmp_path / "state" / "advisor.sqlite").exists()
+
+
 def test_apply_fee_transaction_adjusts_cash():
     state = apply_transactions(
         [
@@ -418,9 +476,15 @@ def test_import_quality_flags_are_non_blocking_and_persisted_in_snapshot(tmp_pat
     assert exposure["ledger_quality"] == list(result.quality_flags)
 
 
-def test_same_day_buy_replays_before_lexically_earlier_sell_and_flags_t_plus_one(
+def test_replay_sort_key_and_import_use_canonical_transaction_id_order_with_same_day_allowance(
     tmp_path: Path,
 ):
+    sell = LedgerTransaction("a-sell", "2026-07-10", "sell", "600519", 100, 110, 11000, 0)
+    buy = LedgerTransaction("z-buy", "2026-07-10", "buy", "600519", 100, 100, -10000, 0)
+    assert [item.transaction_id for item in sorted([buy, sell], key=ledger_transaction_sort_key)] == [
+        "a-sell",
+        "z-buy",
+    ]
     db_path = tmp_path / "advisor.sqlite"
     csv_path = write_ledger(
         tmp_path / "same-day.csv",
@@ -434,7 +498,29 @@ def test_same_day_buy_replays_before_lexically_earlier_sell_and_flags_t_plus_one
     result = import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     assert [flag["flag"] for flag in result.quality_flags] == ["a_share_t_plus_one"]
+    assert query_all(db_path, "SELECT transaction_id FROM ledger_transactions ORDER BY rowid") == [
+        ("deposit",),
+        ("a-sell",),
+        ("z-buy",),
+    ]
     assert query_all(db_path, "SELECT code, quantity FROM positions") == []
+
+
+def test_odd_lot_sells_do_not_emit_lot_size_quality_flags(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = write_ledger(
+        tmp_path / "odd-lot-sell.csv",
+        [
+            "deposit,2026-07-09,cash_deposit,,0,0,20000,0",
+            "buy-lot,2026-07-09,buy,600519,100,100,-10000,0",
+            "sell-odd,2026-07-10,sell,600519,50,110,5500,0",
+        ],
+    )
+
+    result = import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
+
+    assert result.quality_flags == ()
+    assert query_all(db_path, "SELECT code, quantity FROM positions") == [("600519", 50)]
 
 
 def test_csv_import_rejects_file_over_byte_limit_before_database_write(

@@ -58,39 +58,42 @@ def load_ledger_csv(path: Path) -> list[LedgerTransaction]:
     if file_size > MAX_LEDGER_CSV_BYTES:
         raise ValueError(f"ledger CSV exceeds {MAX_LEDGER_CSV_BYTES} byte limit")
     with path.open("r", encoding="utf-8", newline="") as handle:
-        rows = csv.DictReader(handle)
-        required = {
-            "transaction_id", "trade_date", "transaction_type", "code",
-            "quantity", "price", "amount", "fees",
-        }
-        if rows.fieldnames is None or set(rows.fieldnames) != required:
-            raise ValueError("ledger CSV has invalid columns")
-        transactions = []
-        for row_number, row in enumerate(rows, start=2):
-            if len(transactions) >= MAX_LEDGER_ROWS:
-                raise ValueError(f"ledger import exceeds {MAX_LEDGER_ROWS} row limit")
-            try:
-                if any(
-                    not isinstance(value, str) or len(value) > MAX_LEDGER_FIELD_LENGTH
-                    for value in row.values()
-                ):
-                    raise ValueError(
-                        f"ledger CSV field exceeds {MAX_LEDGER_FIELD_LENGTH} character limit"
+        try:
+            rows = csv.DictReader(handle)
+            required = {
+                "transaction_id", "trade_date", "transaction_type", "code",
+                "quantity", "price", "amount", "fees",
+            }
+            if rows.fieldnames is None or set(rows.fieldnames) != required:
+                raise ValueError("ledger CSV has invalid columns")
+            transactions = []
+            for row_number, row in enumerate(rows, start=2):
+                if len(transactions) >= MAX_LEDGER_ROWS:
+                    raise ValueError(f"ledger import exceeds {MAX_LEDGER_ROWS} row limit")
+                try:
+                    if any(
+                        not isinstance(value, str) or len(value) > MAX_LEDGER_FIELD_LENGTH
+                        for value in row.values()
+                    ):
+                        raise ValueError(
+                            f"ledger CSV field exceeds {MAX_LEDGER_FIELD_LENGTH} character limit"
+                        )
+                    transaction = LedgerTransaction(
+                        transaction_id=row["transaction_id"],
+                        trade_date=row["trade_date"],
+                        transaction_type=row["transaction_type"],
+                        code=row["code"] or None,
+                        quantity=int(row["quantity"]),
+                        price=float(row["price"]),
+                        amount=float(row["amount"]),
+                        fees=float(row["fees"]),
                     )
-                transaction = LedgerTransaction(
-                    transaction_id=row["transaction_id"],
-                    trade_date=row["trade_date"],
-                    transaction_type=row["transaction_type"],
-                    code=row["code"] or None,
-                    quantity=int(row["quantity"]),
-                    price=float(row["price"]),
-                    amount=float(row["amount"]),
-                    fees=float(row["fees"]),
-                )
-                validate_ledger_transaction(transaction)
-            except (TypeError, ValueError) as error:
-                raise ValueError(f"invalid ledger CSV row {row_number}: {error}") from error
-            transactions.append(transaction)
+                    validate_ledger_transaction(transaction)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(f"invalid ledger CSV row {row_number}: {error}") from error
+                transactions.append(transaction)
+        except csv.Error as error:
+            raise ValueError(f"invalid ledger CSV: {error}") from error
     if not transactions:
         raise ValueError("ledger CSV contains no transactions")
     return transactions
@@ -430,7 +433,7 @@ def _ledger_quality_flags(
             sold_today = {}
         if transaction.transaction_type not in {"buy", "sell"} or transaction.code is None:
             continue
-        if transaction.quantity % 100:
+        if transaction.transaction_type == "buy" and transaction.quantity % 100:
             flags.append(
                 {
                     "flag": "a_share_lot_size",
