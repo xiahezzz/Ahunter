@@ -765,6 +765,108 @@ No live smoke test, browser screenshot QA, MX page operation, collector start, R
 
 Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched.
 
+## Task 17 Capacity/Header Review Fix
+
+Implementation commit: `bb43a68`
+
+Required commit subject: `fix: bound ledger capacity surfaces`
+
+### Summary
+
+- Added one shared ledger replay limit validator used by import, store replay, and snapshot paths; public `max_rows` overrides now fail unless `0 < max_rows <= MAX_LEDGER_ROWS`.
+- Added a fixed snapshot account cap and a coordinator ledger-context item cap, both fail-closed before snapshot SQL/report context rendering.
+- Replaced set-based CSV header validation with exact ordered unique header validation for the eight-column ledger schema.
+- Preserved passive collector behavior and made no RID configuration, broker/order, frontend visual, schema, or unrelated changes.
+
+### RED Evidence
+
+Initial boundedness/header regressions:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_csv_header_must_match_expected_unique_order_before_database_write tests/advisor/test_ledger.py::test_import_ledger_entries_rejects_invalid_public_replay_limits tests/advisor/test_ledger.py::test_ledger_store_rejects_invalid_public_replay_limits tests/advisor/test_ledger.py::test_materialize_ledger_snapshots_rejects_excessive_account_lists tests/advisor/test_coordinator.py::test_review_rejects_excessive_ledger_accounts_before_rendering_context -q
+FF..FFFFFF                                                               [100%]
+8 failed, 2 passed in 1.47s
+```
+
+Explicit review context item regression:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_review_rejects_excessive_ledger_context_items_before_rendering -q
+F                                                                        [100%]
+1 failed in 1.24s
+```
+
+### GREEN Evidence
+
+Focused regression GREEN:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_csv_header_must_match_expected_unique_order_before_database_write tests/advisor/test_ledger.py::test_import_ledger_entries_rejects_invalid_public_replay_limits tests/advisor/test_ledger.py::test_ledger_store_rejects_invalid_public_replay_limits tests/advisor/test_ledger.py::test_materialize_ledger_snapshots_rejects_excessive_account_lists tests/advisor/test_coordinator.py::test_review_rejects_excessive_ledger_accounts_before_rendering_context tests/advisor/test_coordinator.py::test_review_rejects_excessive_ledger_context_items_before_rendering -q
+...........                                                              [100%]
+11 passed in 1.17s
+```
+
+### Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 34%]
+........................................................................ [ 69%]
+................................................................         [100%]
+208 passed in 5.60s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 15%]
+........................................................................ [ 30%]
+........................................................................ [ 46%]
+........................................................................ [ 61%]
+........................................................................ [ 76%]
+........................................................................ [ 92%]
+....................................                                     [100%]
+468 passed in 7.91s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 520.1325
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
+### Changed Files
+
+- `advisor/coordinator.py`
+- `advisor/ledger/importer.py`
+- `advisor/ledger/store.py`
+- `tests/advisor/test_coordinator.py`
+- `tests/advisor/test_ledger.py`
+- `.superpowers/sdd/task-17-report.md`
+
+### Concerns
+
+Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched.
+
 ## Final CSV Byte-Bound and Snapshot Interface Fix
 
 Implementation commit: `e90437073e790ed49b615692809af03b64edb06f`
