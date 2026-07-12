@@ -16,6 +16,8 @@ Final consistency implementation commit: `9169090`
 
 Final race/capacity implementation commit: `683c086`
 
+Operating contract implementation commit: `bd31d8b`
+
 Required commit subject: `fix: complete coordinator review paths`
 
 Archive consistency commit subject: `fix: hide orphan report archives`
@@ -27,6 +29,104 @@ Eligibility capacity commit subject: `fix: bound report eligibility queries`
 Final consistency commit subject: `fix: close coordinator consistency gaps`
 
 Final race/capacity commit subject: `fix: stabilize report visibility and review linkage`
+
+Operating contract commit subject: `fix: complete coordinator operating contract`
+
+## Operating Contract Fix Summary
+
+- Premarket advice now parses bounded `buy`, `watch`, `hold`, `reduce`, `exit`, and `avoid` research decisions from portfolio-manager/trader/research-manager payloads before bounded summary fallback. Valid payload confidence is retained; otherwise a conservative deterministic default is used. Rationale labels the contributing analyst summaries and remains research-only.
+- Daily review evaluates close movement against advice direction and records ledger transaction types and counts in review text.
+- Premarket and review CLIs accept `--date`, default to Shanghai report day and 08:30/22:30 `as_of`, allow omitted `--codes`, print JSON results, return nonzero for blocked/failed outcomes, and attempt sanitized failure archives when parsed runtime context is available.
+- Candidate scope is expanded before quality checks from caller codes, accepted MX summary codes, nonzero positions, and positive replayed ledger holdings. Analyst outputs referencing securities outside the checked set block publication.
+- Premarket profile projection preserves prior non-empty information flow, analyst flow, and chart assets. K-line input is restricted to passed rows no later than both `as_of` and report date; advice marker metadata is persisted in report context.
+- Report listing now uses DB-backed keyset batches and verifies only enough filesystem candidates to fill the requested page, with a bounded 500-row fail-closed scan. Filesystem-only orphans remain hidden.
+- No collector behavior, RID configuration, broker/order code, live Chrome state, or MX page was touched.
+
+## Operating Contract TDD Evidence
+
+The initial coordinator/CLI regressions failed for the expected hardcoded decision, missing candidate expansion, projection replacement, legacy required CLI flags, and direction-agnostic review behavior:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py -k 'bounded_analyst_decision or expands_candidates or preserves_non_empty or date_defaults or decline_as_favorable' -q
+FFFFFF                                                                   [100%]
+6 failed, 19 deselected in 2.18s
+```
+
+The chart temporal regression failed before the cutoff contract was implemented:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_kline_chart.py::test_generate_kline_chart_excludes_future_and_failed_rows -q
+F                                                                        [100%]
+1 failed in 0.88s
+```
+
+The bounded report-page regression opened all 180 archives before pagination:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_web_api.py::test_small_report_page_verifies_only_bounded_archive_candidates -q
+F                                                                        [100%]
+1 failed in 0.89s
+```
+
+## Operating Contract Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py tests/advisor/test_web_api.py tests/advisor/test_kline_chart.py tests/advisor/test_reporting.py tests/advisor/test_quality_gate.py tests/advisor/test_astock_adapter.py tests/advisor/test_profiles.py -q
+........................................................................ [ 30%]
+........................................................................ [ 61%]
+........................................................................ [ 91%]
+....................                                                     [100%]
+236 passed in 5.36s
+```
+
+Required complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 17%]
+........................................................................ [ 35%]
+........................................................................ [ 53%]
+........................................................................ [ 71%]
+........................................................................ [ 89%]
+............................................                             [100%]
+404 passed in 7.15s
+```
+
+Required offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+suites 0
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 508.088833
+```
+
+Required static check:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+Changed implementation/test files:
+
+- `advisor/charts/kline.py`
+- `advisor/coordinator.py`
+- `advisor/reporting/premarket.py`
+- `advisor/reporting/review.py`
+- `advisor/web/api.py`
+- `tests/advisor/test_coordinator.py`
+- `tests/advisor/test_kline_chart.py`
+- `tests/advisor/test_web_api.py`
+
+Concern: bounded report verification intentionally stops after 500 database candidates. If more than 500 newer invalid/orphan rows precede a valid archive in one requested window, the response stays fail-closed and truncated instead of performing unbounded filesystem work.
 
 ## Final Race/Capacity Summary
 
@@ -523,5 +623,5 @@ Premarket linkage follow-up:
 
 - Report files remain immutable and cannot participate in the SQLite transaction. Orphans are now hidden by DB-backed API eligibility, but reclaiming their filenames requires a distinct versioned report run ID; same-ID retries fail and are recorded as failed runs.
 - Profile Markdown and chart image generation are filesystem projections. Their database metadata is rolled back on report failure, while already-written projection files may remain for a later successful run to replace.
-- API report listing still slices the filesystem archive page before filtering against database eligibility. Correct eligible-only pagination requires changing the reporting contract's cursor snapshot semantics outside this follow-up's allowed scope; orphan files can still consume list limits and affect pagination metadata even though they are not exposed.
+- API report listing now pages database-backed candidates before bounded filesystem verification. The 500-row verification ceiling is intentionally fail-closed when a window contains an extreme number of invalid candidates.
 - Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched and excluded from both commits.
