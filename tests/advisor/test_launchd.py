@@ -1,4 +1,5 @@
 import json
+import plistlib
 import subprocess
 import sys
 from datetime import datetime
@@ -113,6 +114,32 @@ def test_launchd_render_creates_log_directories_for_output(tmp_path):
     assert exit_code == 0
     assert output.exists()
     assert logs_dir.is_dir()
+
+
+def test_launchd_render_preserves_explicit_python_path(tmp_path):
+    output = tmp_path / "Library" / "LaunchAgents" / "advisor.plist"
+    repo_root = tmp_path / "repo"
+    python_target = tmp_path / "base-python"
+    python_target.write_text("", encoding="utf-8")
+    explicit_python = repo_root / ".venv311" / "bin" / "python"
+    explicit_python.parent.mkdir(parents=True)
+    explicit_python.symlink_to(python_target)
+
+    exit_code = main(
+        [
+            str(LAUNCHD_DIR / "com.ahunter.advisor-api.plist.template"),
+            "--repo-root",
+            str(repo_root),
+            "--python",
+            str(explicit_python),
+            "--output",
+            str(output),
+        ]
+    )
+
+    payload = plistlib.loads(output.read_bytes())
+    assert exit_code == 0
+    assert payload["ProgramArguments"][0] == str(explicit_python)
 
 
 def test_review_scheduler_archives_sanitized_failure_when_morning_archive_linkage_fails(

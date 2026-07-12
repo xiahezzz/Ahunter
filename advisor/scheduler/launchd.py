@@ -1,4 +1,5 @@
 import argparse
+import os
 import plistlib
 from pathlib import Path
 
@@ -100,12 +101,16 @@ def main(argv: list[str] | None = None) -> int:
         rendered = render_launchd_template(
             args.template,
             repo_root=args.repo_root.resolve(),
-            python=args.python.resolve(),
+            python=_absolute_without_symlink_resolution(args.python),
         )
         _ensure_render_directories(rendered, args.output)
         args.output.write_text(rendered, encoding="utf-8")
     print(f"valid launchd template: {args.template}")
     return 0
+
+
+def _absolute_without_symlink_resolution(path: Path) -> Path:
+    return Path(os.path.abspath(path))
 
 
 def _ensure_render_directories(rendered: str, output: Path) -> None:
