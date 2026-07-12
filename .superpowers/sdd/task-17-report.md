@@ -970,3 +970,91 @@ No live smoke test, browser screenshot QA, MX page operation, collector start, R
 ### Concerns
 
 Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched.
+
+## Task 17 Final Review Projection Bounds Fix
+
+Required implementation commit subject: `fix: bound ledger review context`
+
+Required report commit subject: `docs: record task 17 review bounds fix`
+
+### Summary
+
+- Bounded review account discovery at `MAX_LEDGER_SNAPSHOT_ACCOUNTS + 1` and fail closed before snapshot materialization when the overflow row is present.
+- Replaced the broad same-day trade match fetch with per-advice/account/code/date bounded lookup.
+- Added visible review context markers for bounded same-day matches: `transaction_match_count` and `transactions_truncated`.
+- Persisted only the bounded trade matches to `advice_trade_matches`.
+- Preserved passive collector behavior and made no RID configuration, broker/order, frontend visual, schema, or unrelated changes.
+
+### TDD Evidence
+
+Review projection bounds RED:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_review_bounds_ledger_account_discovery_before_snapshot_materialization tests/advisor/test_coordinator.py::test_review_truncates_excessive_same_day_trade_matches_per_context_item -q
+FF                                                                       [100%]
+2 failed in 1.39s
+```
+
+Review projection bounds GREEN:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_review_bounds_ledger_account_discovery_before_snapshot_materialization tests/advisor/test_coordinator.py::test_review_truncates_excessive_same_day_trade_matches_per_context_item -q
+..                                                                       [100%]
+2 passed in 1.25s
+```
+
+Coordinator suite check:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py -q
+.................................                                        [100%]
+33 passed in 3.31s
+```
+
+### Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 34%]
+........................................................................ [ 68%]
+..................................................................       [100%]
+210 passed in 6.02s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 15%]
+........................................................................ [ 30%]
+........................................................................ [ 45%]
+........................................................................ [ 61%]
+........................................................................ [ 76%]
+........................................................................ [ 91%]
+......................................                                   [100%]
+470 passed in 8.30s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 507.33175
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
