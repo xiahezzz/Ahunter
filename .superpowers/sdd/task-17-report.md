@@ -581,3 +581,103 @@ duration_ms 510.113542
 ```
 
 No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
+## Final Replay/Quality/CSV Decoder Fixes
+
+Implementation commit: `9c57aa0`
+
+Required commit subject: `fix: restore canonical ledger replay order`
+
+### Summary
+
+- Restored canonical ledger replay ordering to `(account_id, trade_date, transaction_id)` by removing transaction-type priority from the shared transaction sort key.
+- Added a same-day net-availability allowance for canonical prefixes that temporarily oversell only because same-day buy/sell transaction IDs are arbitrary; true oversells across days still reject.
+- Limited A-share lot-size quality flags to non-lot buys; odd-lot sells remain structurally valid sell-offs without lot-size flags.
+- Normalized `_csv.Error` parser failures from `csv.DictReader` fieldname access and iteration into deterministic `ValueError` handling, including CLI usage-error output.
+
+### RED Evidence
+
+Focused regressions initially failed for parser normalization, CLI handling, canonical replay ordering, and odd-lot sell flags:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_load_ledger_csv_normalizes_parser_field_limit_error tests/advisor/test_ledger.py::test_cli_reports_csv_parser_errors_as_usage_errors tests/advisor/test_ledger.py::test_replay_sort_key_and_import_use_canonical_transaction_id_order_with_same_day_allowance tests/advisor/test_ledger.py::test_odd_lot_sells_do_not_emit_lot_size_quality_flags -q
+FFFF                                                                     [100%]
+4 failed in 0.23s
+```
+
+### GREEN Evidence
+
+Focused regressions after the fix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_load_ledger_csv_normalizes_parser_field_limit_error tests/advisor/test_ledger.py::test_cli_reports_csv_parser_errors_as_usage_errors tests/advisor/test_ledger.py::test_replay_sort_key_and_import_use_canonical_transaction_id_order_with_same_day_allowance tests/advisor/test_ledger.py::test_odd_lot_sells_do_not_emit_lot_size_quality_flags -q
+....                                                                     [100%]
+4 passed in 0.23s
+```
+
+Ledger import suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q
+...............................                                          [100%]
+31 passed in 0.47s
+```
+
+### Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 37%]
+........................................................................ [ 75%]
+................................................                         [100%]
+192 passed in 5.61s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 15%]
+........................................................................ [ 31%]
+........................................................................ [ 47%]
+........................................................................ [ 63%]
+........................................................................ [ 79%]
+........................................................................ [ 95%]
+....................                                                     [100%]
+452 passed in 7.92s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 526.058334
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
+### Changed Files
+
+- `advisor/ledger/model.py`
+- `advisor/ledger/importer.py`
+- `tests/advisor/test_ledger.py`
+- `.superpowers/sdd/task-17-report.md`
+
+### Concerns
+
+Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched and are not included in the final replay-fix commits.
