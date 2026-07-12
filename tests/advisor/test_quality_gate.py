@@ -413,6 +413,78 @@ def test_historical_calendar_proof_is_ignored_when_current_proof_is_available(tm
     assert next(check for check in result.checks if check.check_name == "trading_calendar").passed
 
 
+def test_calendar_proof_future_instant_in_earlier_timezone_blocks(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    run_as_of = datetime(2026, 7, 12, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    details = json.loads(
+        connection.execute(
+            "SELECT details_json FROM market_sources WHERE source_key = 'calendar-proof'"
+        ).fetchone()[0]
+    )
+    details["as_of"] = run_as_of.isoformat()
+    connection.execute(
+        "UPDATE market_sources SET fetched_at = ?, details_json = ? WHERE source_key = 'calendar-proof'",
+        (run_as_of.isoformat(), json.dumps(details)),
+    )
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('future-timezone-proof', 'future_calendar', 'bounded', 'timezone', ?, 'passed', ?)
+        """,
+        (
+            run_as_of.isoformat(),
+            json.dumps(
+                {
+                    "as_of": "2026-07-11T23:30:00-10:00",
+                    "calendar_source": "future_calendar",
+                    "coverage_codes": ["600519"],
+                    "latest_expected_session": "2026-07-10",
+                    "proof_type": "trading_calendar",
+                }
+            ),
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request(as_of=run_as_of))
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "future" in check.details
+
+
+def test_calendar_proof_current_in_run_timezone_conflicts_across_timezones(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    proof_as_of = datetime(2026, 7, 11, 16, 30, tzinfo=ZoneInfo("Etc/GMT+4"))
+    connection.execute(
+        """
+        INSERT INTO market_sources (
+          source_key, source, endpoint, params_hash, fetched_at, status, details_json
+        ) VALUES ('cross-timezone-proof', 'other_calendar', 'bounded', 'timezone', ?, 'passed', ?)
+        """,
+        (
+            proof_as_of.isoformat(),
+            json.dumps(
+                {
+                    "as_of": proof_as_of.isoformat(),
+                    "calendar_source": "other_calendar",
+                    "coverage_codes": ["600519"],
+                    "latest_expected_session": "2026-07-09",
+                    "proof_type": "trading_calendar",
+                }
+            ),
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "conflict" in check.details
+
+
 @pytest.mark.parametrize("run_id", ("token=secret", "../escape", "run\nid"))
 def test_unsafe_quality_request_run_id_blocks_without_persisting_checks(tmp_path: Path, run_id: str):
     connection = quality_connection(tmp_path)

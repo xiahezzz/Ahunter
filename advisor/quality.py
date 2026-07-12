@@ -182,10 +182,13 @@ def _authoritative_expected_session(
             proof_as_of = dt.datetime.fromisoformat(details.get("as_of"))
             if proof_as_of.tzinfo is None or proof_as_of.utcoffset() is None:
                 raise ValueError("invalid calendar as_of")
-            if proof_as_of.date() < request.as_of.date():
+            if proof_as_of > request.as_of:
+                return None, "trading calendar proof is future-dated for this run"
+            proof_date = proof_as_of.astimezone(request.as_of.tzinfo).date()
+            if proof_date < request.as_of.date():
                 saw_historical_proof = True
                 continue
-            if proof_as_of > request.as_of or proof_as_of.date() != request.as_of.date():
+            if proof_date != request.as_of.date():
                 return None, "trading calendar proof is stale or not current for this run"
             coverage = details.get("coverage_codes")
             scope = details.get("scope")
