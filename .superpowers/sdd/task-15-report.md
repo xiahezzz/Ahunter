@@ -947,3 +947,92 @@ git diff --check
 ### Concerns
 
 None. No collector behavior, RID values, frontend, broker/order code, database/calendar/quality logic, live smoke test, Chrome session, or MX page operation was changed or invoked. Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched.
+
+## Generalized Sensitive Identifier Fix
+
+### Status
+
+DONE
+
+Implementation commit: `3450cee`
+
+Required commit subject: `fix: generalize sensitive id filtering`
+
+### Fix Summary
+
+- Replaced the exactly-two-term compound regex with a bounded helper that segments each delimiter-separated identifier component into any number of sensitive terms.
+- Continued rejecting separated and two-term secret, debug, session, socket, token, API-key, authorization, cookie, password, credential, and secret concepts.
+- Added regressions for `sessionaccesstoken`, `accessauthorizationtoken`, and a four-term compound while preserving benign identifiers including `evt-authorized-1`.
+
+### TDD Evidence
+
+The new multi-term regressions initially produced:
+
+```text
+.FFF...........                                                          [100%]
+3 failed, 12 passed, 104 deselected in 0.15s
+```
+
+After implementation, the concatenated-sensitive and benign identifier tests produced:
+
+```text
+...................                                                      [100%]
+19 passed, 100 deselected in 0.06s
+```
+
+### Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+........................................................................ [ 28%]
+........................................................................ [ 56%]
+........................................................................ [ 85%]
+.....................................                                    [100%]
+253 passed in 2.64s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 19%]
+........................................................................ [ 38%]
+........................................................................ [ 57%]
+........................................................................ [ 77%]
+........................................................................ [ 96%]
+.............                                                            [100%]
+373 passed in 4.67s
+```
+
+Offline collector self-test aggregate:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+ℹ tests 133
+ℹ suites 0
+ℹ pass 133
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 526.223292
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+### Changed Files
+
+- `advisor/evidence/mx_adapter.py`
+- `tests/advisor/test_mx_evidence_quality.py`
+- `.superpowers/sdd/task-15-report.md`
+
+### Concerns
+
+None. No collector behavior, RID values, frontend, broker/order code, database/calendar/quality logic, live smoke test, Chrome session, or MX page operation was changed or invoked. Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched.
