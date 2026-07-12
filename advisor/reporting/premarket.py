@@ -168,7 +168,7 @@ def main(argv: Sequence[str] | None = None, *, coordinator=None, snapshot_reader
             "warnings": list(result.warnings),
         }
         print(json.dumps(payload, sort_keys=True))
-        return 0 if result.status == "passed" else 2
+        return 0 if result.status in {"passed", "blocked"} else 1
     except Exception as error:
         run_id = f"premarket-cli-failed-{report_day:%Y%m%d}"
         if args.run_id is not None:

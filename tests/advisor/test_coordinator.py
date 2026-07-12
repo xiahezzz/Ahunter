@@ -75,7 +75,10 @@ class PassingRunner:
                 summary=f"{role} summary",
                 payload={
                     "quality_outcome": QualityOutcome(True, "hard checks passed")
-                } if role == "quality_gate" else {"signal": role},
+                } if role == "quality_gate"
+                else {"decision": {"action": "watch", "confidence": 0.7}}
+                if role == "portfolio_manager"
+                else {"signal": role},
             )
             for role in ANALYST_ROLES
         ]
@@ -123,7 +126,10 @@ class CandidateRunner:
                 code,
                 f"{role} summary",
                 {"quality_outcome": QualityOutcome(True, "hard checks passed")}
-                if role == "quality_gate" else {"signal": role},
+                if role == "quality_gate"
+                else {"decision": {"action": "watch", "confidence": 0.7}}
+                if role == "portfolio_manager"
+                else {"signal": role},
             )
             for role in ANALYST_ROLES
         ]
@@ -447,6 +453,70 @@ def test_analyst_quality_error_publishes_no_partial_advice(tmp_path: Path):
     assert query_all(paths["db_path"], "SELECT COUNT(*) FROM advice")[0][0] == 0
     assert query_all(paths["db_path"], "SELECT COUNT(*) FROM analyst_outputs")[0][0] == 0
     assert "must-not-archive" not in result.report_paths.json_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "portfolio_payload",
+    [
+        {},
+        {"decision": {"action": "watch"}},
+        {"decision": {"action": "watch", "confidence": 1.5}},
+        {"decision": {"action": "buy", "rating": "hold", "confidence": 0.8}},
+    ],
+)
+def test_missing_malformed_or_ambiguous_portfolio_decision_blocks_publication(
+    tmp_path: Path,
+    portfolio_payload: dict,
+):
+    class BadDecisionRunner(PassingRunner):
+        def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
+            return [
+                AnalystOutput(item.role, item.code, item.summary, portfolio_payload)
+                if item.role == "portfolio_manager" else item
+                for item in super().run(code, trade_date, evidence)
+            ]
+
+    paths = coordinator_paths(tmp_path)
+
+    result = run_premarket(
+        collector_snapshot=collector(), analyst_runner=BadDecisionRunner(), as_of=AS_OF,
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, evidence_persister=persist_fixture_evidence,
+        **paths,
+    )
+
+    assert result.status == "blocked"
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM advice") == [(0,)]
+    payload = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))
+    assert payload["report_type"] == "failure"
+    assert payload["quality_status"] == "blocked"
+
+
+def test_ambiguous_duplicate_portfolio_decisions_block_publication(tmp_path: Path):
+    class DuplicateDecisionRunner(PassingRunner):
+        def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
+            outputs = super().run(code, trade_date, evidence)
+            outputs.append(
+                AnalystOutput(
+                    "portfolio_manager",
+                    code,
+                    "duplicate",
+                    {"decision": {"action": "buy", "confidence": 0.8}},
+                )
+            )
+            return outputs
+
+    paths = coordinator_paths(tmp_path)
+
+    result = run_premarket(
+        collector_snapshot=collector(), analyst_runner=DuplicateDecisionRunner(), as_of=AS_OF,
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=passed_quality, evidence_persister=persist_fixture_evidence,
+        **paths,
+    )
+
+    assert result.status == "blocked"
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM advice") == [(0,)]
 
 
 def test_review_links_morning_advice_and_persists_review(tmp_path: Path):
@@ -882,7 +952,7 @@ def test_report_cli_date_defaults_as_of_and_allows_candidate_expansion(
     assert calls["snapshot_as_of"].date().isoformat() == "2026-07-12"
     assert (calls["snapshot_as_of"].hour, calls["snapshot_as_of"].minute) == (expected_hour, 30)
     assert calls["coordinator"]["candidate_codes"] == ()
-    assert exit_code == 2
+    assert exit_code == 0
     assert json.loads(capsys.readouterr().out)["status"] == "blocked"
 
 
@@ -1369,3 +1439,48 @@ def test_coordinator_resolves_configured_storage_without_tushare(tmp_path: Path)
     assert (tmp_path / "custom" / "state.sqlite").exists()
     assert (tmp_path / "custom" / "profiles" / f"{CODE}.md").exists()
     assert not list(tmp_path.rglob("*tushare*"))
+
+
+def test_premarket_uses_configured_tradingagents_runtime_when_runner_is_not_injected(
+    tmp_path: Path,
+    monkeypatch,
+):
+    created = []
+
+    class ConfiguredRunner(PassingRunner):
+        def __init__(self, *, repository_path, upstream_config):
+            created.append((str(repository_path), upstream_config))
+
+    monkeypatch.setattr(coordinator_module, "ExternalTradingAgentsRunner", ConfiguredRunner)
+    config_path = tmp_path / "config" / "advisor.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(yaml.safe_dump({
+        "market": {"primary": "A股"},
+        "schedule": {"premarket_time": "08:30", "review_time": "22:30"},
+        "storage": {
+            "database": "custom/state.sqlite",
+            "chart_dir": "custom/charts",
+            "profile_dir": "custom/profiles",
+        },
+        "data_sources": {"allow_tushare": False, "free_sources": ["sina"]},
+        "trading_agents": {
+            "repository_path": "/opt/tradingagents-astock",
+            "upstream_provider": "dashscope",
+            "upstream_model": "qwen-plus",
+        },
+    }), encoding="utf-8")
+
+    result = run_premarket(
+        collector_snapshot=collector(), as_of=AS_OF,
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        output_dir=tmp_path / "reports", config_path=config_path, root=tmp_path,
+        quality_evaluator=passed_quality, evidence_persister=persist_fixture_evidence,
+    )
+
+    assert result.status == "passed"
+    assert created == [
+        (
+            "/opt/tradingagents-astock",
+            {"llm_provider": "dashscope", "deep_think_llm": "qwen-plus", "quick_think_llm": "qwen-plus"},
+        )
+    ]

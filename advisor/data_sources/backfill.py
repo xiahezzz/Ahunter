@@ -9,11 +9,17 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
+from advisor.calendar import latest_expected_session
 from advisor.config import load_advisor_config, resolve_state_db
 from advisor.data_sources.contracts import DailyBar, MarketDataProvider, MarketSourceError
 from advisor.data_sources.free_sources import ConfiguredProviderRegistry
 from advisor.db.migrate import migrate_database
-from advisor.db.repository import connect, record_market_source_attempt, upsert_daily_bar
+from advisor.db.repository import (
+    connect,
+    record_market_source_attempt,
+    record_trading_calendar_proof,
+    upsert_daily_bar,
+)
 
 
 _CODE_RE = re.compile(r"[03468]\d{5}\Z")
@@ -34,9 +40,11 @@ def update_market_database(
     start: date,
     end: date,
     *,
+    as_of: datetime | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> BackfillResult:
     requested = _validate_backfill_request(codes, start, end)
+    proof_as_of = as_of or datetime.now().astimezone()
     migrate_database(db_path)
     completed: list[str] = []
     failed: list[str] = []
@@ -44,7 +52,7 @@ def update_market_database(
     rate = getattr(provider, "rate_limit_per_second", 1.0)
 
     for index, code in enumerate(requested):
-        attempted_at = datetime.now().astimezone().isoformat()
+        attempted_at = proof_as_of.isoformat()
         try:
             bars = provider.fetch_daily_bars(code, start, end)
             _validate_bars(code, bars, start, end)
@@ -56,6 +64,8 @@ def update_market_database(
             completed.append(code)
         if index + 1 < len(requested):
             sleep(1.0 / rate)
+    if completed:
+        _record_calendar_proof(db_path, tuple(completed), proof_as_of)
     return BackfillResult(requested, tuple(completed), tuple(failed), inserted)
 
 
@@ -144,6 +154,25 @@ def _record_failed_attempt(
             status="failed",
             fetched_at=attempted_at,
             error=str(error),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _record_calendar_proof(db_path: Path, completed_codes: tuple[str, ...], as_of: datetime) -> None:
+    connection = connect(db_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        record_trading_calendar_proof(
+            connection,
+            calendar_source="local_trading_calendar",
+            as_of=as_of,
+            latest_expected_session=latest_expected_session(as_of),
+            coverage_codes=completed_codes,
         )
         connection.commit()
     except Exception:

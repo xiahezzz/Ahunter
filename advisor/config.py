@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from advisor.paths import repo_root
 
@@ -40,12 +40,40 @@ class QualityConfig(BaseModel):
     require_trading_calendar: bool = True
 
 
+class TradingAgentsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repository_path: str = "/Users/mac/Documents/TradingAgents-astock"
+    upstream_provider: str | None = None
+    upstream_model: str | None = None
+
+    @field_validator("repository_path")
+    @classmethod
+    def validate_repository_path(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("TradingAgents repository path is required")
+        path = Path(value)
+        if not path.is_absolute():
+            raise ValueError("TradingAgents repository path must be absolute")
+        return str(path)
+
+    @field_validator("upstream_provider", "upstream_model")
+    @classmethod
+    def validate_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("TradingAgents upstream settings must be non-empty when provided")
+        return value.strip()
+
+
 class AdvisorConfig(BaseModel):
     market: MarketConfig
     schedule: ScheduleConfig
     storage: StorageConfig
     data_sources: DataSourceConfig
     quality: QualityConfig = Field(default_factory=QualityConfig)
+    trading_agents: TradingAgentsConfig = Field(default_factory=TradingAgentsConfig)
 
 
 def load_advisor_config(path: Path | None = None) -> AdvisorConfig:

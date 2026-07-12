@@ -92,7 +92,9 @@ def insert_report_archive(
 def test_dev_dependencies_declare_starlette_testclient_transport():
     project = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert any(requirement.startswith("httpx2>=") and "<3" in requirement for requirement in project["project"]["optional-dependencies"]["dev"])
+    dev_dependencies = project["project"]["optional-dependencies"]["dev"]
+    assert any(requirement.startswith("httpx>=") for requirement in dev_dependencies)
+    assert not any(requirement.startswith("httpx2") for requirement in dev_dependencies)
 
 
 def test_health_endpoint_reports_service_and_known_component_statuses(tmp_path):

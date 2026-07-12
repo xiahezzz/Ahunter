@@ -29,7 +29,7 @@ def validate_launchd_template(path: Path) -> bool:
     if label == "com.ahunter.advisor-api":
         return _valid_api_payload(payload, args)
     if label == "com.ahunter.advisor-premarket":
-        return _valid_report_payload(payload, args, "advisor.reporting.premarket", 8, 30)
+        return _valid_report_payload(payload, args, "advisor.scheduler.premarket", 8, 30)
     if label == "com.ahunter.advisor-review":
         return _valid_report_payload(payload, args, "advisor.reporting.review", 22, 30)
     return False
@@ -97,16 +97,24 @@ def main(argv: list[str] | None = None) -> int:
     if not validate_launchd_template(args.template):
         raise SystemExit(1)
     if args.output is not None:
-        args.output.write_text(
-            render_launchd_template(
-                args.template,
-                repo_root=args.repo_root.resolve(),
-                python=args.python.resolve(),
-            ),
-            encoding="utf-8",
+        rendered = render_launchd_template(
+            args.template,
+            repo_root=args.repo_root.resolve(),
+            python=args.python.resolve(),
         )
+        _ensure_render_directories(rendered, args.output)
+        args.output.write_text(rendered, encoding="utf-8")
     print(f"valid launchd template: {args.template}")
     return 0
+
+
+def _ensure_render_directories(rendered: str, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = plistlib.loads(rendered.encode("utf-8"))
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        path = payload.get(key)
+        if isinstance(path, str) and path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
 if __name__ == "__main__":

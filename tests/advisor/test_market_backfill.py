@@ -1,7 +1,8 @@
 import json
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,6 +10,8 @@ from fastapi.testclient import TestClient
 from advisor.data_sources.backfill import main, update_market_database
 from advisor.data_sources.contracts import DailyBar, MarketDataProvider, MarketSourceError
 from advisor.db.repository import connect
+from advisor.evidence.mx_adapter import CollectorSnapshot
+from advisor.quality import QualityRequest, QualityResult, evaluate_run_quality
 from advisor.web.api import create_app
 
 
@@ -43,6 +46,17 @@ class FakeProvider(MarketDataProvider):
         if code in self.failed_codes:
             raise MarketSourceError("recorded source failure")
         return [self.bar_factory(code)]
+
+
+class HistoricalProvider(MarketDataProvider):
+    source = "fake_free_source"
+    endpoint = "http://free.example.test/kline"
+
+    def fetch_daily_bars(self, code: str, start: date, end: date) -> list[DailyBar]:
+        return [
+            make_bar(code, content_hash="start", trade_date=start),
+            make_bar(code, content_hash="latest", trade_date=date(2026, 7, 10)),
+        ]
 
 
 def test_backfill_issues_36_month_request_and_writes_api_database(tmp_path: Path):
@@ -85,8 +99,9 @@ def test_backfill_is_idempotent_but_records_every_attempt(tmp_path: Path):
         connection.close()
 
 
-def test_successful_backfill_records_fetch_metadata_without_self_authorizing_calendar(tmp_path: Path):
+def test_successful_backfill_records_trusted_calendar_proof(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
+    as_of = datetime(2026, 7, 12, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
 
     update_market_database(
         db_path,
@@ -94,6 +109,7 @@ def test_successful_backfill_records_fetch_metadata_without_self_authorizing_cal
         ["600519"],
         date(2023, 7, 12),
         date(2026, 7, 12),
+        as_of=as_of,
         sleep=lambda _: None,
     )
 
@@ -104,13 +120,70 @@ def test_successful_backfill_records_fetch_metadata_without_self_authorizing_cal
                 "SELECT details_json FROM market_sources WHERE status = 'passed'"
             ).fetchone()[0]
         )
+        proof = connection.execute(
+            "SELECT calendar_source, latest_expected_session, scope, coverage_codes_json "
+            "FROM trading_calendar_proofs"
+        ).fetchone()
     finally:
         connection.close()
     assert details["proof_type"] == "historical_market_fetch"
     assert details["code"] == "600519"
     assert details["actual_latest_session"] == "2026-07-10"
-    assert "latest_expected_session" not in details
-    assert "calendar_source" not in details
+    assert tuple(proof) == (
+        "local_trading_calendar",
+        "2026-07-10",
+        "candidate_codes",
+        '["600519"]',
+    )
+
+
+def test_successful_backfill_calendar_proof_satisfies_premarket_quality_gate_without_test_seeding(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "advisor.sqlite"
+    as_of = datetime(2026, 7, 12, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    update_market_database(
+        db_path,
+        HistoricalProvider(),
+        ["600519"],
+        date(2023, 7, 12),
+        date(2026, 7, 12),
+        as_of=as_of,
+        sleep=lambda _: None,
+    )
+
+    connection = connect(db_path)
+    try:
+        connection.execute(
+            "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+            "VALUES ('premarket-proof', 'premarket', ?, 'running', ?)",
+            (as_of.isoformat(), as_of.isoformat()),
+        )
+        connection.commit()
+        result = evaluate_run_quality(
+            connection,
+            QualityRequest(
+                "premarket-proof",
+                "premarket",
+                as_of,
+                ("600519",),
+                CollectorSnapshot(
+                    events=(),
+                    quality=QualityResult("collector_state", "blocking", True, "collector ready"),
+                    as_of=as_of,
+                    allowed_rids=(),
+                ),
+            ),
+        )
+    finally:
+        connection.close()
+
+    checks = {check.check_name: check for check in result.checks}
+    assert checks["trading_calendar"].passed is True
+    assert checks["future_data_leakage"].passed is True
+    blocking = {check.check_name for check in result.checks if check.blocking_failure}
+    assert blocking == {"analyst_contract_readiness"}
 
 
 def test_failed_second_code_preserves_committed_first_code(tmp_path: Path):
@@ -259,3 +332,88 @@ data_sources: {allow_tushare: false, free_sources: [sina]}
 
     assert exit_info.value.code == 2
     assert not (tmp_path / "data" / "advisor" / "operational.sqlite").exists()
+
+
+def test_scheduled_premarket_refreshes_market_data_before_advice(tmp_path: Path, monkeypatch):
+    from advisor.scheduler import premarket as scheduled_premarket
+    from advisor.db.migrate import migrate_database
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "advisor.yaml"
+    config_path.write_text(
+        """
+market: {primary: A股}
+schedule: {premarket_time: "08:30", review_time: "22:30"}
+storage: {database: data/advisor/advisor.sqlite}
+data_sources: {allow_tushare: false, free_sources: [sina]}
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "data-sources.yaml").write_text(
+        "sources:\n  sina:\n    enabled: true\n    rate_limit_per_second: 100\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "data" / "advisor" / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('a1', 'fixture', ?)",
+        ("2026-07-12T08:30:00+08:00",),
+    )
+    connection.execute(
+        "INSERT INTO positions (account_id, code, quantity, cost_basis, updated_at) "
+        "VALUES ('a1', '600519', 100, 1000, ?)",
+        ("2026-07-12T08:30:00+08:00",),
+    )
+    connection.commit()
+    connection.close()
+    calls: list[tuple] = []
+
+    class Registry:
+        historical_provider = HistoricalProvider()
+
+    monkeypatch.setattr(scheduled_premarket.ConfiguredProviderRegistry, "from_yaml", lambda _: Registry())
+    monkeypatch.setattr(
+        scheduled_premarket,
+        "read_collector_snapshot",
+        lambda _events_db, _allowed_rids, *, as_of: CollectorSnapshot(
+            events=(),
+            quality=QualityResult("collector_state", "blocking", True, "collector ready"),
+            as_of=as_of,
+            allowed_rids=(),
+        ),
+    )
+
+    def coordinator(**kwargs):
+        calls.append(kwargs["candidate_codes"])
+        proof_count = sqlite3.connect(db_path).execute(
+            "SELECT COUNT(*) FROM trading_calendar_proofs"
+        ).fetchone()[0]
+        assert proof_count == 1
+        return type(
+            "Result",
+            (),
+            {
+                "run_id": "scheduled",
+                "status": "passed",
+                "warnings": (),
+                "report_paths": type(
+                    "Paths",
+                    (),
+                    {"json_path": tmp_path / "report.json", "markdown_path": tmp_path / "report.md"},
+                )(),
+            },
+        )()
+
+    exit_code = scheduled_premarket.main(
+        [
+            "--config", str(config_path),
+            "--as-of", "2026-07-12T08:30:00+08:00",
+            "--output-dir", str(tmp_path / "reports"),
+        ],
+        coordinator=coordinator,
+    )
+
+    assert exit_code == 0
+    assert calls == [("600519",)]

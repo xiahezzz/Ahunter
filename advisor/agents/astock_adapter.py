@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from importlib import import_module
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -30,6 +31,7 @@ ANALYST_ROLES = UPSTREAM_ANALYST_ROLES + (
 )
 
 DEFAULT_TRADINGAGENTS_REPOSITORY = Path("/Users/mac/Documents/TradingAgents-astock")
+PORTFOLIO_DECISION_ACTIONS = frozenset({"buy", "watch", "hold", "reduce", "exit", "avoid"})
 _HARD_CHECKS_HEADER = "### 硬检查结果"
 _HARD_CHECK_GRADE = re.compile(r"\[([ABCDF])\]")
 _SAFE_EVIDENCE_FIELDS = (
@@ -335,6 +337,11 @@ def _validate_outputs(outputs: list[AnalystOutput]) -> None:
     missing = set(ANALYST_ROLES) - output_roles
     if missing:
         raise DataQualityBlockedError(f"missing analyst outputs: {sorted(missing)}")
+    for role in ANALYST_ROLES:
+        if sum(1 for output in outputs if output.role == role) != 1:
+            if role == "portfolio_manager":
+                raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+            raise DataQualityBlockedError(f"missing or ambiguous analyst output: {role}")
 
     quality_outputs = [output for output in outputs if output.role == "quality_gate"]
     if len(quality_outputs) != 1:
@@ -345,6 +352,50 @@ def _validate_outputs(outputs: list[AnalystOutput]) -> None:
         raise DataQualityBlockedError("missing or ambiguous quality outcome")
     if not outcome.passed:
         raise DataQualityBlockedError("quality gate blocked advisory output")
+    portfolio_outputs = [output for output in outputs if output.role == "portfolio_manager"]
+    if len(portfolio_outputs) != 1:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    extract_portfolio_decision(portfolio_outputs[0])
+
+
+def extract_portfolio_decision(output: AnalystOutput) -> tuple[str, float]:
+    if output.role != "portfolio_manager":
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    payload = output.payload
+    if not isinstance(payload, dict) or set(payload) != {"decision"}:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    decision = payload["decision"]
+    if not isinstance(decision, dict) or set(decision) != {"action", "confidence"}:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    action = decision.get("action")
+    if not isinstance(action, str):
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    normalized_action = action.strip().lower()
+    if normalized_action not in PORTFOLIO_DECISION_ACTIONS:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    confidence = decision.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    normalized_confidence = float(confidence)
+    if not math.isfinite(normalized_confidence) or not 0 <= normalized_confidence <= 1:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    return normalized_action, normalized_confidence
+
+
+def _portfolio_decision_payload(value: Any) -> dict[str, dict[str, float | str]]:
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise DataQualityBlockedError("missing or ambiguous portfolio decision") from error
+    if isinstance(parsed, dict) and "decision" not in parsed:
+        payload = {"decision": parsed}
+    else:
+        payload = parsed
+    probe = AnalystOutput("portfolio_manager", "", "", payload if isinstance(payload, dict) else {})
+    action, confidence = extract_portfolio_decision(probe)
+    return {"decision": {"action": action, "confidence": confidence}}
 
 
 def _outputs_from_state(
@@ -354,6 +405,13 @@ def _outputs_from_state(
 ) -> list[AnalystOutput]:
     investment_debate = state.get("investment_debate_state", {})
     risk_debate = state.get("risk_debate_state", {})
+    portfolio_payload = _portfolio_decision_payload(state.get("final_trade_decision"))
+    portfolio_summary = json.dumps(
+        portfolio_payload["decision"],
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     summaries = {
         "market": state.get("market_report", ""),
         "social": state.get("sentiment_report", ""),
@@ -370,14 +428,18 @@ def _outputs_from_state(
         "aggressive_risk": risk_debate.get("aggressive_history", ""),
         "neutral_risk": risk_debate.get("neutral_history", ""),
         "conservative_risk": risk_debate.get("conservative_history", ""),
-        "portfolio_manager": state.get("final_trade_decision", ""),
+        "portfolio_manager": portfolio_summary,
     }
     return [
         AnalystOutput(
             role=role,
             code=code,
             summary=summaries[role],
-            payload={"quality_outcome": quality_outcome} if role == "quality_gate" else {},
+            payload={"quality_outcome": quality_outcome}
+            if role == "quality_gate"
+            else portfolio_payload
+            if role == "portfolio_manager"
+            else {},
         )
         for role in ANALYST_ROLES
     ]

@@ -14,3 +14,5 @@ data_sources:
 quality:
   max_market_data_staleness_minutes: 1440
   require_trading_calendar: true
+trading_agents:
+  repository_path: /Users/mac/Documents/TradingAgents-astock

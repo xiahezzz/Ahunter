@@ -17,6 +17,8 @@ from advisor.agents.astock_adapter import (
     AnalystOutput,
     AnalystRunner,
     DataQualityBlockedError,
+    ExternalTradingAgentsRunner,
+    extract_portfolio_decision,
     run_analyst_flow,
 )
 from advisor.charts.kline import generate_kline_chart
@@ -92,6 +94,7 @@ def run_premarket(
     db_path, chart_dir, profile_dir = _storage_paths(
         db_path, chart_dir, profile_dir, config_path=config_path, root=root
     )
+    active_analyst_runner = analyst_runner if analyst_runner is not None else _configured_analyst_runner(config_path)
     active_run_id = run_id or _default_run_id("premarket", as_of)
     migrate_database(db_path)
     connection = connect(db_path)
@@ -118,7 +121,7 @@ def run_premarket(
             outputs.extend(
                 run_analyst_flow(
                     code, report_day, _evidence_for_code(evidence_payload, code),
-                    runner=analyst_runner,
+                    runner=active_analyst_runner,
                 )
             )
         if any(output.code not in codes for output in outputs):
@@ -294,6 +297,25 @@ def _storage_paths(
     )
 
 
+def _configured_analyst_runner(config_path: Path | None) -> AnalystRunner:
+    config = load_advisor_config(config_path)
+    upstream_config = _tradingagents_upstream_config(config.trading_agents)
+    return ExternalTradingAgentsRunner(
+        repository_path=config.trading_agents.repository_path,
+        upstream_config=upstream_config,
+    )
+
+
+def _tradingagents_upstream_config(trading_agents_config) -> dict[str, str] | None:
+    payload: dict[str, str] = {}
+    if trading_agents_config.upstream_provider is not None:
+        payload["llm_provider"] = trading_agents_config.upstream_provider
+    if trading_agents_config.upstream_model is not None:
+        payload["deep_think_llm"] = trading_agents_config.upstream_model
+        payload["quick_think_llm"] = trading_agents_config.upstream_model
+    return payload or None
+
+
 def _start_run(
     connection: sqlite3.Connection, run_id: str, run_type: str, as_of: datetime
 ) -> None:
@@ -397,48 +419,13 @@ def _advice_items(
 def _analyst_decision(
     code: str, outputs: Sequence[AnalystOutput], has_evidence: bool
 ) -> tuple[str, float]:
-    relevant = [
-        item for role in ("portfolio_manager", "trader", "research_manager")
-        for item in outputs if item.code == code and item.role == role
+    del has_evidence
+    portfolio_outputs = [
+        item for item in outputs if item.code == code and item.role == "portfolio_manager"
     ]
-    action: str | None = None
-    confidence: float | None = None
-    for output in relevant:
-        for value in _bounded_payload_dicts(output.payload):
-            candidate = value.get("action", value.get("decision"))
-            if action is None and isinstance(candidate, str):
-                normalized = candidate.strip().lower()
-                if normalized in _RESEARCH_ACTIONS:
-                    action = normalized
-            if confidence is None:
-                confidence = _valid_confidence(value.get("confidence"))
-            if action is not None and confidence is not None:
-                break
-        if action is not None and confidence is not None:
-            break
-    if action is None:
-        for output in relevant:
-            match = re.search(
-                r"\b(?:action|decision)\s*[:=]\s*(buy|watch|hold|reduce|exit|avoid)\b",
-                output.summary[:2000], re.IGNORECASE,
-            )
-            if match:
-                action = match.group(1).lower()
-                break
-    if confidence is None:
-        for output in relevant:
-            match = re.search(
-                r"\bconfidence\s*[:=]\s*(0(?:\.\d+)?|1(?:\.0+)?)\b",
-                output.summary[:2000], re.IGNORECASE,
-            )
-            if match:
-                confidence = _valid_confidence(match.group(1))
-                if confidence is not None:
-                    break
-    resolved_action = action or "watch"
-    if confidence is None:
-        confidence = 0.6 if action is not None and has_evidence else 0.5
-    return resolved_action, confidence
+    if len(portfolio_outputs) != 1:
+        raise DataQualityBlockedError("missing or ambiguous portfolio decision")
+    return extract_portfolio_decision(portfolio_outputs[0])
 
 
 def _bounded_payload_dicts(payload: object) -> list[dict[str, object]]:

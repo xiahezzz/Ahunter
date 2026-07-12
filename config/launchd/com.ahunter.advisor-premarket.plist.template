@@ -10,7 +10,7 @@
   <array>
     <string>{{PYTHON}}</string>
     <string>-m</string>
-    <string>advisor.reporting.premarket</string>
+    <string>advisor.scheduler.premarket</string>
     <string>--output-dir</string>
     <string>reports</string>
   </array>

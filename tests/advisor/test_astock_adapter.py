@@ -27,7 +27,8 @@ def passing_outputs(code: str) -> list[AnalystOutput]:
             role=role,
             code=code,
             summary=f"{role} summary",
-            payload={},
+            payload={"decision": {"action": "watch", "confidence": 0.7}}
+            if role == "portfolio_manager" else {},
         )
         for role in ANALYST_ROLES
     ]
@@ -138,7 +139,7 @@ def passing_state(code: str) -> dict:
             "neutral_history": "neutral",
             "conservative_history": "conservative",
         },
-        "final_trade_decision": "advice only",
+        "final_trade_decision": {"action": "watch", "confidence": 0.7},
     }
 
 
@@ -165,7 +166,8 @@ def test_external_runner_uses_full_analyst_set_and_maps_passing_staged_state():
     assert graph.finalized is True
     assert graph.closed is True
     assert [output.role for output in outputs] == list(ANALYST_ROLES)
-    assert outputs[-1].summary == "advice only"
+    assert outputs[-1].summary == '{"action":"watch","confidence":0.7}'
+    assert outputs[-1].payload == {"decision": {"action": "watch", "confidence": 0.7}}
 
 
 def test_external_runner_stops_at_failing_quality_gate_before_downstream_state():
@@ -212,6 +214,44 @@ def test_missing_roles_or_quality_outcome_fail_closed(outputs):
             return outputs()
 
     with pytest.raises(DataQualityBlockedError):
+        run_analyst_flow("600519", "2026-07-11", [], runner=Runner())
+
+
+@pytest.mark.parametrize(
+    "portfolio_output",
+    [
+        AnalystOutput("portfolio_manager", "600519", "missing decision", {}),
+        AnalystOutput("portfolio_manager", "600519", "bad action", {"decision": {"action": "buy/watch", "confidence": 0.7}}),
+        AnalystOutput("portfolio_manager", "600519", "bad confidence", {"decision": {"action": "watch", "confidence": "high"}}),
+        AnalystOutput("portfolio_manager", "600519", "extra rating", {"decision": {"action": "watch", "rating": "buy", "confidence": 0.7}}),
+    ],
+)
+def test_portfolio_manager_decision_contract_failures_block_outputs(portfolio_output):
+    class Runner:
+        def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
+            outputs = passing_outputs(code)
+            outputs[ANALYST_ROLES.index("portfolio_manager")] = portfolio_output
+            return outputs
+
+    with pytest.raises(DataQualityBlockedError, match="portfolio decision"):
+        run_analyst_flow("600519", "2026-07-11", [], runner=Runner())
+
+
+def test_duplicate_portfolio_manager_decision_is_ambiguous_and_blocks_outputs():
+    class Runner:
+        def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
+            outputs = passing_outputs(code)
+            outputs.append(
+                AnalystOutput(
+                    "portfolio_manager",
+                    code,
+                    "second decision",
+                    {"decision": {"action": "buy", "confidence": 0.8}},
+                )
+            )
+            return outputs
+
+    with pytest.raises(DataQualityBlockedError, match="portfolio decision"):
         run_analyst_flow("600519", "2026-07-11", [], runner=Runner())
 
 
