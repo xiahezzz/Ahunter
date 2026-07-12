@@ -209,6 +209,46 @@ def test_small_report_page_verifies_only_bounded_archive_candidates(tmp_path, mo
     assert verification_calls <= 20
 
 
+def test_report_page_with_only_invalid_candidates_returns_empty_truncated_page(
+    tmp_path, monkeypatch
+):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_MAX_REPORT_ARCHIVE_ROWS", 3)
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    for index in range(3):
+        run_id = f"invalid-{index}"
+        connection.execute(
+            "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+            "VALUES (?, 'premarket', '2026-07-12', 'passed', '2026-07-12T08:30:00+08:00')",
+            (run_id,),
+        )
+        connection.execute(
+            "INSERT INTO report_archive "
+            "(report_id, run_id, report_type, report_date, markdown_path, json_path, created_at) "
+            "VALUES (?, ?, 'premarket', '2026-07-12', ?, ?, '2026-07-12T08:31:00+08:00')",
+            (
+                f"report-{index}",
+                run_id,
+                str(reports_root / "outside" / f"premarket.{run_id}.md"),
+                str(reports_root / "outside" / f"premarket.{run_id}.json"),
+            ),
+        )
+    connection.commit()
+    connection.close()
+
+    response = TestClient(create_app(tmp_path, db_path=db_path)).get(
+        "/api/reports?start_date=2026-07-12&end_date=2026-07-12&limit=1"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+    assert response.json()["next_cursor"] is None
+    assert response.json()["truncated"] is True
+
+
 def test_report_routes_hide_verified_archive_without_committed_archive_row(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)

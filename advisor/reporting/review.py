@@ -200,7 +200,14 @@ def main(argv: Sequence[str] | None = None, *, coordinator=None, snapshot_reader
         print(json.dumps(payload, sort_keys=True))
         return 0 if result.status == "passed" else 2
     except Exception as error:
-        run_id = args.run_id or f"review-cli-{report_day:%Y%m%d}"
+        run_id = f"review-cli-failed-{report_day:%Y%m%d}"
+        if args.run_id is not None:
+            try:
+                validate_run_id(args.run_id)
+            except ValueError:
+                pass
+            else:
+                run_id = args.run_id
         payload = {"error": type(error).__name__, "run_id": run_id, "status": "failed"}
         try:
             paths = write_failure_report(

@@ -107,6 +107,14 @@ class DecisionRunner(PassingRunner):
         ]
 
 
+class EmptyPortfolioRunner(PassingRunner):
+    def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
+        return [
+            AnalystOutput(item.role, item.code, "" if item.role == "portfolio_manager" else item.summary, item.payload)
+            for item in super().run(code, trade_date, evidence)
+        ]
+
+
 class CandidateRunner:
     def run(self, code: str, trade_date: str, evidence: list[dict]) -> list[AnalystOutput]:
         return [
@@ -324,7 +332,9 @@ def test_premarket_projection_preserves_non_empty_profile_history(tmp_path: Path
     connection.execute(
         "INSERT INTO stock_profiles (code, thesis_json, information_flow_json, capital_flow_json, "
         "fundamentals_json, analyst_flow_json, ledger_exposure_json, assets_json, updated_at) "
-        "VALUES (?, '{}', '[\"prior information\"]', '[]', '{}', '[\"prior analyst\"]', '{}', "
+        "VALUES (?, '{\"name\":\"Prior Name\",\"industry\":\"Prior Industry\","
+        "\"thesis\":\"Prior thesis\"}', '[\"prior information\"]', "
+        "'[\"prior capital\"]', '{}', '[\"prior analyst\"]', '{}', "
         "'[\"prior-chart.png\"]', ?)",
         (CODE, AS_OF.isoformat()),
     )
@@ -332,7 +342,7 @@ def test_premarket_projection_preserves_non_empty_profile_history(tmp_path: Path
     connection.close()
 
     run_premarket(
-        collector_snapshot=collector(), analyst_runner=PassingRunner(), as_of=AS_OF,
+        collector_snapshot=collector(), analyst_runner=EmptyPortfolioRunner(), as_of=AS_OF,
         report_date="2026-07-12", candidate_codes=(CODE,),
         quality_evaluator=passed_quality, evidence_persister=persist_fixture_evidence,
         **paths,
@@ -340,11 +350,48 @@ def test_premarket_projection_preserves_non_empty_profile_history(tmp_path: Path
 
     row = query_all(
         paths["db_path"],
-        f"SELECT information_flow_json, analyst_flow_json, assets_json FROM stock_profiles WHERE code = '{CODE}'",
+        f"SELECT thesis_json, information_flow_json, capital_flow_json, analyst_flow_json, "
+        f"assets_json FROM stock_profiles WHERE code = '{CODE}'",
     )[0]
-    assert "prior information" in json.loads(row[0])
-    assert "prior analyst" in json.loads(row[1])
-    assert "prior-chart.png" in json.loads(row[2])
+    assert json.loads(row[0]) == {
+        "name": "Prior Name",
+        "industry": "Prior Industry",
+        "thesis": "Prior thesis",
+    }
+    assert "prior information" in json.loads(row[1])
+    assert "prior capital" in json.loads(row[2])
+    assert "prior analyst" in json.loads(row[3])
+    assert "prior-chart.png" in json.loads(row[4])
+
+
+def test_final_premarket_quality_failure_survives_projection_rollback(tmp_path: Path):
+    paths = coordinator_paths(tmp_path)
+    evaluations = iter(
+        (
+            QualityGateResult(
+                "passed",
+                (QualityResult("preflight_fixture", "blocking", True, "ready"),),
+            ),
+            QualityGateResult(
+                "blocked",
+                (QualityResult("final_fixture", "blocking", False, "stale"),),
+            ),
+        )
+    )
+
+    result = run_premarket(
+        collector_snapshot=collector(), analyst_runner=PassingRunner(), as_of=AS_OF,
+        report_date="2026-07-12", candidate_codes=(CODE,),
+        quality_evaluator=lambda *_args: next(evaluations),
+        evidence_persister=persist_fixture_evidence,
+        **paths,
+    )
+
+    assert result.status == "blocked"
+    assert query_all(
+        paths["db_path"],
+        "SELECT check_name, status FROM data_quality_checks ORDER BY check_name",
+    ) == [("final_fixture", "failed")]
 
 
 def test_quality_blocked_premarket_publishes_only_sanitized_failure(tmp_path: Path):
@@ -486,6 +533,38 @@ def test_report_cli_date_defaults_as_of_and_allows_candidate_expansion(
     assert calls["coordinator"]["candidate_codes"] == ()
     assert exit_code == 2
     assert json.loads(capsys.readouterr().out)["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("module", "fallback"),
+    [
+        (premarket_reporting, "premarket-cli-failed-20260712"),
+        (review_reporting, "review-cli-failed-20260712"),
+    ],
+)
+def test_report_cli_failure_never_echoes_invalid_run_id(
+    module, fallback, tmp_path: Path, capsys
+):
+    invalid_run_id = "token=secret"
+
+    def failed_snapshot(*_args, **_kwargs):
+        raise RuntimeError("fixture failure")
+
+    exit_code = module.main(
+        [
+            "--date", "2026-07-12",
+            "--run-id", invalid_run_id,
+            "--output-dir", str(tmp_path / "reports"),
+        ],
+        snapshot_reader=failed_snapshot,
+    )
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert exit_code == 1
+    assert payload["run_id"] == fallback
+    assert invalid_run_id not in output
+    assert payload["json_path"].endswith(f"failure.{fallback}.json")
 
 
 def test_review_uses_exact_selected_premarket_archive(tmp_path: Path):

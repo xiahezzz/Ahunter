@@ -45,9 +45,10 @@ def test_generate_kline_chart_excludes_future_and_failed_rows(tmp_path: Path, mo
           quality_status TEXT
         );
         INSERT INTO market_daily VALUES
-          ('600519','2026-07-10',10,11,9,10.5,1000,10000,'fixture','now','2026-07-10',1,'h1','passed'),
-          ('600519','2026-07-11',20,21,19,20.5,1000,10000,'fixture','now','2026-07-11',1,'h2','failed'),
-          ('600519','2026-07-13',30,31,29,30.5,1000,10000,'fixture','now','2026-07-13',1,'h3','passed');
+          ('600519','2026-07-10',10,11,9,10.5,1000,10000,'fixture','2026-07-12T08:00:00+08:00','2026-07-10',1,'h1','passed'),
+          ('600519','2026-07-10',40,41,39,40.5,1000,10000,'fixture','2026-07-12T09:00:00+08:00','2026-07-10',1,'h4','passed'),
+          ('600519','2026-07-11',20,21,19,20.5,1000,10000,'fixture','2026-07-12T08:00:00+08:00','2026-07-11',1,'h2','failed'),
+          ('600519','2026-07-13',30,31,29,30.5,1000,10000,'fixture','2026-07-12T08:00:00+08:00','2026-07-13',1,'h3','passed');
         """
     )
     connection.close()
@@ -55,6 +56,7 @@ def test_generate_kline_chart_excludes_future_and_failed_rows(tmp_path: Path, mo
 
     def capture_plot(frame, **_kwargs):
         captured["dates"] = [value.date().isoformat() for value in frame.index]
+        captured["closes"] = frame["Close"].tolist()
         output.write_bytes(b"png")
 
     monkeypatch.setattr(kline.mpf, "plot", capture_plot)
@@ -68,3 +70,4 @@ def test_generate_kline_chart_excludes_future_and_failed_rows(tmp_path: Path, mo
     )
 
     assert captured["dates"] == ["2026-07-10"]
+    assert captured.get("closes") == [10.5]

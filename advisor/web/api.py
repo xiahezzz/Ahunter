@@ -1299,7 +1299,7 @@ def _page_db_backed_archives(
         _encode_report_cursor(
             page_items[-1], cursor_secret, requested_start, requested_end, snapshot_digest
         )
-        if truncated
+        if truncated and page_items
         else None
     )
     return {

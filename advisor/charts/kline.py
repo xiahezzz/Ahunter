@@ -26,14 +26,21 @@ def generate_kline_chart(
         )
     cutoff = min(cutoffs).isoformat() if cutoffs else date.max.isoformat()
     connection = sqlite3.connect(db_path)
+    fetched_predicate = " AND julianday(fetched_at) <= julianday(?)" if as_of else ""
+    parameters = [code, cutoff, cutoff]
+    if as_of is not None:
+        parameters.append(as_of.isoformat())
     rows = connection.execute(
-        """
+        f"""
         SELECT trade_date, open, high, low, close, volume
         FROM market_daily
-        WHERE code = ? AND quality_status = 'passed' AND date(trade_date) <= date(?)
+        WHERE code = ? AND quality_status = 'passed'
+          AND date(trade_date) <= date(?)
+          AND date(as_of_date) <= date(?)
+          {fetched_predicate}
         ORDER BY trade_date
         """,
-        (code, cutoff),
+        parameters,
     ).fetchall()
     connection.close()
     if not rows:

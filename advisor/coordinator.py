@@ -126,6 +126,7 @@ def run_premarket(
         final_blocking = _blocking_failures(final_gate)
         if final_blocking:
             connection.rollback()
+            persist_quality_results(connection, request, final_gate.checks)
             return _blocked_result(
                 connection, active_run_id, "premarket", report_day, output_dir,
                 final_blocking, as_of,
@@ -527,13 +528,19 @@ def _project_premarket_profiles(
         code_outputs = [item for item in outputs if item.code == code]
         portfolio = next((item.summary for item in code_outputs if item.role == "portfolio_manager"), "")
         existing = connection.execute(
-            "SELECT information_flow_json, analyst_flow_json, assets_json "
+            "SELECT thesis_json, information_flow_json, capital_flow_json, "
+            "analyst_flow_json, assets_json "
             "FROM stock_profiles WHERE code = ?", (code,),
         ).fetchone()
-        prior_information, prior_analyst, prior_assets = (
-            (json.loads(existing[0]), json.loads(existing[1]), json.loads(existing[2]))
-            if existing else ([], [], [])
-        )
+        if existing:
+            prior_thesis = json.loads(existing[0])
+            prior_information = json.loads(existing[1])
+            prior_capital = json.loads(existing[2])
+            prior_analyst = json.loads(existing[3])
+            prior_assets = json.loads(existing[4])
+        else:
+            prior_thesis = {}
+            prior_information, prior_capital, prior_analyst, prior_assets = [], [], [], []
         information = list(dict.fromkeys(
             prior_information + [item.summary for item in evidence if item.code in {None, code}]
         ))
@@ -541,11 +548,19 @@ def _project_premarket_profiles(
             prior_analyst + [f"{item.role}: {item.summary}" for item in code_outputs]
         ))
         assets = list(dict.fromkeys(prior_assets + assets))
+        name = _security_name(connection, code)
+        industry = _security_industry(connection, code)
+        if prior_thesis:
+            if not name or name == code:
+                name = str(prior_thesis.get("name") or name)
+            industry = industry or str(prior_thesis.get("industry") or "")
+        thesis = portfolio.strip()
+        if thesis in {"", "Research watch candidate."}:
+            thesis = str(prior_thesis.get("thesis") or "Research watch candidate.")
         profile = StockProfile(
-            code, _security_name(connection, code), _security_industry(connection, code),
-            portfolio or "Research watch candidate.",
+            code, name, industry, thesis,
             information,
-            [],
+            list(dict.fromkeys(prior_capital)),
             analyst,
             [item.summary for item in code_outputs if item.role.endswith("_risk")],
             assets,
