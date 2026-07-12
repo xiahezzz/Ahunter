@@ -296,6 +296,89 @@ git diff --check
 
 None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
 
+## Sixth Reviewer Fix: MX Proof Provenance Hardening
+
+### Status
+
+DONE
+
+Implementation commit: `e2f7fadc7d3dc6a7dedb23a2954d16ff44eca1ae`
+
+Required commit subject: `fix: harden mx proof provenance`
+
+### Fix Summary
+
+- Added an immutable, adapter-issued RID authorization proof bound to the user-provided allowlist path and original authorized RID tuple. Evidence persistence reopens and revalidates that configuration before starting any transaction; forged snapshot allowlists, changed configurations, invalid configurations, and empty allowlists fail closed.
+- Rejected sensitive opaque identifier components at dot, colon, underscore, and hyphen boundaries anywhere in a value. The reserved set covers authorization, cookies, credentials, passwords, secrets, sessions, sockets, debug/CDP identifiers, API keys, and access, refresh, ID, or generic tokens.
+- Bound trading-calendar authority to a dedicated v1 storage contract outside `details_json`: an internal source-key namespace, endpoint, and producer marker are all required before semantic proof labels are considered. A market-provider row using trusted-looking source and JSON labels but an arbitrary endpoint is ignored and the quality gate blocks.
+
+### RED Evidence
+
+Command:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py -q
+```
+
+Output:
+
+```text
+22 failed, 104 passed in 1.06s
+```
+
+The failures covered boundary-sensitive compound identifiers in adapter and persistence paths, a snapshot forged with RID 456 and `allowed_rids=(456,)`, and a calendar row impersonating `exchange_calendar` through mutable labels.
+
+### GREEN Evidence
+
+The focused adapter and quality suites after implementation:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py -q
+126 passed in 0.74s
+```
+
+A follow-up regression also verified that replacing the configured allowlist with either an empty list or RID 456 after snapshot creation blocks persistence before a transaction.
+
+### Verification
+
+Required focused and integration suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+222 passed in 2.48s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+342 passed in 4.45s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 513.210125
+```
+
+Static verification:
+
+```text
+git diff --check
+<no output; exit 0>
+
+.venv311/bin/python -m compileall -q advisor/evidence advisor/quality.py
+<no output; exit 0>
+```
+
+### Concerns
+
+None. No collector behavior, RID configuration value, live smoke test, Chrome or MX page operation, frontend, market backfill, broker, or order behavior was changed or invoked. Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched.
+
 ## Fifth Reviewer Fix: Bound MX Authorization Proofs
 
 ### Status
