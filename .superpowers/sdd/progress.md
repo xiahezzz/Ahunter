@@ -20,3 +20,5 @@ Task 15: complete (commits 7f04281..10bd8f0, review clean after MX authorization
 Task 16: complete (commits c0d6317..665d036, review clean after coordinator operating contract, review linkage, report visibility, consistency, CLI, profile, chart, and bounded API fixes; live browser screenshot QA skipped per user instruction)
 
 Task 17: complete (commits 35886e1..5be058d, review clean after durable ledger store, bounded imports/API bodies, canonical replay, portfolio snapshots, durable advice-trade projection, CSV decoder/header/capacity fixes, and bounded review context; browser screenshot QA skipped per user instruction)
+
+Task 13: complete (commits b7e6a01..e5afd8b, review clean; browser screenshot QA skipped per user instruction)
