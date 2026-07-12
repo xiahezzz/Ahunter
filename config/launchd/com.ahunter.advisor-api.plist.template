@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ahunter.advisor-api</string>
+  <key>WorkingDirectory</key>
+  <string>{{REPO_ROOT}}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON}}</string>
+    <string>-m</string>
+    <string>uvicorn</string>
+    <string>advisor.web.api:app</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8000</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{REPO_ROOT}}/logs/advisor-api.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{REPO_ROOT}}/logs/advisor-api.err.log</string>
+</dict>
+</plist>

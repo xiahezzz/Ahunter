@@ -65,3 +65,13 @@ Stop with `Ctrl-C` in the collector terminal. On login expiry, connection failur
 ## Data handling
 
 Store no credentials or debugging identifiers. Rejected, undecodable, and non-allowlisted content must not enter SQLite, JSON output, logs, or media paths. Raw accepted payloads expire after 30 days; hashes remain for deduplication and audit. Do not use event data for downstream analytical conclusions or stock recommendations after a quality check fails until the failure is resolved.
+
+## Advisor operations
+
+The advisor is separate from the passive MX collector. It may read accepted MX events, free A-share market data, stock profiles, ledger state, and analyst outputs to create research reports. It must not connect to a broker, submit orders, or create order-like objects or instructions.
+
+Use free A-share data sources only. Tushare, paid feeds, and API-key-only market-data paths are not part of required advisor operation.
+
+The 08:30 premarket run writes `reports/YYYY-MM-DD/premarket.md` and `reports/YYYY-MM-DD/premarket.json`. The 22:30 review writes `reports/YYYY-MM-DD/review.md` and `reports/YYYY-MM-DD/review.json`, and it must link back to the same day's premarket advice IDs.
+
+If advisor data-quality checks fail, archive a failure report and do not generate stock recommendations until the failure is resolved.
