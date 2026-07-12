@@ -18,6 +18,8 @@ Final race/capacity implementation commit: `683c086`
 
 Operating contract implementation commit: `bd31d8b`
 
+Final polish implementation commit: `15d6885`
+
 Required commit subject: `fix: complete coordinator review paths`
 
 Archive consistency commit subject: `fix: hide orphan report archives`
@@ -31,6 +33,8 @@ Final consistency commit subject: `fix: close coordinator consistency gaps`
 Final race/capacity commit subject: `fix: stabilize report visibility and review linkage`
 
 Operating contract commit subject: `fix: complete coordinator operating contract`
+
+Final polish commit subject: `fix: close task 16 polish gaps`
 
 ## Operating Contract Fix Summary
 
@@ -625,3 +629,90 @@ Premarket linkage follow-up:
 - Profile Markdown and chart image generation are filesystem projections. Their database metadata is rolled back on report failure, while already-written projection files may remain for a later successful run to replace.
 - API report listing now pages database-backed candidates before bounded filesystem verification. The 500-row verification ceiling is intentionally fail-closed when a window contains an extreme number of invalid candidates.
 - Pre-existing untracked `.venv311` and `__pycache__` paths were left untouched and excluded from both commits.
+
+## Final Polish Summary
+
+- Final premarket quality failures are re-persisted after projection rollback, so the blocking final gate replaces the earlier preflight audit rows before the blocked run and failure archive are committed.
+- Premarket profile projection retains non-empty prior name, industry, and thesis fields when current values are empty/default, and retains prior capital-flow history while continuing to append the existing information, analyst, and asset histories.
+- Premarket and review CLI exception paths validate caller-supplied run IDs before using them. Invalid values such as `token=secret` are neither printed nor used in failure archive names; deterministic date-based fallback IDs are used instead.
+- K-line selection now requires passed rows whose `trade_date` and `as_of_date` are within the report boundary and, when supplied, whose `fetched_at` is no later than the full `as_of` timestamp.
+- A bounded report page containing only invalid candidates returns an empty truncated page with no cursor instead of indexing an empty list.
+- No collector behavior, RID configuration, broker/order code, live Chrome state, or MX page was touched.
+
+## Final Polish TDD Evidence
+
+The new regressions failed before implementation for all five reported gaps:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_final_premarket_quality_failure_survives_projection_rollback tests/advisor/test_coordinator.py::test_premarket_projection_preserves_non_empty_profile_history tests/advisor/test_coordinator.py::test_report_cli_failure_never_echoes_invalid_run_id tests/advisor/test_kline_chart.py::test_generate_kline_chart_excludes_future_and_failed_rows tests/advisor/test_web_api.py::test_report_page_with_only_invalid_candidates_returns_empty_truncated_page -q
+FFFFFF                                                                   [100%]
+6 failed in 2.12s
+```
+
+After the scoped fixes, the same regressions passed:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py::test_final_premarket_quality_failure_survives_projection_rollback tests/advisor/test_coordinator.py::test_premarket_projection_preserves_non_empty_profile_history tests/advisor/test_coordinator.py::test_report_cli_failure_never_echoes_invalid_run_id tests/advisor/test_kline_chart.py::test_generate_kline_chart_excludes_future_and_failed_rows tests/advisor/test_web_api.py::test_report_page_with_only_invalid_candidates_returns_empty_truncated_page -q
+......                                                                   [100%]
+6 passed in 1.36s
+```
+
+## Final Polish Verification
+
+Required focused suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_coordinator.py tests/advisor/test_web_api.py tests/advisor/test_kline_chart.py tests/advisor/test_reporting.py tests/advisor/test_quality_gate.py tests/advisor/test_astock_adapter.py tests/advisor/test_profiles.py -q
+........................................................................ [ 30%]
+........................................................................ [ 60%]
+........................................................................ [ 90%]
+........................                                                 [100%]
+240 passed in 5.37s
+```
+
+Required complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 17%]
+........................................................................ [ 35%]
+........................................................................ [ 52%]
+........................................................................ [ 70%]
+........................................................................ [ 88%]
+................................................                         [100%]
+408 passed in 7.05s
+```
+
+Required offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+suites 0
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 527.603083
+```
+
+Required static check:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+Files changed by final polish implementation commit `15d6885`:
+
+- `advisor/charts/kline.py`
+- `advisor/coordinator.py`
+- `advisor/reporting/premarket.py`
+- `advisor/reporting/review.py`
+- `advisor/web/api.py`
+- `tests/advisor/test_coordinator.py`
+- `tests/advisor/test_kline_chart.py`
+- `tests/advisor/test_web_api.py`
+
+Final polish concern: the bounded report listing intentionally returns `truncated: true` with `next_cursor: null` when all 500 scanned candidates are invalid. This is fail-closed and avoids constructing a cursor from an unverified archive.
