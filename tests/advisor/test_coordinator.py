@@ -572,6 +572,113 @@ def test_review_versions_snapshots_for_every_active_ledger_account(tmp_path: Pat
     assert versioned == [("cash-only", 2), ("review-account", 2), ("unrelated", 2)]
 
 
+def test_review_rejects_excessive_ledger_accounts_before_rendering_context(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from advisor.db.migrate import migrate_database
+    from advisor.ledger import importer as ledger_importer
+
+    monkeypatch.setattr(ledger_importer, "MAX_LEDGER_SNAPSHOT_ACCOUNTS", 2, raising=False)
+    paths = coordinator_paths(tmp_path)
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    seed_premarket_report(
+        paths,
+        database_run_id="initial",
+        report_run_id="initial",
+        advice=[
+            AdviceItem(
+                "advice-1",
+                CODE,
+                "watch",
+                0.7,
+                "fixture rationale",
+                (),
+            )
+        ],
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.executemany(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES (?, ?, ?)",
+        [
+            ("account-1", "Account 1", AS_OF.isoformat()),
+            ("account-2", "Account 2", AS_OF.isoformat()),
+            ("account-3", "Account 3", AS_OF.isoformat()),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, "
+        "transaction_type, code, quantity, price, amount, fees, source, created_at) "
+        "VALUES (?, ?, '2026-07-11', 'cash_deposit', NULL, 0, 0, 1000, 0, 'fixture', ?)",
+        [
+            ("deposit-1", "account-1", AS_OF.isoformat()),
+            ("deposit-2", "account-2", AS_OF.isoformat()),
+            ("deposit-3", "account-3", AS_OF.isoformat()),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ValueError, match="ledger snapshot account limit"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE,),
+            run_id="review-too-many-accounts", quality_evaluator=passed_quality, **paths,
+        )
+
+    assert not (paths["output_dir"] / "2026-07-12" / "review.json").exists()
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM portfolio_snapshots") == [(0,)]
+
+
+def test_review_rejects_excessive_ledger_context_items_before_rendering(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from advisor.db.migrate import migrate_database
+
+    monkeypatch.setattr(coordinator_module, "MAX_REVIEW_LEDGER_CONTEXT_ITEMS", 3, raising=False)
+    paths = coordinator_paths(tmp_path)
+    migrate_database(paths["db_path"])
+    seed_premarket_report(
+        paths,
+        database_run_id="initial",
+        report_run_id="initial",
+        advice=[
+            AdviceItem("advice-1", CODE, "watch", 0.7, "fixture rationale", ()),
+            AdviceItem("advice-2", "000001", "watch", 0.7, "fixture rationale", ()),
+        ],
+    )
+    connection = sqlite3.connect(paths["db_path"])
+    connection.executemany(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES (?, ?, ?)",
+        [
+            ("account-1", "Account 1", AS_OF.isoformat()),
+            ("account-2", "Account 2", AS_OF.isoformat()),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, "
+        "transaction_type, code, quantity, price, amount, fees, source, created_at) "
+        "VALUES (?, ?, '2026-07-11', 'cash_deposit', NULL, 0, 0, 1000, 0, 'fixture', ?)",
+        [
+            ("deposit-1", "account-1", AS_OF.isoformat()),
+            ("deposit-2", "account-2", AS_OF.isoformat()),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ValueError, match="review ledger context limit"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE, "000001"),
+            run_id="review-too-many-context-items", quality_evaluator=passed_quality, **paths,
+        )
+
+    assert not (paths["output_dir"] / "2026-07-12" / "review.json").exists()
+
+
 @pytest.mark.parametrize("module", [premarket_reporting, review_reporting])
 def test_declared_report_cli_entrypoint_has_minimal_argparse_path(module):
     assert hasattr(module, "main")

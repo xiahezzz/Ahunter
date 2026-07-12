@@ -57,10 +57,9 @@ class LedgerStore:
 
     def replay(self, *, max_rows: int | None = None) -> dict[str, LedgerState]:
         if not self.db_path.exists():
+            ledger_importer.validate_ledger_replay_limit(max_rows)
             return {}
-        limit = ledger_importer.MAX_LEDGER_ROWS if max_rows is None else max_rows
-        if not isinstance(limit, int) or limit <= 0:
-            raise ValueError("invalid ledger replay limit")
+        limit = ledger_importer.validate_ledger_replay_limit(max_rows)
         connection = connect(self.db_path)
         try:
             rows = connection.execute(
@@ -112,7 +111,7 @@ class LedgerStore:
                 connection,
                 account_ids,
                 as_of=as_of,
-                max_rows=ledger_importer.MAX_LEDGER_ROWS if max_rows is None else max_rows,
+                max_rows=max_rows,
                 snapshot_source=snapshot_source,
             )
             connection.commit()

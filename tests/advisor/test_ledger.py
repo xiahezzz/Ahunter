@@ -325,6 +325,31 @@ def test_duplicate_transaction_ids_within_csv_fail_before_database_write(tmp_pat
     assert not db_path.exists()
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        "transaction_id,trade_date,transaction_type,code,quantity,price,amount,fees,fees",
+        "trade_date,transaction_id,transaction_type,code,quantity,price,amount,fees",
+    ],
+)
+def test_csv_header_must_match_expected_unique_order_before_database_write(
+    tmp_path: Path,
+    header: str,
+):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = tmp_path / "bad-header.csv"
+    csv_path.write_text(
+        f"{header}\n"
+        "deposit,2026-07-09,cash_deposit,,0,0,20000,0,0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="ledger CSV has invalid columns"):
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
+
+    assert not db_path.exists()
+
+
 def test_cli_resolves_config_database_and_prints_json_status(tmp_path: Path, capsys):
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -800,6 +825,27 @@ def test_historical_review_snapshot_does_not_regress_current_positions(tmp_path:
     assert snapshot_payload["positions"]["600519"]["quantity"] == 100
 
 
+def test_materialize_ledger_snapshots_rejects_excessive_account_lists(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(ledger_importer, "MAX_LEDGER_SNAPSHOT_ACCOUNTS", 2, raising=False)
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        with pytest.raises(ValueError, match="ledger snapshot account limit"):
+            ledger_importer.materialize_ledger_snapshots(
+                connection,
+                ("account-1", "account-2", "account-3"),
+                as_of=AS_OF,
+                snapshot_source="bounded-review",
+            )
+    finally:
+        connection.close()
+
+
 def test_create_portfolio_snapshot_public_interface_persists_typed_snapshot(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
     seed_market_prices(db_path)
@@ -914,6 +960,52 @@ def test_ledger_store_append_import_many_replay_and_snapshot_use_canonical_paths
         ("buy", "facade", "import"),
         ("deposit", "facade", "manual"),
     ]
+
+
+@pytest.mark.parametrize("max_rows", [0, -1, ledger_importer.MAX_LEDGER_ROWS + 1])
+def test_import_ledger_entries_rejects_invalid_public_replay_limits(
+    tmp_path: Path,
+    max_rows: int,
+):
+    db_path = tmp_path / "advisor.sqlite"
+    entry = (
+        "bounded",
+        LedgerTransaction("deposit", "2026-07-10", "cash_deposit", None, 0, 0, 20000, 0),
+    )
+
+    with pytest.raises(ValueError, match="invalid ledger replay limit"):
+        ledger_importer.import_ledger_entries([entry], db_path, as_of=AS_OF, max_rows=max_rows)
+
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("method", ["import_many", "replay", "snapshot"])
+def test_ledger_store_rejects_invalid_public_replay_limits(tmp_path: Path, method: str):
+    db_path = tmp_path / "advisor.sqlite"
+    store = LedgerStore(db_path)
+    invalid_limit = ledger_importer.MAX_LEDGER_ROWS + 1
+
+    with pytest.raises(ValueError, match="invalid ledger replay limit"):
+        if method == "import_many":
+            store.import_many(
+                [
+                    (
+                        "bounded",
+                        LedgerTransaction(
+                            "deposit", "2026-07-10", "cash_deposit", None, 0, 0, 20000, 0
+                        ),
+                    )
+                ],
+                as_of=AS_OF,
+                max_rows=invalid_limit,
+            )
+        elif method == "replay":
+            store.replay(max_rows=invalid_limit)
+        else:
+            store.snapshot(("bounded",), as_of=AS_OF, max_rows=invalid_limit)
+
+    if method == "import_many":
+        assert not db_path.exists()
 
 
 def test_ledger_store_rejects_duplicate_import_atomically(tmp_path: Path):

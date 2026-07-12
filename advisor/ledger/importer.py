@@ -33,8 +33,19 @@ _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _SOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 MAX_LEDGER_ROWS = 10_000
+MAX_LEDGER_SNAPSHOT_ACCOUNTS = 200
 MAX_LEDGER_CSV_BYTES = 5 * 1024 * 1024
 MAX_LEDGER_FIELD_LENGTH = 4096
+LEDGER_CSV_HEADERS = (
+    "transaction_id",
+    "trade_date",
+    "transaction_type",
+    "code",
+    "quantity",
+    "price",
+    "amount",
+    "fees",
+)
 
 
 class LedgerCapacityError(ValueError):
@@ -79,12 +90,7 @@ def load_ledger_csv(path: Path) -> list[LedgerTransaction]:
         content = _read_bounded_csv_bytes(path)
         handle = io.StringIO(content.decode("utf-8"), newline="")
         rows = csv.DictReader(handle)
-        required = {
-            "transaction_id", "trade_date", "transaction_type", "code",
-            "quantity", "price", "amount", "fees",
-        }
-        if rows.fieldnames is None or set(rows.fieldnames) != required:
-            raise ValueError("ledger CSV has invalid columns")
+        _validate_ledger_csv_headers(rows.fieldnames)
         transactions = []
         for row_number, row in enumerate(rows, start=2):
             if len(transactions) >= MAX_LEDGER_ROWS:
@@ -133,6 +139,27 @@ def _read_bounded_csv_bytes(path: Path) -> bytes:
                 raise ValueError(f"ledger CSV exceeds {MAX_LEDGER_CSV_BYTES} byte limit")
             chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _validate_ledger_csv_headers(fieldnames: Sequence[str] | None) -> None:
+    if (
+        fieldnames is None
+        or tuple(fieldnames) != LEDGER_CSV_HEADERS
+        or len(set(fieldnames)) != len(fieldnames)
+    ):
+        raise ValueError("ledger CSV has invalid columns")
+
+
+def validate_ledger_replay_limit(max_rows: int | None) -> int:
+    limit = MAX_LEDGER_ROWS if max_rows is None else max_rows
+    if (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit <= 0
+        or limit > MAX_LEDGER_ROWS
+    ):
+        raise ValueError("invalid ledger replay limit")
+    return limit
 
 
 def import_ledger_csv(
@@ -186,9 +213,7 @@ def import_ledger_entries(
     max_rows: int | None = None,
 ) -> tuple[LedgerImportResult, ...]:
     active_as_of = as_of or datetime.now(_SHANGHAI)
-    replay_limit = MAX_LEDGER_ROWS if max_rows is None else max_rows
-    if not isinstance(replay_limit, int) or replay_limit <= 0:
-        raise ValueError("invalid ledger replay limit")
+    replay_limit = validate_ledger_replay_limit(max_rows)
     if isinstance(entries, (str, bytes)) or not entries:
         raise ValueError("transactions are required")
     if len(entries) > replay_limit:
@@ -285,9 +310,16 @@ def materialize_ledger_snapshots(
     max_rows: int = MAX_LEDGER_ROWS,
     snapshot_source: str | None = None,
 ) -> dict[str, dict[str, Any]]:
+    replay_limit = validate_ledger_replay_limit(max_rows)
+    if isinstance(account_ids, (str, bytes)):
+        raise ValueError("invalid account id")
+    if len(account_ids) > MAX_LEDGER_SNAPSHOT_ACCOUNTS:
+        raise ValueError(f"ledger snapshot account limit exceeds {MAX_LEDGER_SNAPSHOT_ACCOUNTS}")
     requested = tuple(sorted(set(account_ids)))
     if not requested:
         return {}
+    if len(requested) > MAX_LEDGER_SNAPSHOT_ACCOUNTS:
+        raise ValueError(f"ledger snapshot account limit exceeds {MAX_LEDGER_SNAPSHOT_ACCOUNTS}")
     if any(not _ACCOUNT_ID_RE.fullmatch(account_id) for account_id in requested):
         raise ValueError("invalid account id")
     if snapshot_source is not None and (
@@ -303,9 +335,9 @@ def materialize_ledger_snapshots(
         WHERE account_id IN ({placeholders})
         ORDER BY account_id, trade_date, transaction_id LIMIT ?
         """,
-        (*requested, max_rows + 1),
+        (*requested, replay_limit + 1),
     ).fetchall()
-    if len(current_rows) > max_rows:
+    if len(current_rows) > replay_limit:
         raise LedgerCapacityError("ledger history exceeds replay limit")
     snapshot_rows = connection.execute(
         f"""
@@ -317,9 +349,9 @@ def materialize_ledger_snapshots(
           AND julianday(created_at) <= julianday(?)
         ORDER BY account_id, trade_date, transaction_id LIMIT ?
         """,
-        (*requested, as_of.date().isoformat(), as_of.isoformat(), max_rows + 1),
+        (*requested, as_of.date().isoformat(), as_of.isoformat(), replay_limit + 1),
     ).fetchall()
-    if len(snapshot_rows) > max_rows:
+    if len(snapshot_rows) > replay_limit:
         raise LedgerCapacityError("ledger history exceeds replay limit")
     grouped = _group_stored_transactions(current_rows)
     snapshot_grouped = _group_stored_transactions(snapshot_rows)

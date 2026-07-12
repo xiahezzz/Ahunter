@@ -55,6 +55,7 @@ QualityEvaluator = Callable[[sqlite3.Connection, QualityRequest], QualityGateRes
 EvidencePersister = Callable[..., list[EvidenceRecord]]
 _RESEARCH_ACTIONS = frozenset({"buy", "watch", "hold", "reduce", "exit", "avoid"})
 _CODE_PATTERN = re.compile(r"(?<!\d)([03468]\d{5})(?!\d)")
+MAX_REVIEW_LEDGER_CONTEXT_ITEMS = 500
 
 
 @dataclass(frozen=True)
@@ -927,6 +928,11 @@ def _review_ledger_context(
         (report_date, as_of.isoformat()),
     ).fetchall()
     account_ids = tuple(row[0] for row in account_rows)
+    context_items = len(account_ids) * len(advice_items)
+    if context_items > MAX_REVIEW_LEDGER_CONTEXT_ITEMS:
+        raise ValueError(
+            f"review ledger context limit exceeds {MAX_REVIEW_LEDGER_CONTEXT_ITEMS}"
+        )
     snapshots = materialize_ledger_snapshots(
         connection, account_ids, as_of=as_of, snapshot_source=run_id
     )
