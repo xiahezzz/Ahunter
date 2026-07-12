@@ -91,8 +91,8 @@ def test_import_ledger_csv_persists_account_transactions_positions_and_snapshot(
     )
 
     result = import_ledger_csv(
-        csv_path,
         db_path,
+        csv_path,
         account_id="broker-a",
         account_name="Broker A",
         source="broker_csv",
@@ -150,6 +150,40 @@ def test_import_ledger_csv_plan_contract_accepts_db_path_then_csv_path(tmp_path:
     ) == [("deposit", "plan-contract")]
 
 
+def test_import_ledger_csv_requires_account_id_keyword(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = write_ledger(
+        tmp_path / "ledger.csv",
+        ["deposit,2026-07-09,cash_deposit,,0,0,20000,0"],
+    )
+
+    with pytest.raises(TypeError, match="account_id"):
+        import_ledger_csv(db_path, csv_path, as_of=AS_OF)
+    with pytest.raises(TypeError):
+        import_ledger_csv(db_path, csv_path, "contract-account", as_of=AS_OF)
+
+
+def test_import_ledger_csv_does_not_swap_paths_based_on_suffix(tmp_path: Path):
+    db_path = tmp_path / "advisor.csv"
+    csv_path = write_ledger(
+        tmp_path / "ledger-data",
+        ["deposit,2026-07-09,cash_deposit,,0,0,20000,0"],
+    )
+
+    result = import_ledger_csv(
+        db_path,
+        csv_path,
+        account_id="suffix-contract",
+        as_of=AS_OF,
+    )
+
+    assert result.account_id == "suffix-contract"
+    assert result.imported_count == 1
+    assert query_all(db_path, "SELECT transaction_id, account_id FROM ledger_transactions") == [
+        ("deposit", "suffix-contract")
+    ]
+
+
 def test_invalid_import_rolls_back_every_ledger_row(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
     migrate_database(db_path)
@@ -162,7 +196,7 @@ def test_invalid_import_rolls_back_every_ledger_row(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="buy amount must be negative"):
-        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     for table in ("ledger_accounts", "ledger_transactions", "positions", "portfolio_snapshots"):
         assert query_all(db_path, f"SELECT COUNT(*) FROM {table}") == [(0,)]
@@ -179,7 +213,7 @@ def test_import_rejects_non_finite_replayed_cash_atomically(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="non-finite ledger state"):
-        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     for table in ("ledger_transactions", "positions", "portfolio_snapshots"):
         assert query_all(db_path, f"SELECT COUNT(*) FROM {table}") == [(0,)]
@@ -214,7 +248,7 @@ def test_import_rejects_non_finite_snapshot_aggregates_atomically(tmp_path: Path
     )
 
     with pytest.raises(ValueError, match="non-finite ledger snapshot"):
-        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     for table in ("ledger_transactions", "positions", "portfolio_snapshots"):
         assert query_all(db_path, f"SELECT COUNT(*) FROM {table}") == [(0,)]
@@ -226,7 +260,7 @@ def test_existing_transaction_id_rolls_back_new_rows(tmp_path: Path):
         tmp_path / "first.csv",
         ["deposit,2026-07-09,cash_deposit,,0,0,20000,0"],
     )
-    import_ledger_csv(first, db_path, as_of=AS_OF)
+    import_ledger_csv(db_path, first, account_id="default", as_of=AS_OF)
     duplicate = write_ledger(
         tmp_path / "duplicate.csv",
         [
@@ -236,7 +270,7 @@ def test_existing_transaction_id_rolls_back_new_rows(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="duplicate transaction id"):
-        import_ledger_csv(duplicate, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, duplicate, account_id="default", as_of=AS_OF)
 
     assert query_all(
         db_path, "SELECT transaction_id FROM ledger_transactions ORDER BY transaction_id"
@@ -255,7 +289,7 @@ def test_duplicate_transaction_ids_within_csv_fail_before_database_write(tmp_pat
     )
 
     with pytest.raises(ValueError, match="duplicate transaction id"):
-        import_ledger_csv(duplicate, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, duplicate, account_id="default", as_of=AS_OF)
 
     assert not db_path.exists()
 
@@ -357,7 +391,7 @@ def test_csv_import_rejects_more_than_replay_limit_before_database_write(tmp_pat
     )
 
     with pytest.raises(ValueError, match="ledger import exceeds 2 row limit"):
-        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     assert not db_path.exists()
 
@@ -373,7 +407,7 @@ def test_import_quality_flags_are_non_blocking_and_persisted_in_snapshot(tmp_pat
         ],
     )
 
-    result = import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+    result = import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     assert {flag["flag"] for flag in result.quality_flags} == {
         "a_share_lot_size",
@@ -397,7 +431,7 @@ def test_same_day_buy_replays_before_lexically_earlier_sell_and_flags_t_plus_one
         ],
     )
 
-    result = import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+    result = import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     assert [flag["flag"] for flag in result.quality_flags] == ["a_share_t_plus_one"]
     assert query_all(db_path, "SELECT code, quantity FROM positions") == []
@@ -416,7 +450,7 @@ def test_csv_import_rejects_file_over_byte_limit_before_database_write(
     )
 
     with pytest.raises(ValueError, match="ledger CSV exceeds .* byte limit"):
-        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     assert not db_path.exists()
 
@@ -432,7 +466,7 @@ def test_csv_import_rejects_oversized_field_before_database_write(
     )
 
     with pytest.raises(ValueError, match="ledger CSV field exceeds 16 character limit"):
-        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
 
     assert not db_path.exists()
 
@@ -446,7 +480,7 @@ def test_replay_removes_stale_positions_and_keeps_other_accounts(tmp_path: Path)
             "buy-a,2026-07-10,buy,600519,100,100,-10000,0",
         ],
     )
-    import_ledger_csv(first, db_path, account_id="a", as_of=AS_OF)
+    import_ledger_csv(db_path, first, account_id="a", as_of=AS_OF)
     second = write_ledger(
         tmp_path / "second.csv",
         [
@@ -454,7 +488,7 @@ def test_replay_removes_stale_positions_and_keeps_other_accounts(tmp_path: Path)
             "buy-b,2026-07-10,buy,000001,100,10,-1000,0",
         ],
     )
-    import_ledger_csv(second, db_path, account_id="b", as_of=AS_OF)
+    import_ledger_csv(db_path, second, account_id="b", as_of=AS_OF)
     connection = sqlite3.connect(db_path)
     connection.execute(
         "INSERT INTO positions (account_id, code, quantity, cost_basis, updated_at) "
@@ -468,7 +502,7 @@ def test_replay_removes_stale_positions_and_keeps_other_accounts(tmp_path: Path)
         ["sell-a,2026-07-11,sell,600519,100,110,11000,0"],
     )
 
-    import_ledger_csv(sell, db_path, account_id="a", as_of=AS_OF)
+    import_ledger_csv(db_path, sell, account_id="a", as_of=AS_OF)
 
     assert query_all(
         db_path, "SELECT account_id, code, quantity FROM positions ORDER BY account_id, code"
@@ -485,7 +519,7 @@ def test_oversell_during_replay_preserves_existing_snapshot_and_positions(tmp_pa
             "buy,2026-07-10,buy,600519,100,100,-10000,0",
         ],
     )
-    import_ledger_csv(initial, db_path, as_of=AS_OF)
+    import_ledger_csv(db_path, initial, account_id="default", as_of=AS_OF)
     before_positions = query_all(db_path, "SELECT * FROM positions")
     before_snapshots = query_all(db_path, "SELECT * FROM portfolio_snapshots")
     oversell = write_ledger(
@@ -494,7 +528,7 @@ def test_oversell_during_replay_preserves_existing_snapshot_and_positions(tmp_pa
     )
 
     with pytest.raises(ValueError, match="only 100 held"):
-        import_ledger_csv(oversell, db_path, as_of=AS_OF)
+        import_ledger_csv(db_path, oversell, account_id="default", as_of=AS_OF)
 
     assert query_all(db_path, "SELECT * FROM positions") == before_positions
     assert query_all(db_path, "SELECT * FROM portfolio_snapshots") == before_snapshots
@@ -509,14 +543,14 @@ def test_snapshot_replay_is_stable_and_marks_missing_prices(tmp_path: Path):
             "buy,2026-07-10,buy,000001,100,10,-1000,0",
         ],
     )
-    first = import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+    first = import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
     snapshot_before = query_all(db_path, "SELECT snapshot_id, exposure_json FROM portfolio_snapshots")
     extra = write_ledger(
         tmp_path / "extra.csv",
         ["fee,2026-07-11,fee,,0,0,-10,0"],
     )
 
-    second = import_ledger_csv(extra, db_path, as_of=AS_OF)
+    second = import_ledger_csv(db_path, extra, account_id="default", as_of=AS_OF)
 
     snapshot_after = query_all(db_path, "SELECT snapshot_id, exposure_json FROM portfolio_snapshots")
     assert first.snapshot_id == second.snapshot_id == snapshot_after[0][0]
@@ -533,12 +567,12 @@ def test_historical_review_snapshot_does_not_regress_current_positions(tmp_path:
             "buy,2026-07-10,buy,600519,100,100,-10000,0",
         ],
     )
-    import_ledger_csv(initial, db_path, as_of=AS_OF)
+    import_ledger_csv(db_path, initial, account_id="default", as_of=AS_OF)
     later = write_ledger(
         tmp_path / "later.csv",
         ["sell,2026-07-13,sell,600519,100,110,11000,0"],
     )
-    import_ledger_csv(later, db_path, as_of=AS_OF.replace(day=13))
+    import_ledger_csv(db_path, later, account_id="default", as_of=AS_OF.replace(day=13))
     assert query_all(db_path, "SELECT code, quantity FROM positions") == []
 
     connection = sqlite3.connect(db_path)

@@ -1605,7 +1605,7 @@ def test_api_and_cli_imports_materialize_equivalent_account_state(tmp_path):
         encoding="utf-8",
     )
     as_of = datetime(2026, 7, 12, 8, 30, tzinfo=web_api._SHANGHAI)
-    import_ledger_csv(csv_path, cli_db, account_id="same", source="import", as_of=as_of)
+    import_ledger_csv(cli_db, csv_path, account_id="same", source="import", as_of=as_of)
     monkeypatch_time = pytest.MonkeyPatch()
     class FixedDatetime(datetime):
         @classmethod
@@ -1646,7 +1646,7 @@ def test_api_and_csv_share_beijing_stock_code_validation(tmp_path, monkeypatch):
         "buy,2026-07-10,buy,430047,100,10,-1000,0\n",
         encoding="utf-8",
     )
-    import_ledger_csv(csv_path, cli_db, account_id="same", source="import", as_of=as_of)
+    import_ledger_csv(cli_db, csv_path, account_id="same", source="import", as_of=as_of)
 
     class FixedDatetime(datetime):
         @classmethod

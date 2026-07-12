@@ -100,29 +100,20 @@ def import_ledger_csv(
     db_path: Path,
     csv_path: Path,
     *,
-    account_id: str = "default",
+    account_id: str,
     account_name: str | None = None,
     source: str = "csv",
     as_of: datetime | None = None,
 ) -> LedgerImportResult:
-    active_db_path, active_csv_path = _resolve_import_ledger_csv_paths(db_path, csv_path)
-    transactions = load_ledger_csv(active_csv_path)
+    transactions = load_ledger_csv(Path(csv_path))
     return import_ledger_transactions(
         transactions,
-        active_db_path,
+        Path(db_path),
         account_id=account_id,
         account_name=account_name,
         source=source,
         as_of=as_of,
     )
-
-
-def _resolve_import_ledger_csv_paths(db_path: Path, csv_path: Path) -> tuple[Path, Path]:
-    active_db_path = Path(db_path)
-    active_csv_path = Path(csv_path)
-    if active_db_path.suffix.lower() == ".csv" and active_csv_path.suffix.lower() != ".csv":
-        return active_csv_path, active_db_path
-    return active_db_path, active_csv_path
 
 
 def import_ledger_transactions(
