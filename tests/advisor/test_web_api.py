@@ -21,6 +21,33 @@ from advisor.web.api import create_app
 import advisor.web.api as web_api
 
 
+def insert_report_archive(
+    connection: sqlite3.Connection,
+    *,
+    database_run_id: str,
+    report_type: str,
+    report_date: str,
+    markdown_path: Path,
+    json_path: Path,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO report_archive (
+          report_id, run_id, report_type, report_date, markdown_path, json_path, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"report-{database_run_id}-{report_type}",
+            database_run_id,
+            report_type,
+            report_date,
+            str(markdown_path),
+            str(json_path),
+            datetime.now().isoformat(),
+        ),
+    )
+
+
 def test_dev_dependencies_declare_starlette_testclient_transport():
     project = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
 
@@ -82,7 +109,7 @@ def test_report_routes_list_and_serve_only_verified_archives(tmp_path, monkeypat
     state_dir = tmp_path / "state"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
     monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
-    write_premarket_report(
+    archive_paths = write_premarket_report(
         "2026-07-11",
         [],
         reports_root,
@@ -98,6 +125,14 @@ def test_report_routes_list_and_serve_only_verified_archives(tmp_path, monkeypat
     connection.execute(
         "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("current-check", "current-run", "market", "blocking", "passed", "{}", "2026-07-12T08:31:00+08:00"),
+    )
+    insert_report_archive(
+        connection,
+        database_run_id="current-run",
+        report_type="premarket",
+        report_date="2026-07-11",
+        markdown_path=archive_paths.markdown_path,
+        json_path=archive_paths.json_path,
     )
     connection.commit()
     connection.close()
@@ -121,6 +156,44 @@ def test_report_routes_list_and_serve_only_verified_archives(tmp_path, monkeypat
     assert "08:30 Premarket Advice" in report.json()["markdown"]
     assert client.get("/api/reports/../premarket").status_code == 404
     assert client.get("/api/reports/2026-07-11/unknown").status_code == 404
+
+
+def test_report_routes_hide_verified_archive_without_committed_archive_row(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
+    monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
+    write_premarket_report(
+        "2026-07-11",
+        [],
+        reports_root,
+        quality_results=[QualityResult("market_data", "blocking", True, "current")],
+    )
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("current-run", "premarket", "2026-07-12", "passed", "2026-07-12T08:30:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, "
+        "details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("current-check", "current-run", "market", "blocking", "passed", "{}", "2026-07-12T08:31:00+08:00"),
+    )
+    connection.commit()
+    connection.close()
+    client = TestClient(create_app(tmp_path))
+
+    listing = client.get(
+        "/api/reports?start_date=2026-07-11&end_date=2026-07-11"
+    )
+
+    assert listing.status_code == 200
+    assert listing.json()["reports"] == []
+    assert client.get(
+        "/api/reports/2026-07-11/premarket?run_id=initial"
+    ).status_code == 404
 
 
 def test_report_cursor_cannot_be_replayed_after_app_restart(tmp_path, monkeypatch):
@@ -887,8 +960,8 @@ def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_p
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
     today = date.today().isoformat()
     advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "fixture rationale", ["evidence-1"])]
-    write_premarket_report(today, advice, reports_root, quality_results=[QualityResult("market", "blocking", True, "current")])
-    write_review_report(
+    premarket_paths = write_premarket_report(today, advice, reports_root, quality_results=[QualityResult("market", "blocking", True, "current")])
+    review_paths = write_review_report(
         today,
         advice,
         [ReviewItem("review-1", "advice-1", "valid", "fixture review")],
@@ -905,6 +978,30 @@ def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_p
     connection.execute(
         "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
         ("run-1", "premarket", today, "blocked", now),
+    )
+    connection.executemany(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+        "VALUES (?, ?, ?, 'passed', ?)",
+        [
+            ("archive-premarket", "premarket", today, f"{today}T00:00:00+08:00"),
+            ("archive-review", "review", today, f"{today}T00:00:00+08:00"),
+        ],
+    )
+    insert_report_archive(
+        connection,
+        database_run_id="archive-premarket",
+        report_type="premarket",
+        report_date=today,
+        markdown_path=premarket_paths.markdown_path,
+        json_path=premarket_paths.json_path,
+    )
+    insert_report_archive(
+        connection,
+        database_run_id="archive-review",
+        report_type="review",
+        report_date=today,
+        markdown_path=review_paths.markdown_path,
+        json_path=review_paths.json_path,
     )
     connection.execute(
         "INSERT INTO securities (code, name, exchange, concepts_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -978,7 +1075,7 @@ def test_current_state_ignores_yesterday_quality_failure_for_today_passed_report
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
     today = date.today().isoformat()
     advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "fixture", ["evidence-1"])]
-    write_premarket_report(today, advice, reports_root, quality_results=[QualityResult("market", "blocking", True, "current")])
+    report_paths = write_premarket_report(today, advice, reports_root, quality_results=[QualityResult("market", "blocking", True, "current")])
     db_path = tmp_path / "advisor.sqlite"
     migrate_database(db_path)
     yesterday = "2026-01-01" if today != "2026-01-01" else "2026-01-02"
@@ -998,6 +1095,14 @@ def test_current_state_ignores_yesterday_quality_failure_for_today_passed_report
     connection.execute(
         "INSERT INTO data_quality_checks (check_id, run_id, check_name, severity, status, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("today-check", "today-run", "market", "blocking", "passed", "{}", f"{today}T08:31:00+08:00"),
+    )
+    insert_report_archive(
+        connection,
+        database_run_id="today-run",
+        report_type="premarket",
+        report_date=today,
+        markdown_path=report_paths.markdown_path,
+        json_path=report_paths.json_path,
     )
     connection.commit()
     connection.close()
@@ -1054,8 +1159,8 @@ def test_newer_timestamped_current_day_failure_run_blocks_passed_archive(tmp_pat
 
 def test_current_state_fails_closed_for_malformed_report_quality(tmp_path, monkeypatch):
     malformed_report = {"json": {"quality_status": "not-valid", "advice": [{"advice_id": "advice-1"}]}}
-    monkeypatch.setattr(web_api, "_read_report_links", lambda _today, _secret: ([], {"status": "ok", "truncated": False}))
-    monkeypatch.setattr(web_api, "_read_today_report", lambda _today, report_type: malformed_report if report_type == "premarket" else None)
+    monkeypatch.setattr(web_api, "_read_report_links", lambda _today, _secret, _eligible: ([], {"status": "ok", "truncated": False}))
+    monkeypatch.setattr(web_api, "_read_today_report", lambda _today, report_type, _eligible: malformed_report if report_type == "premarket" else None)
 
     payload = TestClient(create_app(tmp_path)).get("/api/current-state").json()
 
@@ -1353,7 +1458,7 @@ def test_current_failure_blocks_historical_report_content(tmp_path, monkeypatch)
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)
     monkeypatch.setattr(web_api, "_shanghai_today", lambda: date(2026, 7, 12))
     advice = [AdviceItem("advice-1", "600519", "watch", 0.7, "historical conclusion", ["evidence-1"])]
-    write_premarket_report(
+    report_paths = write_premarket_report(
         "2026-07-11",
         advice,
         reports_root,
@@ -1365,6 +1470,19 @@ def test_current_failure_blocks_historical_report_content(tmp_path, monkeypatch)
     connection.execute(
         "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) VALUES (?, ?, ?, ?, ?)",
         ("current-failure", "failure", "2026-07-12", "failed", "2026-07-12T09:00:00+08:00"),
+    )
+    connection.execute(
+        "INSERT INTO advisor_runs (run_id, run_type, as_of, status, started_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("historical-run", "premarket", "2026-07-11", "passed", "2026-07-11T08:30:00+08:00"),
+    )
+    insert_report_archive(
+        connection,
+        database_run_id="historical-run",
+        report_type="premarket",
+        report_date="2026-07-11",
+        markdown_path=report_paths.markdown_path,
+        json_path=report_paths.json_path,
     )
     connection.commit()
     connection.close()

@@ -43,6 +43,7 @@ _MAX_CURRENT_RUN_CANDIDATES = 100
 _MAX_CURRENT_QUALITY_CHECKS = 100
 _MAX_QUALITY_DETAILS_BYTES = 64 * 1024
 _MAX_CURRENT_REPORT_LINKS = 20
+_MAX_REPORT_ARCHIVE_ROWS = 500
 _MAX_CURRENT_PROFILE_LINKS = 100
 _MAX_CURRENT_CHART_LINKS = 100
 _CURRENT_REPORT_LOOKBACK_DAYS = 30
@@ -79,6 +80,12 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> dict:
+        connection = _read_connection(resolved_db_path)
+        try:
+            eligible = _eligible_report_keys(connection, advisor_paths.reports_dir())
+        finally:
+            if connection is not None:
+                connection.close()
         try:
             page = page_verified_archives(
                 advisor_paths.reports_dir(),
@@ -92,6 +99,10 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
             raise HTTPException(status_code=409, detail="report cursor stale") from None
         except ValueError:
             raise HTTPException(status_code=503, detail="report listing unavailable") from None
+        page["items"] = [
+            item for item in page["items"]
+            if _report_key(item) in eligible
+        ]
         page["reports"] = [
             {
                 **item,
@@ -105,10 +116,6 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
     def report(report_date: str, report_type: str, run_id: str = "initial") -> dict:
         if report_type not in {"premarket", "review"}:
             raise HTTPException(status_code=404, detail="report not found")
-        try:
-            archive = read_verified_archive(advisor_paths.reports_dir(), report_date, report_type, run_id)
-        except (OSError, ValueError, RuntimeError):
-            raise HTTPException(status_code=404, detail="report not found") from None
         connection = _read_connection(resolved_db_path)
         try:
             quality = _resolve_current_run_quality(
@@ -116,11 +123,20 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
                 _shanghai_today().isoformat(),
                 database_present=_database_entry_present(resolved_db_path),
             )
+            eligible = _eligible_report_keys(connection, advisor_paths.reports_dir())
         finally:
             if connection is not None:
                 connection.close()
         if not quality["safe"]:
             raise HTTPException(status_code=503, detail="current report quality unavailable")
+        if (report_date, report_type, run_id) not in eligible:
+            raise HTTPException(status_code=404, detail="report not found")
+        try:
+            archive = read_verified_archive(
+                advisor_paths.reports_dir(), report_date, report_type, run_id
+            )
+        except (OSError, ValueError, RuntimeError):
+            raise HTTPException(status_code=404, detail="report not found") from None
         return archive
 
     @app.get("/api/profiles")
@@ -260,24 +276,29 @@ def _current_state(state_dir: Path, db_path: Path, report_cursor_secret: bytes) 
         )
         profiles, profile_list = _read_profile_links_with_status(connection)
         charts, chart_list = _read_chart_links_with_status(connection, state_dir)
+        eligible_reports = _eligible_report_keys(connection, advisor_paths.reports_dir())
     finally:
         if connection is not None:
             connection.close()
 
-    reports, report_list = _read_report_links(today, report_cursor_secret)
-    premarket = _read_today_report(today, "premarket")
-    review = _read_today_report(today, "review")
+    reports, report_list = _read_report_links(today, report_cursor_secret, eligible_reports)
+    premarket = _read_today_report(today, "premarket", eligible_reports)
+    review = _read_today_report(today, "review", eligible_reports)
     premarket_status = _report_status(premarket)
     review_status = _report_status(review)
     quality_blocks_empty_state = current_quality["available"] and not current_quality["safe"]
+    unbacked_premarket = premarket is None and _has_today_verified_report(today, "premarket")
+    unbacked_review = review is None and _has_today_verified_report(today, "review")
     premarket_blocked = (
         premarket_status == "blocked"
         or quality_blocks_empty_state
+        or (unbacked_premarket and not current_quality["safe"])
         or (premarket is not None and not current_quality["safe"])
     )
     review_blocked = (
         review_status == "blocked"
         or quality_blocks_empty_state
+        or (unbacked_review and not current_quality["safe"])
         or (review is not None and not current_quality["safe"])
     )
     checks = current_quality["blocking_checks"]
@@ -1109,7 +1130,82 @@ def _regular_file_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_report_links(today: str, cursor_secret: bytes) -> tuple[list[dict], dict]:
+def _eligible_report_keys(
+    connection: sqlite3.Connection | None, reports_root: Path
+) -> set[tuple[str, str, str]]:
+    if connection is None:
+        return set()
+    try:
+        rows = connection.execute(
+            """
+            SELECT report_archive.report_type, report_archive.report_date,
+                   report_archive.markdown_path, report_archive.json_path
+            FROM report_archive
+            JOIN advisor_runs ON advisor_runs.run_id = report_archive.run_id
+            WHERE (report_archive.report_type IN ('premarket', 'review')
+                   AND advisor_runs.status = 'passed')
+               OR (report_archive.report_type = 'failure'
+                   AND advisor_runs.status = 'blocked')
+            LIMIT ?
+            """,
+            (_MAX_REPORT_ARCHIVE_ROWS + 1,),
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    if len(rows) > _MAX_REPORT_ARCHIVE_ROWS:
+        return set()
+
+    keys: set[tuple[str, str, str]] = set()
+    root = reports_root.resolve(strict=False)
+    for row in rows:
+        report_type = row["report_type"]
+        report_date = row["report_date"]
+        if report_type not in {"premarket", "review", "failure"}:
+            continue
+        try:
+            if date.fromisoformat(report_date).isoformat() != report_date:
+                continue
+        except (TypeError, ValueError):
+            continue
+        try:
+            json_path = Path(row["json_path"])
+            markdown_path = Path(row["markdown_path"])
+        except TypeError:
+            continue
+        run_id = _report_run_id(report_type, json_path.name)
+        if run_id is None:
+            continue
+        suffix = "" if run_id == "initial" else f".{run_id}"
+        expected_directory = root / report_date
+        if (
+            json_path.resolve(strict=False) != expected_directory / f"{report_type}{suffix}.json"
+            or markdown_path.resolve(strict=False)
+            != expected_directory / f"{report_type}{suffix}.md"
+        ):
+            continue
+        keys.add((report_date, report_type, run_id))
+    return keys
+
+
+def _report_run_id(report_type: str, filename: str) -> str | None:
+    if filename == f"{report_type}.json":
+        return "initial"
+    match = re.fullmatch(
+        rf"{re.escape(report_type)}\.([A-Za-z0-9][A-Za-z0-9_-]{{0,63}})\.json",
+        filename,
+    )
+    return match.group(1) if match is not None else None
+
+
+def _report_key(report: dict) -> tuple[str, str, str]:
+    return report["report_date"], report["report_type"], report["run_id"]
+
+
+def _read_report_links(
+    today: str,
+    cursor_secret: bytes,
+    eligible: set[tuple[str, str, str]],
+) -> tuple[list[dict], dict]:
     end = date.fromisoformat(today)
     start = end - timedelta(days=_CURRENT_REPORT_LOOKBACK_DAYS)
     try:
@@ -1128,15 +1224,69 @@ def _read_report_links(today: str, cursor_secret: bytes) -> tuple[list[dict], di
             "href": f"/api/reports/{archive['report_date']}/{archive['report_type']}?run_id={archive['run_id']}",
         }
         for archive in page["items"]
+        if _report_key(archive) in eligible
     ]
     return links, {"status": "ok", "truncated": page["truncated"]}
 
 
-def _read_today_report(today: str, report_type: str) -> dict | None:
+def _read_today_report(
+    today: str,
+    report_type: str,
+    eligible: set[tuple[str, str, str]],
+) -> dict | None:
+    run_ids = {
+        run_id
+        for report_date, candidate_type, run_id in eligible
+        if report_date == today and candidate_type == report_type
+    }
+    if not run_ids:
+        return None
     try:
-        return read_active_verified_archive(advisor_paths.reports_dir(), today, report_type)
+        archives = {
+            run_id: read_verified_archive(
+                advisor_paths.reports_dir(), today, report_type, run_id
+            )
+            for run_id in run_ids
+        }
     except (OSError, ValueError, RuntimeError):
         return None
+    predecessors: set[str] = set()
+    for run_id, archive in archives.items():
+        supersession = archive["json"].get("supersession")
+        if run_id == "initial":
+            if supersession is not None:
+                return None
+            continue
+        if (
+            not isinstance(supersession, dict)
+            or set(supersession) != {"reason", "supersedes"}
+            or not isinstance(supersession["reason"], str)
+            or supersession["supersedes"] not in archives
+        ):
+            return None
+        predecessors.add(supersession["supersedes"])
+    heads = set(archives) - predecessors
+    if len(heads) != 1:
+        return None
+    head = heads.pop()
+    seen: set[str] = set()
+    current = head
+    while current != "initial":
+        if current in seen:
+            return None
+        seen.add(current)
+        current = archives[current]["json"]["supersession"]["supersedes"]
+    if set(archives) != seen | {"initial"}:
+        return None
+    return archives[head]
+
+
+def _has_today_verified_report(today: str, report_type: str) -> bool:
+    try:
+        read_active_verified_archive(advisor_paths.reports_dir(), today, report_type)
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return True
 
 
 def _report_status(report: dict | None) -> str:

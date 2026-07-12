@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 import pytest
+from fastapi.testclient import TestClient
 
 from advisor import paths as advisor_paths
 from advisor import coordinator as coordinator_module
@@ -24,6 +25,7 @@ from advisor.reporting import premarket as premarket_reporting
 from advisor.reporting import review as review_reporting
 from advisor.reporting.contracts import AdviceItem
 from advisor.reporting.premarket import write_premarket_report
+from advisor.web.api import create_app
 
 
 AS_OF = datetime(2026, 7, 12, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -392,6 +394,71 @@ def test_review_rolls_back_all_projection_rows_when_report_write_fails(
         paths["db_path"],
         "SELECT status FROM advisor_runs WHERE run_type = 'review'",
     ) == [("failed",)]
+
+
+def test_review_archive_insert_failure_rolls_back_and_hides_orphan_archive(
+    tmp_path: Path, monkeypatch
+):
+    paths = coordinator_paths(tmp_path)
+    from advisor.db.migrate import migrate_database
+    migrate_database(paths["db_path"])
+    seed_market(paths["db_path"])
+    advice = AdviceItem("initial-advice", CODE, "watch", 0.5, "initial", [])
+    seed_premarket_report(
+        paths, database_run_id="morning-initial", report_run_id="initial", advice=[advice]
+    )
+    real_archive_report = coordinator_module._archive_report
+
+    def fail_review_archive(connection, run_id, report_type, report_date, report_paths, as_of):
+        if report_type == "review":
+            raise sqlite3.IntegrityError("fixture archive insertion failure")
+        return real_archive_report(
+            connection, run_id, report_type, report_date, report_paths, as_of
+        )
+
+    monkeypatch.setattr(coordinator_module, "_archive_report", fail_review_archive)
+    with pytest.raises(sqlite3.IntegrityError, match="fixture archive insertion failure"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
+            report_date="2026-07-12", candidate_codes=(CODE,), run_id="review-orphan",
+            quality_evaluator=passed_quality, **paths,
+        )
+
+    assert (paths["output_dir"] / "2026-07-12" / "review.complete.json").is_file()
+    assert query_all(paths["db_path"], "SELECT COUNT(*) FROM reviews") == [(0,)]
+    assert query_all(
+        paths["db_path"], "SELECT COUNT(*) FROM report_archive WHERE report_type = 'review'"
+    ) == [(0,)]
+    assert query_all(
+        paths["db_path"],
+        "SELECT status FROM advisor_runs WHERE run_id = 'review-orphan'",
+    ) == [("failed",)]
+
+    monkeypatch.setattr(coordinator_module, "_archive_report", real_archive_report)
+    with pytest.raises(FileExistsError, match="report archive already exists"):
+        run_review(
+            collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=31),
+            report_date="2026-07-12", candidate_codes=(CODE,), run_id="review-retry",
+            quality_evaluator=passed_quality, **paths,
+        )
+    assert query_all(
+        paths["db_path"],
+        "SELECT status FROM advisor_runs WHERE run_id = 'review-retry'",
+    ) == [("failed",)]
+    assert query_all(
+        paths["db_path"], "SELECT COUNT(*) FROM report_archive WHERE report_type = 'review'"
+    ) == [(0,)]
+
+    client = TestClient(create_app(paths["db_path"].parent, db_path=paths["db_path"]))
+    listing = client.get(
+        "/api/reports?start_date=2026-07-12&end_date=2026-07-12"
+    )
+
+    assert listing.status_code == 200
+    assert not any(item["report_type"] == "review" for item in listing.json()["reports"])
+    assert client.get(
+        "/api/reports/2026-07-12/review?run_id=initial"
+    ).status_code == 503
 
 
 def test_review_blocks_when_archive_advice_scope_differs_from_quality_scope(tmp_path: Path):
