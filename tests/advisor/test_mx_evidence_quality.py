@@ -403,6 +403,9 @@ def test_sensitive_opaque_collector_source_id_fails_closed(
     "source_id",
     [
         "event_accesstoken_foo",
+        "event_sessionaccesstoken_foo",
+        "event_accessauthorizationtoken_foo",
+        "event_debugsessionaccesstoken_foo",
         "event_refreshtoken_foo",
         "event_sessiontoken_foo",
         "event_authorizationtoken_foo",

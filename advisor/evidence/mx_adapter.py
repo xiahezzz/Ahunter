@@ -49,14 +49,29 @@ _SENSITIVE_OPAQUE_COMPONENT = re.compile(
     r"session|sess|socket|token|debug|debugger|cdp)(?:[_.:-]|$)",
     re.IGNORECASE,
 )
-_SENSITIVE_OPAQUE_COMPOUND = re.compile(
-    r"(?:^|[_.:-])"
-    r"(?:access|refresh|id|token|session|authorization|auth|cookie|debug|debugger|"
-    r"cdp|socket|api|apikey|password|credential|credentials|secret)"
-    r"(?:token|id|identifier|key|session|authorization|auth|cookie|debug|debugger|"
-    r"socket|apikey|password|credential|credentials|secret)"
-    r"(?:[_.:-]|$)",
-    re.IGNORECASE,
+_OPAQUE_COMPONENT_DELIMITER = re.compile(r"[_.:-]")
+_SENSITIVE_OPAQUE_TERMS = (
+    "authorization",
+    "credentials",
+    "credential",
+    "identifier",
+    "password",
+    "debugger",
+    "session",
+    "refresh",
+    "access",
+    "cookie",
+    "socket",
+    "secret",
+    "token",
+    "debug",
+    "apikey",
+    "auth",
+    "cdp",
+    "sess",
+    "api",
+    "key",
+    "id",
 )
 _MEDIA_CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\Z")
 _URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
@@ -555,9 +570,25 @@ def valid_opaque_identifier(value: object) -> bool:
         isinstance(value, str)
         and bool(_OPAQUE_ID.fullmatch(value))
         and not _SENSITIVE_OPAQUE_COMPONENT.search(value)
-        and not _SENSITIVE_OPAQUE_COMPOUND.search(value)
+        and not _contains_sensitive_opaque_compound(value)
         and redact_sensitive_text(value) == value
     )
+
+
+def _contains_sensitive_opaque_compound(value: str) -> bool:
+    for component in _OPAQUE_COMPONENT_DELIMITER.split(value.lower()):
+        term_counts: list[int | None] = [None] * (len(component) + 1)
+        term_counts[0] = 0
+        for start, count in enumerate(term_counts):
+            if count is None:
+                continue
+            for term in _SENSITIVE_OPAQUE_TERMS:
+                if component.startswith(term, start):
+                    end = start + len(term)
+                    term_counts[end] = max(term_counts[end] or 0, count + 1)
+        if term_counts[-1] is not None and term_counts[-1] >= 2:
+            return True
+    return False
 
 
 def valid_snapshot_authorization(snapshot: object) -> bool:
