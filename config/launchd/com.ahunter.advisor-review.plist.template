@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ahunter.advisor-review</string>
+  <key>WorkingDirectory</key>
+  <string>{{REPO_ROOT}}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON}}</string>
+    <string>-m</string>
+    <string>advisor.scheduler.review</string>
+    <string>--output-dir</string>
+    <string>reports</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>22</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{{REPO_ROOT}}/logs/advisor-review.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{REPO_ROOT}}/logs/advisor-review.err.log</string>
+</dict>
+</plist>

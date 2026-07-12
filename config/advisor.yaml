@@ -1,0 +1,18 @@
+market:
+  primary: A股
+schedule:
+  premarket_time: "08:30"
+  review_time: "22:30"
+storage:
+  database: data/advisor/advisor.sqlite
+  chart_dir: data/advisor/charts
+  profile_dir: data/advisor/profiles
+data_sources:
+  allow_tushare: false
+  free_sources:
+    - sina
+quality:
+  max_market_data_staleness_minutes: 1440
+  require_trading_calendar: true
+trading_agents:
+  repository_path: /Users/mac/Documents/TradingAgents-astock
