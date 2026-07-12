@@ -1,5 +1,7 @@
 import csv
+import io
 import json
+import stat
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -594,6 +596,66 @@ def test_csv_import_rejects_file_over_byte_limit_before_database_write(
     assert not db_path.exists()
 
 
+def test_csv_import_rejects_non_regular_input_before_database_write(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = tmp_path / "ledger-directory"
+    csv_path.mkdir()
+
+    with pytest.raises(ValueError, match="ledger CSV must be a regular file"):
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
+
+    assert not db_path.exists()
+
+
+def test_csv_import_rejects_stream_that_exceeds_byte_limit_before_database_write(
+    tmp_path: Path, monkeypatch
+):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = tmp_path / "growing.csv"
+    csv_path.write_text(
+        "transaction_id,trade_date,transaction_type,code,quantity,price,amount,fees\n",
+        encoding="utf-8",
+    )
+    payload = (
+        b"transaction_id,trade_date,transaction_type,code,quantity,price,amount,fees\n"
+        b"deposit-1,2026-07-09,cash_deposit,,0,0,20000,0\n"
+        b"deposit-2,2026-07-10,cash_deposit,,0,0,1000,0\n"
+    )
+    byte_limit = len(payload) - 2
+    monkeypatch.setattr(ledger_importer, "MAX_LEDGER_CSV_BYTES", byte_limit, raising=False)
+
+    original_stat = Path.stat
+    original_open = Path.open
+
+    class InLimitRegularStat:
+        st_mode = stat.S_IFREG | 0o644
+        st_size = byte_limit - 1
+
+    def fake_stat(self, *args, **kwargs):
+        if self == csv_path:
+            return InLimitRegularStat()
+        return original_stat(self, *args, **kwargs)
+
+    def fake_open(self, mode="r", *args, **kwargs):
+        if self == csv_path and "r" in mode:
+            if "b" in mode:
+                return io.BytesIO(payload)
+            return io.TextIOWrapper(
+                io.BytesIO(payload),
+                encoding=kwargs.get("encoding") or "utf-8",
+                newline=kwargs.get("newline"),
+            )
+        return original_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(Path, "open", fake_open)
+
+    with pytest.raises(ValueError, match="ledger CSV exceeds .* byte limit"):
+        import_ledger_csv(db_path, csv_path, account_id="default", as_of=AS_OF)
+
+    assert not db_path.exists()
+
+
 def test_csv_import_rejects_oversized_field_before_database_write(
     tmp_path: Path, monkeypatch
 ):
@@ -736,6 +798,63 @@ def test_historical_review_snapshot_does_not_regress_current_positions(tmp_path:
         )[0][0]
     )
     assert snapshot_payload["positions"]["600519"]["quantity"] == 100
+
+
+def test_create_portfolio_snapshot_public_interface_persists_typed_snapshot(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    seed_market_prices(db_path)
+    csv_path = write_ledger(
+        tmp_path / "ledger.csv",
+        [
+            "deposit,2026-07-09,cash_deposit,,0,0,20000,0",
+            "buy-odd,2026-07-10,buy,600519,150,100,-15000,0",
+            "sell-same-day,2026-07-10,sell,600519,50,110,5500,0",
+        ],
+    )
+    import_ledger_csv(db_path, csv_path, account_id="public", as_of=AS_OF)
+
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        snapshot = ledger_importer.create_portfolio_snapshot(
+            connection,
+            "public",
+            AS_OF.replace(hour=22, minute=30),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert isinstance(snapshot, ledger_importer.PortfolioSnapshot)
+    assert snapshot.account_id == "public"
+    assert snapshot.as_of == "2026-07-12T22:30:00+08:00"
+    assert snapshot.cash == 10500.0
+    assert snapshot.market_value == 11000.0
+    assert snapshot.realized_pnl == 500.0
+    assert snapshot.unrealized_pnl == 1000.0
+    assert snapshot.pricing_status == "passed"
+    assert {flag["flag"] for flag in snapshot.quality_flags} == {
+        "a_share_lot_size",
+        "a_share_t_plus_one",
+    }
+    assert snapshot.exposure["600519"] == {
+        "cost_basis": 10000.0,
+        "market_price": 110.0,
+        "market_value": 11000.0,
+        "pricing_status": "passed",
+        "quantity": 100,
+        "unrealized_pnl": 1000.0,
+    }
+    persisted = query_all(
+        db_path,
+        "SELECT snapshot_id, cash, market_value, realized_pnl, unrealized_pnl, exposure_json "
+        "FROM portfolio_snapshots WHERE account_id = 'public' AND as_of = "
+        "'2026-07-12T22:30:00+08:00'",
+    )
+    assert [(row[0], row[1], row[2], row[3], row[4]) for row in persisted] == [
+        (snapshot.snapshot_id, 10500.0, 11000.0, 500.0, 1000.0)
+    ]
+    assert json.loads(persisted[0][5])["pricing_status"] == "passed"
 
 
 def test_ledger_exposure_code_filter_is_explicitly_bounded(tmp_path: Path, monkeypatch):

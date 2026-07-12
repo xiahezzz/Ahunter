@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import re
 import sqlite3
+import stat
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -53,52 +55,84 @@ class LedgerImportResult:
     quality_flags: tuple[dict[str, object], ...] = ()
 
 
+@dataclass(frozen=True)
+class PortfolioSnapshot:
+    snapshot_id: str
+    account_id: str
+    as_of: str
+    cash: float
+    market_value: float
+    realized_pnl: float
+    unrealized_pnl: float
+    exposure: dict[str, dict[str, float | int | str | None]]
+    pricing_status: str
+    quality_flags: tuple[dict[str, object], ...] = ()
+
+
 def load_ledger_csv(path: Path) -> list[LedgerTransaction]:
-    file_size = path.stat().st_size
-    if file_size > MAX_LEDGER_CSV_BYTES:
+    file_info = path.stat()
+    if not stat.S_ISREG(file_info.st_mode):
+        raise ValueError("ledger CSV must be a regular file")
+    if file_info.st_size > MAX_LEDGER_CSV_BYTES:
         raise ValueError(f"ledger CSV exceeds {MAX_LEDGER_CSV_BYTES} byte limit")
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        try:
-            rows = csv.DictReader(handle)
-            required = {
-                "transaction_id", "trade_date", "transaction_type", "code",
-                "quantity", "price", "amount", "fees",
-            }
-            if rows.fieldnames is None or set(rows.fieldnames) != required:
-                raise ValueError("ledger CSV has invalid columns")
-            transactions = []
-            for row_number, row in enumerate(rows, start=2):
-                if len(transactions) >= MAX_LEDGER_ROWS:
-                    raise ValueError(f"ledger import exceeds {MAX_LEDGER_ROWS} row limit")
-                try:
-                    if any(
-                        not isinstance(value, str) or len(value) > MAX_LEDGER_FIELD_LENGTH
-                        for value in row.values()
-                    ):
-                        raise ValueError(
-                            f"ledger CSV field exceeds {MAX_LEDGER_FIELD_LENGTH} character limit"
-                        )
-                    transaction = LedgerTransaction(
-                        transaction_id=row["transaction_id"],
-                        trade_date=row["trade_date"],
-                        transaction_type=row["transaction_type"],
-                        code=row["code"] or None,
-                        quantity=int(row["quantity"]),
-                        price=float(row["price"]),
-                        amount=float(row["amount"]),
-                        fees=float(row["fees"]),
+    try:
+        content = _read_bounded_csv_bytes(path)
+        handle = io.StringIO(content.decode("utf-8"), newline="")
+        rows = csv.DictReader(handle)
+        required = {
+            "transaction_id", "trade_date", "transaction_type", "code",
+            "quantity", "price", "amount", "fees",
+        }
+        if rows.fieldnames is None or set(rows.fieldnames) != required:
+            raise ValueError("ledger CSV has invalid columns")
+        transactions = []
+        for row_number, row in enumerate(rows, start=2):
+            if len(transactions) >= MAX_LEDGER_ROWS:
+                raise ValueError(f"ledger import exceeds {MAX_LEDGER_ROWS} row limit")
+            try:
+                if any(
+                    not isinstance(value, str) or len(value) > MAX_LEDGER_FIELD_LENGTH
+                    for value in row.values()
+                ):
+                    raise ValueError(
+                        f"ledger CSV field exceeds {MAX_LEDGER_FIELD_LENGTH} character limit"
                     )
-                    validate_ledger_transaction(transaction)
-                except (TypeError, ValueError) as error:
-                    raise ValueError(f"invalid ledger CSV row {row_number}: {error}") from error
-                transactions.append(transaction)
-        except csv.Error as error:
-            raise ValueError(f"invalid ledger CSV: {error}") from error
-        except UnicodeDecodeError as error:
-            raise ValueError("invalid ledger CSV encoding: invalid UTF-8") from error
+                transaction = LedgerTransaction(
+                    transaction_id=row["transaction_id"],
+                    trade_date=row["trade_date"],
+                    transaction_type=row["transaction_type"],
+                    code=row["code"] or None,
+                    quantity=int(row["quantity"]),
+                    price=float(row["price"]),
+                    amount=float(row["amount"]),
+                    fees=float(row["fees"]),
+                )
+                validate_ledger_transaction(transaction)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"invalid ledger CSV row {row_number}: {error}") from error
+            transactions.append(transaction)
+    except csv.Error as error:
+        raise ValueError(f"invalid ledger CSV: {error}") from error
+    except UnicodeDecodeError as error:
+        raise ValueError("invalid ledger CSV encoding: invalid UTF-8") from error
     if not transactions:
         raise ValueError("ledger CSV contains no transactions")
     return transactions
+
+
+def _read_bounded_csv_bytes(path: Path) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_LEDGER_CSV_BYTES:
+                raise ValueError(f"ledger CSV exceeds {MAX_LEDGER_CSV_BYTES} byte limit")
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def import_ledger_csv(
@@ -295,6 +329,37 @@ def materialize_ledger_snapshots(
     return _materialize_grouped_accounts(
         connection, grouped, requested, as_of, snapshot_source=snapshot_source,
         snapshot_grouped=snapshot_grouped,
+    )
+
+
+def create_portfolio_snapshot(
+    connection: sqlite3.Connection,
+    account_id: str,
+    as_of: datetime,
+) -> PortfolioSnapshot:
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("as_of must be a timezone-aware datetime")
+    snapshots = materialize_ledger_snapshots(
+        connection,
+        (account_id,),
+        as_of=as_of,
+        snapshot_source="portfolio-snapshot-v1",
+    )
+    return _portfolio_snapshot_from_dict(snapshots[account_id])
+
+
+def _portfolio_snapshot_from_dict(snapshot: dict[str, Any]) -> PortfolioSnapshot:
+    return PortfolioSnapshot(
+        snapshot_id=str(snapshot["snapshot_id"]),
+        account_id=str(snapshot["account_id"]),
+        as_of=str(snapshot["as_of"]),
+        cash=float(snapshot["cash"]),
+        market_value=float(snapshot["market_value"]),
+        realized_pnl=float(snapshot["realized_pnl"]),
+        unrealized_pnl=float(snapshot["unrealized_pnl"]),
+        exposure=dict(snapshot["exposure"]),
+        pricing_status=str(snapshot["pricing_status"]),
+        quality_flags=tuple(snapshot["quality_flags"]),
     )
 
 
