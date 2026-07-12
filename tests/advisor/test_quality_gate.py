@@ -9,7 +9,7 @@ import pytest
 
 from advisor.agents.astock_adapter import ANALYST_ROLES
 from advisor.db.migrate import migrate_database
-from advisor.db.repository import record_trading_calendar_proof
+from advisor.db.repository import calendar_proof_content_hash, record_trading_calendar_proof
 from advisor.evidence.mx_adapter import CollectorSnapshot, MediaMetadata, MxEvidence
 from advisor.quality import QualityRequest, QualityResult, evaluate_run_quality
 
@@ -391,6 +391,46 @@ def test_direct_calendar_proof_with_invalid_content_hash_blocks(tmp_path: Path):
     check = next(check for check in result.checks if check.check_name == "trading_calendar")
     assert check.blocking_failure
     assert "invalid" in check.details
+
+
+def test_self_consistent_direct_calendar_proof_cannot_change_expected_session(tmp_path: Path):
+    connection = quality_connection(tmp_path)
+    forged_session = "2026-07-09"
+    forged_hash = calendar_proof_content_hash(
+        calendar_source="exchange_calendar",
+        as_of=AS_OF.isoformat(),
+        latest_expected_session=forged_session,
+        scope="candidate_codes",
+        coverage_codes=("600519",),
+    )
+    connection.execute("DELETE FROM trading_calendar_proofs")
+    connection.execute(
+        "UPDATE market_daily SET trade_date = ?, as_of_date = ? WHERE trade_date = '2026-07-10'",
+        (forged_session, forged_session),
+    )
+    connection.execute(
+        """
+        INSERT INTO trading_calendar_proofs (
+          proof_id, contract_version, producer, calendar_source, as_of,
+          latest_expected_session, scope, coverage_codes_json, content_hash
+        ) VALUES (?, 1, ?, 'exchange_calendar', ?, ?,
+                  'candidate_codes', '["600519"]', ?)
+        """,
+        (
+            f"advisor-calendar-proof:v1:{forged_hash}",
+            CALENDAR_PROOF_PRODUCER,
+            AS_OF.isoformat(),
+            forged_session,
+            forged_hash,
+        ),
+    )
+    connection.commit()
+
+    result = evaluate_run_quality(connection, request())
+
+    check = next(check for check in result.checks if check.check_name == "trading_calendar")
+    assert check.blocking_failure
+    assert "2026-07-10" in check.details
 
 
 def test_future_calendar_proof_blocks_future_data_check(tmp_path: Path):

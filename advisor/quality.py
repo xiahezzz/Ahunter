@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from advisor.agents.astock_adapter import ANALYST_ROLES
+from advisor.calendar import latest_expected_session
 from advisor.db.repository import (
     CALENDAR_PROOF_PRODUCER,
     CALENDAR_PROOF_VERSION,
@@ -139,7 +140,7 @@ def _collector_check(snapshot: CollectorSnapshot | None) -> QualityResult:
 
 
 def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
-    expected, error = _authoritative_expected_session(connection, request)
+    expected, error = _expected_session_with_proof_audit(connection, request)
     if error is not None or expected is None:
         return _blocked_check("trading_calendar", error or "latest expected trading session is unavailable")
     missing = [
@@ -166,9 +167,10 @@ def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequ
     )
 
 
-def _authoritative_expected_session(
+def _expected_session_with_proof_audit(
     connection: sqlite3.Connection, request: QualityRequest
 ) -> tuple[dt.date | None, str | None]:
+    expected = latest_expected_session(request.as_of)
     rows = connection.execute(
         """
         SELECT proof_id, contract_version, producer, calendar_source, as_of,
@@ -185,7 +187,7 @@ def _authoritative_expected_session(
     saw_historical_proof = False
     for (
         proof_id, contract_version, producer, calendar_source, proof_as_of_raw,
-        latest_expected_session, scope, raw_coverage, content_hash,
+        claimed_session_raw, scope, raw_coverage, content_hash,
     ) in rows:
         try:
             if (
@@ -203,7 +205,7 @@ def _authoritative_expected_session(
             expected_hash = calendar_proof_content_hash(
                 calendar_source=calendar_source,
                 as_of=proof_as_of_raw,
-                latest_expected_session=latest_expected_session,
+                latest_expected_session=claimed_session_raw,
                 scope=scope,
                 coverage_codes=tuple(coverage),
             )
@@ -236,7 +238,7 @@ def _authoritative_expected_session(
                 raise ValueError("invalid calendar coverage")
             if not applicable_codes:
                 continue
-            claimed = dt.date.fromisoformat(latest_expected_session)
+            claimed = dt.date.fromisoformat(claimed_session_raw)
             if claimed > request.as_of.date():
                 return None, "latest expected trading session is future-dated"
             for code in applicable_codes:
@@ -250,10 +252,16 @@ def _authoritative_expected_session(
         return None, "trading calendar latest expected session is unavailable"
     if any(len(claims) != 1 for claims in claims_by_code.values()):
         return None, "conflicting trading calendar proof"
-    expected_sessions = {next(iter(claims)) for claims in claims_by_code.values()}
-    if len(expected_sessions) != 1:
+    claimed_sessions = {next(iter(claims)) for claims in claims_by_code.values()}
+    if len(claimed_sessions) != 1:
         return None, "conflicting trading calendar proof"
-    return next(iter(expected_sessions)), None
+    claimed = next(iter(claimed_sessions))
+    if claimed != expected:
+        return None, (
+            f"trading calendar proof session {claimed.isoformat()} conflicts with "
+            f"independently expected session {expected.isoformat()}"
+        )
+    return expected, None
 
 
 def _market_staleness_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
@@ -468,7 +476,7 @@ def _optional_source_checks(connection: sqlite3.Connection, request: QualityRequ
         return (_blocked_check("market_source_state", f"{len(required_failures)} required market sources failed"),)
     if not optional_failures:
         return ()
-    expected, calendar_error = _authoritative_expected_session(connection, request)
+    expected, calendar_error = _expected_session_with_proof_audit(connection, request)
     if calendar_error is not None or expected is None:
         return (_blocked_check("optional_source_coverage", "authoritative calendar coverage is unavailable"),)
     cutoff = _three_year_cutoff(request.as_of.date())
