@@ -233,7 +233,7 @@ def run_review(
                 connection, active_run_id, "review", report_day, output_dir, [failure], as_of
             )
         ledger_impact = _review_ledger_context(
-            connection, morning, report_day, as_of
+            connection, morning, report_day, as_of, active_run_id
         )
         reviews = [
             _evaluate_review_item(connection, active_run_id, report_day, as_of, item)
@@ -913,22 +913,22 @@ def _review_ledger_context(
     advice_items: Sequence[AdviceItem],
     report_date: str,
     as_of: datetime,
+    run_id: str,
 ) -> list[str]:
     codes = tuple(dict.fromkeys(item.code for item in advice_items))
     placeholders = ",".join("?" for _ in codes)
     account_rows = connection.execute(
-        f"""
+        """
         SELECT DISTINCT account_id FROM ledger_transactions
-        WHERE code IN ({placeholders})
-          AND date(trade_date) <= date(?)
+        WHERE date(trade_date) <= date(?)
           AND julianday(created_at) <= julianday(?)
         ORDER BY account_id
         """,
-        (*codes, report_date, as_of.isoformat()),
+        (report_date, as_of.isoformat()),
     ).fetchall()
     account_ids = tuple(row[0] for row in account_rows)
     snapshots = materialize_ledger_snapshots(
-        connection, account_ids, as_of=as_of
+        connection, account_ids, as_of=as_of, snapshot_source=run_id
     )
     transaction_rows = connection.execute(
         f"""
@@ -961,6 +961,8 @@ def _review_ledger_context(
                         "cash": snapshot["cash"],
                         "exposure": snapshot["exposure"],
                         "market_value": snapshot["market_value"],
+                        "pricing_status": snapshot["pricing_status"],
+                        "quality_flags": snapshot["quality_flags"],
                         "realized_pnl": snapshot["realized_pnl"],
                         "snapshot_id": snapshot["snapshot_id"],
                         "transactions": matched,

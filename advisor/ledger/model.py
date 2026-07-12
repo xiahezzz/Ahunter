@@ -7,6 +7,14 @@ from datetime import date
 _CODE_RE = re.compile(r"[03468]\d{5}\Z")
 _TRANSACTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_SQLITE_INTEGER = 2**63 - 1
+_TRANSACTION_TYPE_PRIORITY = {
+    "cash_deposit": 0,
+    "cash_withdrawal": 0,
+    "buy": 1,
+    "sell": 2,
+    "fee": 3,
+    "tax": 3,
+}
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,14 @@ def _require_code(tx: LedgerTransaction) -> str:
     if tx.code is None:
         raise ValueError(f"{tx.transaction_type} transaction requires code")
     return tx.code
+
+
+def ledger_transaction_sort_key(transaction: LedgerTransaction) -> tuple[str, int, str]:
+    return (
+        transaction.trade_date,
+        _TRANSACTION_TYPE_PRIORITY.get(transaction.transaction_type, 4),
+        transaction.transaction_id,
+    )
 
 
 def apply_transactions(transactions: list[LedgerTransaction]) -> LedgerState:

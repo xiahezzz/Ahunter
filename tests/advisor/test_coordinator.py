@@ -480,7 +480,7 @@ def test_review_links_morning_advice_and_persists_review(tmp_path: Path):
     assert query_all(paths["db_path"], "SELECT COUNT(*) FROM stock_profile_history")[0][0] >= 2
 
 
-def test_review_creates_snapshot_and_links_advice_to_same_day_transactions(tmp_path: Path):
+def test_review_versions_snapshots_for_every_active_ledger_account(tmp_path: Path):
     paths = coordinator_paths(tmp_path)
     from advisor.db.migrate import migrate_database
     migrate_database(paths["db_path"])
@@ -493,9 +493,13 @@ def test_review_creates_snapshot_and_links_advice_to_same_day_transactions(tmp_p
     )
     advice_id = query_all(paths["db_path"], "SELECT advice_id FROM advice")[0][0]
     connection = sqlite3.connect(paths["db_path"])
-    connection.execute(
-        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES ('review-account', 'Review', ?)",
-        (AS_OF.isoformat(),),
+    connection.executemany(
+        "INSERT INTO ledger_accounts (account_id, name, created_at) VALUES (?, ?, ?)",
+        [
+            ("review-account", "Review", AS_OF.isoformat()),
+            ("cash-only", "Cash", AS_OF.isoformat()),
+            ("unrelated", "Unrelated", AS_OF.isoformat()),
+        ],
     )
     connection.executemany(
         "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees, source, created_at) "
@@ -505,13 +509,22 @@ def test_review_creates_snapshot_and_links_advice_to_same_day_transactions(tmp_p
             ("review-buy", "2026-07-12", "buy", CODE, 100, 11.5, -1150, AS_OF.isoformat()),
         ],
     )
+    connection.executemany(
+        "INSERT INTO ledger_transactions (transaction_id, account_id, trade_date, transaction_type, code, quantity, price, amount, fees, source, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'fixture', ?)",
+        [
+            ("cash-deposit", "cash-only", "2026-07-11", "cash_deposit", None, 0, 0, 5000, AS_OF.isoformat()),
+            ("other-deposit", "unrelated", "2026-07-11", "cash_deposit", None, 0, 0, 5000, AS_OF.isoformat()),
+            ("other-fee", "unrelated", "2026-07-12", "fee", None, 0, 0, -10, AS_OF.isoformat()),
+        ],
+    )
     connection.commit()
     connection.close()
 
     result = run_review(
         collector_snapshot=collector(), as_of=AS_OF.replace(hour=22, minute=30),
         report_date="2026-07-12", candidate_codes=(CODE,),
-        quality_evaluator=passed_quality, **paths,
+        run_id="review-first", quality_evaluator=passed_quality, **paths,
     )
 
     assert morning.status == result.status == "passed"
@@ -519,16 +532,39 @@ def test_review_creates_snapshot_and_links_advice_to_same_day_transactions(tmp_p
         paths["db_path"],
         "SELECT snapshot_id, account_id, cash, market_value, realized_pnl, unrealized_pnl, exposure_json FROM portfolio_snapshots",
     )
-    assert len(snapshots) == 1
-    assert snapshots[0][1:6] == ("review-account", 18850.0, 1150.0, 0.0, 0.0)
+    assert len(snapshots) == 3
+    review_snapshot = next(row for row in snapshots if row[1] == "review-account")
+    assert review_snapshot[1:6] == ("review-account", 18850.0, 1150.0, 0.0, 0.0)
     context = json.loads(result.report_paths.json_path.read_text(encoding="utf-8"))["context"]
-    impact = json.loads(context["ledger_impact"][0])
+    impacts = [json.loads(item) for item in context["ledger_impact"]]
+    assert {item["account_id"] for item in impacts} == {
+        "cash-only", "review-account", "unrelated"
+    }
+    assert all("pricing_status" in item and "quality_flags" in item for item in impacts)
+    impact = next(item for item in impacts if item["account_id"] == "review-account")
     assert impact["advice_id"] == advice_id
-    assert impact["snapshot_id"] == snapshots[0][0]
+    assert impact["snapshot_id"] == review_snapshot[0]
     assert impact["transactions"] == [
         {"transaction_id": "review-buy", "transaction_type": "buy"}
     ]
     assert impact["exposure"][CODE]["quantity"] == 100
+
+    connection = sqlite3.connect(paths["db_path"])
+    connection.row_factory = sqlite3.Row
+    coordinator_module.materialize_ledger_snapshots(
+        connection,
+        ("cash-only", "review-account", "unrelated"),
+        as_of=AS_OF.replace(hour=22, minute=30),
+        snapshot_source="review-second",
+    )
+    connection.commit()
+    connection.close()
+    versioned = query_all(
+        paths["db_path"],
+        "SELECT account_id, COUNT(DISTINCT snapshot_id) FROM portfolio_snapshots "
+        "GROUP BY account_id ORDER BY account_id",
+    )
+    assert versioned == [("cash-only", 2), ("review-account", 2), ("unrelated", 2)]
 
 
 @pytest.mark.parametrize("module", [premarket_reporting, review_reporting])

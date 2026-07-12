@@ -19,6 +19,7 @@ from advisor.ledger.model import (
     LedgerState,
     LedgerTransaction,
     apply_transactions,
+    ledger_transaction_sort_key,
     validate_ledger_transaction,
 )
 from advisor.paths import repo_root
@@ -28,6 +29,8 @@ _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _SOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 MAX_LEDGER_ROWS = 10_000
+MAX_LEDGER_CSV_BYTES = 5 * 1024 * 1024
+MAX_LEDGER_FIELD_LENGTH = 4096
 
 
 class LedgerCapacityError(ValueError):
@@ -49,6 +52,9 @@ class LedgerImportResult:
 
 
 def load_ledger_csv(path: Path) -> list[LedgerTransaction]:
+    file_size = path.stat().st_size
+    if file_size > MAX_LEDGER_CSV_BYTES:
+        raise ValueError(f"ledger CSV exceeds {MAX_LEDGER_CSV_BYTES} byte limit")
     with path.open("r", encoding="utf-8", newline="") as handle:
         rows = csv.DictReader(handle)
         required = {
@@ -62,6 +68,13 @@ def load_ledger_csv(path: Path) -> list[LedgerTransaction]:
             if len(transactions) >= MAX_LEDGER_ROWS:
                 raise ValueError(f"ledger import exceeds {MAX_LEDGER_ROWS} row limit")
             try:
+                if any(
+                    not isinstance(value, str) or len(value) > MAX_LEDGER_FIELD_LENGTH
+                    for value in row.values()
+                ):
+                    raise ValueError(
+                        f"ledger CSV field exceeds {MAX_LEDGER_FIELD_LENGTH} character limit"
+                    )
                 transaction = LedgerTransaction(
                     transaction_id=row["transaction_id"],
                     trade_date=row["trade_date"],
@@ -139,7 +152,7 @@ def import_ledger_entries(
         raise ValueError("transactions are required")
     if len(entries) > replay_limit:
         raise LedgerCapacityError(f"ledger import exceeds {replay_limit} row limit")
-    ordered_entries = sorted(entries, key=lambda item: (item[0], item[1].trade_date, item[1].transaction_id))
+    ordered_entries = sorted(entries, key=lambda item: (item[0], ledger_transaction_sort_key(item[1])))
     transaction_ids = [transaction.transaction_id for _, transaction in ordered_entries]
     if len(transaction_ids) != len(set(transaction_ids)):
         raise ValueError("duplicate transaction id")
@@ -171,7 +184,7 @@ def import_ledger_entries(
             grouped.setdefault(active_account_id, []).append(transaction)
         affected_accounts = tuple(sorted({account_id for account_id, _ in ordered_entries}))
         for active_account_id in affected_accounts:
-            grouped[active_account_id].sort(key=lambda item: (item.trade_date, item.transaction_id))
+            grouped[active_account_id].sort(key=ledger_transaction_sort_key)
             apply_transactions(grouped[active_account_id])
         now = active_as_of.isoformat()
         for active_account_id in affected_accounts:
@@ -229,12 +242,17 @@ def materialize_ledger_snapshots(
     *,
     as_of: datetime,
     max_rows: int = MAX_LEDGER_ROWS,
+    snapshot_source: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     requested = tuple(sorted(set(account_ids)))
     if not requested:
         return {}
     if any(not _ACCOUNT_ID_RE.fullmatch(account_id) for account_id in requested):
         raise ValueError("invalid account id")
+    if snapshot_source is not None and (
+        not isinstance(snapshot_source, str) or not _SOURCE_RE.fullmatch(snapshot_source)
+    ):
+        raise ValueError("invalid snapshot source")
     rows = connection.execute(
         """
         SELECT transaction_id, account_id, trade_date, transaction_type, code,
@@ -251,7 +269,9 @@ def materialize_ledger_snapshots(
     missing = set(requested) - set(grouped)
     if missing:
         raise ValueError("ledger account has no transactions")
-    return _materialize_grouped_accounts(connection, grouped, requested, as_of)
+    return _materialize_grouped_accounts(
+        connection, grouped, requested, as_of, snapshot_source=snapshot_source
+    )
 
 
 def ledger_exposure_by_code(
@@ -336,20 +356,20 @@ def _materialize_grouped_accounts(
     grouped: dict[str, list[LedgerTransaction]],
     account_ids: Sequence[str],
     as_of: datetime,
+    *,
+    snapshot_source: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     snapshots: dict[str, dict[str, Any]] = {}
     cutoff = as_of.date().isoformat()
     for account_id in account_ids:
-        transactions = sorted(
-            grouped[account_id], key=lambda item: (item.trade_date, item.transaction_id)
-        )
+        transactions = sorted(grouped[account_id], key=ledger_transaction_sort_key)
         full_state = apply_transactions(transactions)
         _replace_positions(connection, account_id, full_state, as_of.isoformat())
         snapshot_transactions = [item for item in transactions if item.trade_date <= cutoff]
         snapshot_state = apply_transactions(snapshot_transactions)
         quality_flags = _ledger_quality_flags(snapshot_transactions)
         snapshots[account_id] = _persist_snapshot(
-            connection, account_id, as_of, snapshot_state, quality_flags
+            connection, account_id, as_of, snapshot_state, quality_flags, snapshot_source
         )
     return snapshots
 
@@ -422,6 +442,7 @@ def _persist_snapshot(
     as_of: datetime,
     state: LedgerState,
     quality_flags: Sequence[dict[str, object]],
+    snapshot_source: str | None,
 ) -> dict[str, Any]:
     rows = [
         {"code": code, "quantity": quantity, "cost_basis": state.cost_basis[code]}
@@ -440,7 +461,7 @@ def _persist_snapshot(
         "ledger_quality": list(quality_flags),
     }
     snapshot_id = "ledger-snapshot-" + hashlib.sha256(
-        f"{account_id}\0{as_of.isoformat()}".encode("utf-8")
+        f"{account_id}\0{as_of.isoformat()}\0{snapshot_source or ''}".encode("utf-8")
     ).hexdigest()
     connection.execute(
         """

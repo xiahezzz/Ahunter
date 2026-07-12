@@ -1394,6 +1394,66 @@ def test_api_and_cli_imports_materialize_equivalent_account_state(tmp_path):
     assert state(api_db) == state(cli_db)
 
 
+def test_api_and_csv_share_beijing_stock_code_validation(tmp_path, monkeypatch):
+    from advisor.ledger.importer import import_ledger_csv
+
+    as_of = datetime(2026, 7, 12, 8, 30, tzinfo=web_api._SHANGHAI)
+    cli_db = tmp_path / "cli.sqlite"
+    api_db = tmp_path / "api.sqlite"
+    csv_path = tmp_path / "beijing.csv"
+    csv_path.write_text(
+        "transaction_id,trade_date,transaction_type,code,quantity,price,amount,fees\n"
+        "deposit,2026-07-10,cash_deposit,,0,0,20000,0\n"
+        "buy,2026-07-10,buy,430047,100,10,-1000,0\n",
+        encoding="utf-8",
+    )
+    import_ledger_csv(csv_path, cli_db, account_id="same", source="import", as_of=as_of)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return as_of
+
+    monkeypatch.setattr(web_api, "datetime", FixedDatetime)
+    response = TestClient(create_app(tmp_path, db_path=api_db)).post(
+        "/api/ledger/import",
+        json=[
+            {"transaction_id": "deposit", "account_id": "same", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 20000, "fees": 0},
+            {"transaction_id": "buy", "account_id": "same", "trade_date": "2026-07-10", "transaction_type": "buy", "code": "430047", "quantity": 100, "price": 10, "amount": -1000, "fees": 0},
+        ],
+    )
+
+    assert response.status_code == 201
+    for db_path in (cli_db, api_db):
+        connection = sqlite3.connect(db_path)
+        assert connection.execute(
+            "SELECT account_id, code, quantity FROM positions"
+        ).fetchall() == [("same", "430047", 100)]
+        connection.close()
+
+
+def test_api_ledger_rejects_oversized_string_field_before_database_write(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(web_api, "_MAX_LEDGER_FIELD_LENGTH", 16, raising=False)
+    db_path = tmp_path / "advisor.sqlite"
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        "/api/ledger/transactions",
+        json={
+            "transaction_id": "x" * 17,
+            "trade_date": "2026-07-10",
+            "transaction_type": "cash_deposit",
+            "quantity": 0,
+            "price": 0,
+            "amount": 1,
+            "fees": 0,
+        },
+    )
+
+    assert response.status_code == 422
+    assert not db_path.exists()
+
+
 def test_current_state_reads_verified_reports_and_local_dashboard_fixtures(tmp_path, monkeypatch):
     reports_root = tmp_path / "reports"
     monkeypatch.setattr(advisor_paths, "reports_dir", lambda: reports_root)

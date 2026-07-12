@@ -310,6 +310,59 @@ def test_import_quality_flags_are_non_blocking_and_persisted_in_snapshot(tmp_pat
     assert exposure["ledger_quality"] == list(result.quality_flags)
 
 
+def test_same_day_buy_replays_before_lexically_earlier_sell_and_flags_t_plus_one(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = write_ledger(
+        tmp_path / "same-day.csv",
+        [
+            "deposit,2026-07-09,cash_deposit,,0,0,20000,0",
+            "z-buy,2026-07-10,buy,600519,100,100,-10000,0",
+            "a-sell,2026-07-10,sell,600519,100,110,11000,0",
+        ],
+    )
+
+    result = import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+
+    assert [flag["flag"] for flag in result.quality_flags] == ["a_share_t_plus_one"]
+    assert query_all(db_path, "SELECT code, quantity FROM positions") == []
+
+
+def test_csv_import_rejects_file_over_byte_limit_before_database_write(
+    tmp_path: Path, monkeypatch
+):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = write_ledger(
+        tmp_path / "too-large.csv",
+        ["deposit,2026-07-09,cash_deposit,,0,0,20000,0"],
+    )
+    monkeypatch.setattr(
+        ledger_importer, "MAX_LEDGER_CSV_BYTES", csv_path.stat().st_size - 1, raising=False
+    )
+
+    with pytest.raises(ValueError, match="ledger CSV exceeds .* byte limit"):
+        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+
+    assert not db_path.exists()
+
+
+def test_csv_import_rejects_oversized_field_before_database_write(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(ledger_importer, "MAX_LEDGER_FIELD_LENGTH", 16, raising=False)
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = write_ledger(
+        tmp_path / "oversized-field.csv",
+        [f"{'x' * 17},2026-07-09,cash_deposit,,0,0,20000,0"],
+    )
+
+    with pytest.raises(ValueError, match="ledger CSV field exceeds 16 character limit"):
+        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+
+    assert not db_path.exists()
+
+
 def test_replay_removes_stale_positions_and_keeps_other_accounts(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
     first = write_ledger(

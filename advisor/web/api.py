@@ -25,7 +25,12 @@ from advisor.ledger.importer import (
     LedgerConflictError,
     import_ledger_entries,
 )
-from advisor.ledger.model import LedgerTransaction, apply_transactions
+from advisor.ledger.model import (
+    LedgerTransaction,
+    apply_transactions,
+    ledger_transaction_sort_key,
+    validate_ledger_transaction,
+)
 from advisor.reporting.contracts import (
     StaleArchiveCursorError,
     read_active_verified_archive,
@@ -40,11 +45,11 @@ _CODE_RE = re.compile(r"(?:[0368]\d{5}|(?:SH|SZ|BJ)\d{6})\Z")
 _DASHBOARD_CODE_RE = re.compile(r"[0368]\d{5}\Z")
 _ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-_TRANSACTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _CHART_TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
 _MAX_LEDGER_REPLAY_ROWS = 10_000
 _MAX_IMPORT_TRANSACTIONS = _MAX_LEDGER_REPLAY_ROWS
+_MAX_LEDGER_FIELD_LENGTH = 4096
 _MAX_CHART_BYTES = 5 * 1024 * 1024
 _MAX_CURRENT_RUN_CANDIDATES = 100
 _MAX_CURRENT_QUALITY_CHECKS = 100
@@ -476,6 +481,11 @@ def _read_capped_ledger_history(connection: sqlite3.Connection) -> list[sqlite3.
 def _transaction_from_payload(payload: object) -> tuple[str, LedgerTransaction]:
     if not isinstance(payload, dict):
         raise _LedgerValidationError("invalid transaction")
+    if any(
+        isinstance(value, str) and len(value) > _MAX_LEDGER_FIELD_LENGTH
+        for value in (*payload.keys(), *payload.values())
+    ):
+        raise _LedgerValidationError("ledger field is too long")
     allowed = {"transaction_id", "account_id", "trade_date", "transaction_type", "code", "quantity", "price", "amount", "fees"}
     required = allowed - {"account_id", "code"}
     if set(payload) - allowed or not required <= set(payload):
@@ -494,7 +504,7 @@ def _transaction_from_payload(payload: object) -> tuple[str, LedgerTransaction]:
         fees=payload["fees"],
     )
     try:
-        _validate_ledger_transaction(transaction)
+        validate_ledger_transaction(transaction)
     except ValueError as error:
         raise _LedgerValidationError("invalid transaction") from error
     return account_id, transaction
@@ -543,7 +553,7 @@ def _write_ledger_transactions(
             }
             for account_id, transaction in sorted(
                 transactions,
-                key=lambda item: (item[0], item[1].trade_date, item[1].transaction_id),
+                key=lambda item: (item[0], ledger_transaction_sort_key(item[1])),
             )
         ]
         result = {
@@ -572,7 +582,7 @@ def _validate_candidate_ledger_state(
         grouped[account_id].append(transaction)
     for account_transactions in grouped.values():
         try:
-            apply_transactions(sorted(account_transactions, key=lambda transaction: (transaction.trade_date, transaction.transaction_id)))
+            apply_transactions(sorted(account_transactions, key=ledger_transaction_sort_key))
         except ValueError as error:
             raise _LedgerValidationError("invalid transaction") from error
 
@@ -594,7 +604,9 @@ def _derive_ledger_state(rows: list[sqlite3.Row], connection: sqlite3.Connection
     realized_pnl = 0.0
     for account_id in sorted(transactions_by_account):
         try:
-            state = apply_transactions(transactions_by_account[account_id])
+            state = apply_transactions(
+                sorted(transactions_by_account[account_id], key=ledger_transaction_sort_key)
+            )
         except ValueError:
             return _empty_ledger_state()
         if not all(_finite_number(value) for value in (state.cash, state.realized_pnl, *state.cost_basis.values())):
@@ -652,7 +664,7 @@ def _ledger_transaction_from_row(row: sqlite3.Row) -> LedgerTransaction:
         amount=row["amount"],
         fees=row["fees"],
     )
-    _validate_ledger_transaction(transaction)
+    validate_ledger_transaction(transaction)
     return transaction
 
 
@@ -1646,40 +1658,3 @@ def _valid_dashboard_date(value: object) -> bool:
 
 def _valid_account_id(value: object) -> bool:
     return isinstance(value, str) and bool(_ACCOUNT_ID_RE.fullmatch(value))
-
-
-def _validate_ledger_transaction(transaction: LedgerTransaction) -> None:
-    if not isinstance(transaction.transaction_id, str) or not _TRANSACTION_ID_RE.fullmatch(transaction.transaction_id):
-        raise ValueError("invalid transaction")
-    try:
-        if date.fromisoformat(transaction.trade_date).isoformat() != transaction.trade_date:
-            raise ValueError("invalid trade date")
-    except (TypeError, ValueError) as error:
-        raise ValueError("invalid trade date") from error
-    if transaction.transaction_type not in {"cash_deposit", "cash_withdrawal", "buy", "sell", "fee", "tax"}:
-        raise ValueError("invalid transaction type")
-    if (
-        not isinstance(transaction.quantity, int)
-        or isinstance(transaction.quantity, bool)
-        or not 0 <= transaction.quantity <= _MAX_SQLITE_INTEGER
-    ):
-        raise ValueError("invalid quantity")
-    if not all(_finite_number(value) for value in (transaction.price, transaction.amount, transaction.fees)):
-        raise ValueError("invalid numeric amount")
-    if transaction.transaction_type in {"buy", "sell"}:
-        if not isinstance(transaction.code, str) or not _CODE_RE.fullmatch(transaction.code):
-            raise ValueError("trade requires code")
-        if transaction.quantity <= 0 or transaction.price <= 0 or transaction.fees < 0:
-            raise ValueError("invalid trade")
-        if transaction.transaction_type == "buy" and transaction.amount >= 0:
-            raise ValueError("buy amount must be negative")
-        if transaction.transaction_type == "sell" and transaction.amount <= 0:
-            raise ValueError("sell amount must be positive")
-        if not math.isclose(abs(transaction.amount), transaction.quantity * transaction.price, rel_tol=1e-9, abs_tol=1e-6):
-            raise ValueError("trade amount does not match quantity and price")
-    elif transaction.code is not None or transaction.quantity != 0 or transaction.price != 0 or transaction.fees != 0:
-        raise ValueError("invalid cash transaction")
-    elif transaction.transaction_type == "cash_deposit" and transaction.amount <= 0:
-        raise ValueError("cash deposit must be positive")
-    elif transaction.transaction_type in {"cash_withdrawal", "fee", "tax"} and transaction.amount >= 0:
-        raise ValueError("cash outflow must be negative")
