@@ -8,6 +8,9 @@ from typing import Callable, Sequence
 
 REPO_ROOT_PLACEHOLDER = "{{REPO_ROOT}}"
 PYTHON_PLACEHOLDER = "{{PYTHON}}"
+NODE24_BIN = "/Users/mac/.local/share/chrome-devtools-mcp/node/bin"
+NODE24 = f"{NODE24_BIN}/node"
+NPM_CLI = "/Users/mac/.local/share/chrome-devtools-mcp/node/lib/node_modules/npm/bin/npm-cli.js"
 
 REQUIRED_KEYS = {
     "Label",
@@ -19,6 +22,7 @@ REQUIRED_KEYS = {
 
 LAUNCHD_TEMPLATE_NAMES = (
     "com.ahunter.advisor-api.plist.template",
+    "com.ahunter.advisor-frontend.plist.template",
     "com.ahunter.advisor-premarket.plist.template",
     "com.ahunter.advisor-review.plist.template",
 )
@@ -37,6 +41,8 @@ def validate_launchd_template(path: Path) -> bool:
     args = payload["ProgramArguments"]
     if label == "com.ahunter.advisor-api":
         return _valid_api_payload(payload, args)
+    if label == "com.ahunter.advisor-frontend":
+        return _valid_frontend_payload(payload, args)
     if label == "com.ahunter.advisor-premarket":
         return _valid_report_payload(payload, args, "advisor.scheduler.premarket", 8, 30)
     if label == "com.ahunter.advisor-review":
@@ -70,6 +76,33 @@ def _valid_api_payload(payload: dict, args: list[str]) -> bool:
         and "127.0.0.1" in args
         and "--port" in args
     )
+
+
+def _valid_frontend_payload(payload: dict, args: list[str]) -> bool:
+    return (
+        payload.get("KeepAlive") is True
+        and payload.get("WorkingDirectory") == REPO_ROOT_PLACEHOLDER
+        and payload.get("StandardOutPath") == f"{REPO_ROOT_PLACEHOLDER}/logs/advisor-frontend.out.log"
+        and payload.get("StandardErrorPath") == f"{REPO_ROOT_PLACEHOLDER}/logs/advisor-frontend.err.log"
+        and _has_frontend_node24_path(payload)
+        and args
+        == [
+            NODE24,
+            NPM_CLI,
+            "--prefix",
+            f"{REPO_ROOT_PLACEHOLDER}/frontend",
+            "run",
+            "dev",
+        ]
+    )
+
+
+def _has_frontend_node24_path(payload: dict) -> bool:
+    environment = payload.get("EnvironmentVariables")
+    if not isinstance(environment, dict):
+        return False
+    path = environment.get("PATH")
+    return isinstance(path, str) and path.split(":")[0] == NODE24_BIN
 
 
 def _valid_report_payload(payload: dict, args: list[str], module: str, hour: int, minute: int) -> bool:

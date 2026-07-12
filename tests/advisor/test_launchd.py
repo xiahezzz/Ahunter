@@ -34,8 +34,41 @@ def test_launchd_templates_are_valid():
         "com.ahunter.advisor-api.plist.template",
         "com.ahunter.advisor-premarket.plist.template",
         "com.ahunter.advisor-review.plist.template",
+        "com.ahunter.advisor-frontend.plist.template",
     ]:
         assert validate_launchd_template(LAUNCHD_DIR / name)
+
+
+def test_frontend_launchd_template_uses_node24_npm_cli_and_dev_server():
+    template = LAUNCHD_DIR / "com.ahunter.advisor-frontend.plist.template"
+
+    assert validate_launchd_template(template)
+
+    rendered = render_launchd_template(
+        template,
+        repo_root=Path("/repo"),
+        python=Path("/repo/.venv311/bin/python"),
+    )
+    payload = plistlib.loads(rendered.encode("utf-8"))
+
+    assert payload["Label"] == "com.ahunter.advisor-frontend"
+    assert payload["WorkingDirectory"] == "/repo"
+    assert payload["KeepAlive"] is True
+    assert payload["ProgramArguments"] == [
+        "/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node",
+        "/Users/mac/.local/share/chrome-devtools-mcp/node/lib/node_modules/npm/bin/npm-cli.js",
+        "--prefix",
+        "/repo/frontend",
+        "run",
+        "dev",
+    ]
+    assert payload["EnvironmentVariables"]["PATH"].split(":")[0] == (
+        "/Users/mac/.local/share/chrome-devtools-mcp/node/bin"
+    )
+    assert "127.0.0.1" in Path("frontend/package.json").read_text(encoding="utf-8")
+    assert "5173" in Path("frontend/package.json").read_text(encoding="utf-8")
+    assert payload["StandardOutPath"] == "/repo/logs/advisor-frontend.out.log"
+    assert payload["StandardErrorPath"] == "/repo/logs/advisor-frontend.err.log"
 
 
 def test_premarket_launchd_uses_composed_refresh_then_advice_command():
@@ -180,13 +213,17 @@ def test_launchd_manage_install_writes_all_plists_and_preserves_python_path(tmp_
     assert exit_code == 0
     assert [path.name for path in installed] == [
         "com.ahunter.advisor-api.plist",
+        "com.ahunter.advisor-frontend.plist",
         "com.ahunter.advisor-premarket.plist",
         "com.ahunter.advisor-review.plist",
     ]
     assert logs_dir.is_dir()
     for plist_path in installed:
         payload = plistlib.loads(plist_path.read_bytes())
-        assert payload["ProgramArguments"][0] == str(explicit_python)
+        if payload["Label"] == "com.ahunter.advisor-frontend":
+            assert payload["ProgramArguments"][0] == "/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node"
+        else:
+            assert payload["ProgramArguments"][0] == str(explicit_python)
     output = capsys.readouterr().out
     for plist_path in installed:
         assert str(plist_path) in output
@@ -241,12 +278,16 @@ def test_launchd_manage_install_uses_repo_root_templates_outside_repo_cwd(tmp_pa
     assert exit_code == 0
     assert [path.name for path in installed] == [
         "com.ahunter.advisor-api.plist",
+        "com.ahunter.advisor-frontend.plist",
         "com.ahunter.advisor-premarket.plist",
         "com.ahunter.advisor-review.plist",
     ]
     for plist_path in installed:
         payload = plistlib.loads(plist_path.read_bytes())
-        assert payload["ProgramArguments"][0] == str(explicit_python)
+        if payload["Label"] == "com.ahunter.advisor-frontend":
+            assert payload["ProgramArguments"][0] == "/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node"
+        else:
+            assert payload["ProgramArguments"][0] == str(explicit_python)
 
 
 def test_launchd_manage_install_defaults_python_under_repo_root_outside_repo_cwd(tmp_path, monkeypatch):
@@ -271,7 +312,10 @@ def test_launchd_manage_install_defaults_python_under_repo_root_outside_repo_cwd
     assert exit_code == 0
     for plist_path in installed:
         payload = plistlib.loads(plist_path.read_bytes())
-        assert payload["ProgramArguments"][0] == str(project_root.resolve() / ".venv311/bin/python")
+        if payload["Label"] == "com.ahunter.advisor-frontend":
+            assert payload["ProgramArguments"][0] == "/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node"
+        else:
+            assert payload["ProgramArguments"][0] == str(project_root.resolve() / ".venv311/bin/python")
 
 
 def test_launchd_manage_install_does_not_load_without_load_flag(tmp_path, monkeypatch):
@@ -321,6 +365,7 @@ def test_launchd_manage_install_load_dispatches_installed_plists(tmp_path, monke
 
     expected = [
         launch_agents_dir / "com.ahunter.advisor-api.plist",
+        launch_agents_dir / "com.ahunter.advisor-frontend.plist",
         launch_agents_dir / "com.ahunter.advisor-premarket.plist",
         launch_agents_dir / "com.ahunter.advisor-review.plist",
     ]
