@@ -94,6 +94,8 @@ def load_ledger_csv(path: Path) -> list[LedgerTransaction]:
                 transactions.append(transaction)
         except csv.Error as error:
             raise ValueError(f"invalid ledger CSV: {error}") from error
+        except UnicodeDecodeError as error:
+            raise ValueError("invalid ledger CSV encoding: invalid UTF-8") from error
     if not transactions:
         raise ValueError("ledger CSV contains no transactions")
     return transactions

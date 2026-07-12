@@ -96,6 +96,18 @@ def test_load_ledger_csv_normalizes_parser_field_limit_error(tmp_path: Path):
         csv.field_size_limit(previous_limit)
 
 
+def test_load_ledger_csv_normalizes_invalid_utf8(tmp_path: Path):
+    filename = tmp_path / "invalid-utf8.csv"
+    filename.write_bytes(
+        b"transaction_id,trade_date,transaction_type,code,quantity,price,amount,fees\n"
+        b"t1,2026-07-10,cash_deposit,,0,0,100000,0\n"
+        b"\xff"
+    )
+
+    with pytest.raises(ValueError, match="invalid ledger CSV encoding: invalid UTF-8"):
+        load_ledger_csv(filename)
+
+
 def test_import_ledger_csv_persists_account_transactions_positions_and_snapshot(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
     seed_market_prices(db_path)
@@ -391,6 +403,47 @@ data_sources:
 
     assert error.value.code == 2
     assert "invalid ledger CSV" in capsys.readouterr().err
+    assert not (tmp_path / "state" / "advisor.sqlite").exists()
+
+
+def test_cli_reports_invalid_utf8_as_usage_error_without_traceback(tmp_path: Path, capsys):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "advisor.yaml"
+    config_path.write_text(
+        """
+market:
+  primary: A股
+schedule:
+  premarket_time: "08:30"
+  review_time: "22:30"
+storage:
+  database: state/advisor.sqlite
+data_sources:
+  allow_tushare: false
+  free_sources: []
+""".strip(),
+        encoding="utf-8",
+    )
+    csv_path = tmp_path / "invalid-utf8.csv"
+    csv_path.write_bytes(
+        b"transaction_id,trade_date,transaction_type,code,quantity,price,amount,fees\n"
+        b"t1,2026-07-10,cash_deposit,,0,0,100000,0\n"
+        b"\xff"
+    )
+
+    with pytest.raises(SystemExit) as error:
+        main([
+            str(csv_path),
+            "--config", str(config_path),
+            "--account-id", "cli-account",
+            "--as-of", AS_OF.isoformat(),
+        ])
+
+    captured = capsys.readouterr()
+    assert error.value.code == 2
+    assert "invalid ledger CSV encoding: invalid UTF-8" in captured.err
+    assert "Traceback" not in captured.err
     assert not (tmp_path / "state" / "advisor.sqlite").exists()
 
 
