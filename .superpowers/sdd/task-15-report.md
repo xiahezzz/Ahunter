@@ -296,6 +296,52 @@ git diff --check
 
 None. No collector implementation, RID configuration, live smoke test, Chrome operation, frontend, broker, or order behavior was changed or invoked.
 
+## Timezone Proof Fix
+
+### Fix Summary
+
+- Calendar proofs now reject future aware instants before any date classification.
+- Non-future proof dates are normalized into the request timezone before historical/current classification, so same-run-date cross-timezone proofs participate in conflict detection.
+
+### RED Evidence
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py -q
+2 failed, 29 passed in 0.39s
+```
+
+The failures were the intended regressions: a future proof expressed on the prior local date was ignored, and a conflicting proof expressed on the prior local date was ignored instead of treated as current in the run timezone.
+
+### GREEN Evidence
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_quality_gate.py -q
+31 passed in 0.37s
+
+.venv311/bin/python -m pytest tests/advisor/test_mx_evidence_quality.py tests/advisor/test_quality_gate.py tests/advisor/test_reporting.py tests/advisor/test_market_backfill.py -q
+178 passed in 2.19s
+
+.venv311/bin/python -m pytest tests/advisor -q
+298 passed in 4.19s
+
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+duration_ms 515.170291
+
+git diff --check
+<no output; exit 0>
+```
+
+### Commit
+
+`a261583710b1ed0108148f0d8d2ad8c73261707e` (`fix: normalize calendar proof timezones`)
+
+### Concerns
+
+None. The change is limited to advisor quality proof handling and its focused tests; no collector implementation, RID configuration, frontend, broker, or order behavior was changed or invoked.
+
 ## Fourth Reviewer Fix: Stable MX Quality Proofs
 
 ### Status
