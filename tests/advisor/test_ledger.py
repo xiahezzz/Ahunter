@@ -146,6 +146,58 @@ def test_invalid_import_rolls_back_every_ledger_row(tmp_path: Path):
         assert query_all(db_path, f"SELECT COUNT(*) FROM {table}") == [(0,)]
 
 
+def test_import_rejects_non_finite_replayed_cash_atomically(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    csv_path = write_ledger(
+        tmp_path / "overflow.csv",
+        [
+            "deposit-1,2026-07-09,cash_deposit,,0,0,1e308,0",
+            "deposit-2,2026-07-10,cash_deposit,,0,0,1e308,0",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="non-finite ledger state"):
+        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+
+    for table in ("ledger_transactions", "positions", "portfolio_snapshots"):
+        assert query_all(db_path, f"SELECT COUNT(*) FROM {table}") == [(0,)]
+
+
+def test_import_rejects_non_finite_snapshot_aggregates_atomically(tmp_path: Path):
+    db_path = tmp_path / "advisor.sqlite"
+    migrate_database(db_path)
+    connection = sqlite3.connect(db_path)
+    connection.executemany(
+        """
+        INSERT INTO market_daily (
+          code, trade_date, open, high, low, close, volume, amount, source,
+          fetched_at, as_of_date, content_hash, quality_status
+        ) VALUES (?, '2026-07-10', 1, 1e308, 1, 1e308, 1, 1, 'fixture', ?,
+                  '2026-07-10', ?, 'passed')
+        """,
+        [
+            ("600519", AS_OF.isoformat(), "huge-close-1"),
+            ("000001", AS_OF.isoformat(), "huge-close-2"),
+        ],
+    )
+    connection.commit()
+    connection.close()
+    csv_path = write_ledger(
+        tmp_path / "overflow-snapshot.csv",
+        [
+            "deposit,2026-07-09,cash_deposit,,0,0,10,0",
+            "buy-1,2026-07-10,buy,600519,1,1,-1,0",
+            "buy-2,2026-07-10,buy,000001,1,1,-1,0",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="non-finite ledger snapshot"):
+        import_ledger_csv(csv_path, db_path, as_of=AS_OF)
+
+    for table in ("ledger_transactions", "positions", "portfolio_snapshots"):
+        assert query_all(db_path, f"SELECT COUNT(*) FROM {table}") == [(0,)]
+
+
 def test_existing_transaction_id_rolls_back_new_rows(tmp_path: Path):
     db_path = tmp_path / "advisor.sqlite"
     first = write_ledger(

@@ -15,7 +15,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from advisor import paths as advisor_paths
@@ -50,6 +50,12 @@ _LEDGER_ORDER_BY = "account_id, trade_date, transaction_id"
 _MAX_LEDGER_REPLAY_ROWS = 10_000
 _MAX_IMPORT_TRANSACTIONS = _MAX_LEDGER_REPLAY_ROWS
 _MAX_LEDGER_FIELD_LENGTH = 4096
+_LEDGER_PAYLOAD_KEYS = frozenset({
+    "transaction_id", "account_id", "trade_date", "transaction_type", "code",
+    "quantity", "price", "amount", "fees",
+})
+_REQUIRED_LEDGER_PAYLOAD_KEYS = _LEDGER_PAYLOAD_KEYS - {"account_id", "code"}
+_MAX_LEDGER_PAYLOAD_KEYS = len(_LEDGER_PAYLOAD_KEYS)
 _MAX_CHART_BYTES = 5 * 1024 * 1024
 _MAX_CURRENT_RUN_CANDIDATES = 100
 _MAX_CURRENT_QUALITY_CHECKS = 100
@@ -211,7 +217,7 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
                 connection.close()
 
     @app.post("/api/ledger/transactions", status_code=201)
-    def add_ledger_transaction(payload: dict) -> dict:
+    def add_ledger_transaction(payload: object = Body(...)) -> dict:
         try:
             account_id, transaction = _transaction_from_payload(payload)
             return _write_ledger_transactions(resolved_db_path, [(account_id, transaction)], "manual")
@@ -223,11 +229,10 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
             raise HTTPException(status_code=409, detail=str(error)) from None
 
     @app.post("/api/ledger/import", status_code=201)
-    def import_ledger_transactions(payload: list[dict]) -> dict:
-        if len(payload) > _MAX_IMPORT_TRANSACTIONS:
-            raise HTTPException(status_code=422, detail="too many transactions")
+    def import_ledger_transactions(payload: object = Body(...)) -> dict:
         try:
-            transactions = [_transaction_from_payload(item) for item in payload]
+            rows = _validate_ledger_import_shape(payload)
+            transactions = [_transaction_from_payload(item) for item in rows]
             return _write_ledger_transactions(resolved_db_path, transactions, "import")
         except _LedgerValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
@@ -479,17 +484,7 @@ def _read_capped_ledger_history(connection: sqlite3.Connection) -> list[sqlite3.
 
 
 def _transaction_from_payload(payload: object) -> tuple[str, LedgerTransaction]:
-    if not isinstance(payload, dict):
-        raise _LedgerValidationError("invalid transaction")
-    if any(
-        isinstance(value, str) and len(value) > _MAX_LEDGER_FIELD_LENGTH
-        for value in (*payload.keys(), *payload.values())
-    ):
-        raise _LedgerValidationError("ledger field is too long")
-    allowed = {"transaction_id", "account_id", "trade_date", "transaction_type", "code", "quantity", "price", "amount", "fees"}
-    required = allowed - {"account_id", "code"}
-    if set(payload) - allowed or not required <= set(payload):
-        raise _LedgerValidationError("invalid transaction")
+    _validate_ledger_row_shape(payload)
     account_id = payload.get("account_id", "default")
     if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
         raise _LedgerValidationError("invalid account")
@@ -508,6 +503,33 @@ def _transaction_from_payload(payload: object) -> tuple[str, LedgerTransaction]:
     except ValueError as error:
         raise _LedgerValidationError("invalid transaction") from error
     return account_id, transaction
+
+
+def _validate_ledger_import_shape(payload: object) -> list[dict]:
+    if not isinstance(payload, list):
+        raise _LedgerValidationError("invalid ledger request shape")
+    if len(payload) > _MAX_IMPORT_TRANSACTIONS:
+        raise _LedgerValidationError("too many transactions")
+    for row in payload:
+        _validate_ledger_row_shape(row)
+    return payload
+
+
+def _validate_ledger_row_shape(payload: object) -> None:
+    if not isinstance(payload, dict) or len(payload) > _MAX_LEDGER_PAYLOAD_KEYS:
+        raise _LedgerValidationError("invalid ledger request shape")
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            raise _LedgerValidationError("invalid ledger request shape")
+        if len(key) > _MAX_LEDGER_FIELD_LENGTH or (
+            isinstance(value, str) and len(value) > _MAX_LEDGER_FIELD_LENGTH
+        ):
+            raise _LedgerValidationError("ledger field is too long")
+        if isinstance(value, (dict, list)):
+            raise _LedgerValidationError("invalid ledger request shape")
+    keys = set(payload)
+    if keys - _LEDGER_PAYLOAD_KEYS or not _REQUIRED_LEDGER_PAYLOAD_KEYS <= keys:
+        raise _LedgerValidationError("invalid ledger request shape")
 
 
 def _write_ledger_transactions(

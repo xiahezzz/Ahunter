@@ -99,6 +99,14 @@ def validate_ledger_transaction(transaction: LedgerTransaction) -> None:
         raise ValueError("cash outflow must be negative")
 
 
+def validate_ledger_state(state: LedgerState) -> None:
+    if not all(
+        _finite_number(value)
+        for value in (state.cash, state.realized_pnl, *state.cost_basis.values())
+    ):
+        raise ValueError("non-finite ledger state")
+
+
 def _require_code(tx: LedgerTransaction) -> str:
     if tx.code is None:
         raise ValueError(f"{tx.transaction_type} transaction requires code")
@@ -141,4 +149,5 @@ def apply_transactions(transactions: list[LedgerTransaction]) -> LedgerState:
                 state.cost_basis[code] = prior_cost - sold_cost
         else:
             raise ValueError(f"unsupported transaction_type: {tx.transaction_type}")
+    validate_ledger_state(state)
     return state

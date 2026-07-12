@@ -1202,6 +1202,95 @@ def test_ledger_import_is_atomic_for_bounded_validated_json_lists(tmp_path):
     assert [row["transaction_id"] for row in current.json()["transactions"]] == ["buy-1", "cash-1"]
 
 
+def test_ledger_import_rejects_non_finite_replayed_cash_atomically(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        "/api/ledger/import",
+        json=[
+            {"transaction_id": "deposit-1", "trade_date": "2026-07-09", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 1e308, "fees": 0},
+            {"transaction_id": "deposit-2", "trade_date": "2026-07-10", "transaction_type": "cash_deposit", "quantity": 0, "price": 0, "amount": 1e308, "fees": 0},
+        ],
+    )
+
+    assert response.status_code == 422
+    connection = sqlite3.connect(db_path)
+    for table in ("ledger_transactions", "positions", "portfolio_snapshots"):
+        assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+    connection.close()
+
+
+@pytest.mark.parametrize("nested", [["unexpected"], {"unexpected": True}])
+def test_ledger_import_rejects_nested_values_before_database_write(tmp_path, nested):
+    db_path = tmp_path / "advisor.sqlite"
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        "/api/ledger/import",
+        json=[
+            {
+                "transaction_id": "deposit-1",
+                "trade_date": "2026-07-09",
+                "transaction_type": "cash_deposit",
+                "quantity": 0,
+                "price": 0,
+                "amount": 1,
+                "fees": 0,
+                "unknown": nested,
+            }
+        ],
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid ledger request shape"
+    assert not db_path.exists()
+
+
+def test_ledger_import_rejects_huge_unknown_field_before_database_write(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(web_api, "_MAX_LEDGER_FIELD_LENGTH", 16)
+    db_path = tmp_path / "advisor.sqlite"
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        "/api/ledger/import",
+        json=[
+            {
+                "transaction_id": "deposit-1",
+                "trade_date": "2026-07-09",
+                "transaction_type": "cash_deposit",
+                "quantity": 0,
+                "price": 0,
+                "amount": 1,
+                "fees": 0,
+                "unknown": "x" * 17,
+            }
+        ],
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "ledger field is too long"
+    assert not db_path.exists()
+
+
+def test_ledger_import_rejects_rows_over_key_limit_before_database_write(tmp_path):
+    db_path = tmp_path / "advisor.sqlite"
+    row = {
+        "transaction_id": "deposit-1",
+        "trade_date": "2026-07-09",
+        "transaction_type": "cash_deposit",
+        "quantity": 0,
+        "price": 0,
+        "amount": 1,
+        "fees": 0,
+    }
+    row.update({f"unknown-{index}": index for index in range(3)})
+
+    response = TestClient(create_app(tmp_path, db_path=db_path)).post(
+        "/api/ledger/import", json=[row]
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid ledger request shape"
+    assert not db_path.exists()
+
+
 def test_ledger_rejects_backdated_sell_using_canonical_replay_order(tmp_path):
     client = TestClient(create_app(tmp_path))
     assert client.post(

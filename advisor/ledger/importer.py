@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -20,6 +21,7 @@ from advisor.ledger.model import (
     LedgerTransaction,
     apply_transactions,
     ledger_transaction_sort_key,
+    validate_ledger_state,
     validate_ledger_transaction,
 )
 from advisor.paths import repo_root
@@ -360,16 +362,28 @@ def _materialize_grouped_accounts(
     snapshot_source: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     snapshots: dict[str, dict[str, Any]] = {}
+    prepared: dict[str, tuple[LedgerState, LedgerState, list[dict[str, object]], dict]] = {}
     cutoff = as_of.date().isoformat()
     for account_id in account_ids:
         transactions = sorted(grouped[account_id], key=ledger_transaction_sort_key)
         full_state = apply_transactions(transactions)
-        _replace_positions(connection, account_id, full_state, as_of.isoformat())
         snapshot_transactions = [item for item in transactions if item.trade_date <= cutoff]
         snapshot_state = apply_transactions(snapshot_transactions)
         quality_flags = _ledger_quality_flags(snapshot_transactions)
+        rows = [
+            {"code": code, "quantity": quantity, "cost_basis": snapshot_state.cost_basis[code]}
+            for code, quantity in sorted(snapshot_state.positions.items())
+        ]
+        exposure = _exposure_for_positions(connection, rows, cutoff)
+        _snapshot_totals(snapshot_state, exposure)
+        prepared[account_id] = (full_state, snapshot_state, quality_flags, exposure)
+
+    for account_id in account_ids:
+        full_state, snapshot_state, quality_flags, exposure = prepared[account_id]
+        _replace_positions(connection, account_id, full_state, as_of.isoformat())
         snapshots[account_id] = _persist_snapshot(
-            connection, account_id, as_of, snapshot_state, quality_flags, snapshot_source
+            connection, account_id, as_of, snapshot_state, quality_flags, snapshot_source,
+            exposure,
         )
     return snapshots
 
@@ -443,14 +457,9 @@ def _persist_snapshot(
     state: LedgerState,
     quality_flags: Sequence[dict[str, object]],
     snapshot_source: str | None,
+    exposure: dict[str, dict[str, float | int | str | None]],
 ) -> dict[str, Any]:
-    rows = [
-        {"code": code, "quantity": quantity, "cost_basis": state.cost_basis[code]}
-        for code, quantity in sorted(state.positions.items())
-    ]
-    exposure = _exposure_for_positions(connection, rows, as_of.date().isoformat())
-    market_value = sum(float(item["market_value"]) for item in exposure.values())
-    unrealized_pnl = sum(float(item["unrealized_pnl"]) for item in exposure.values())
+    market_value, unrealized_pnl = _snapshot_totals(state, exposure)
     payload = {
         "positions": exposure,
         "pricing_status": (
@@ -496,6 +505,18 @@ def _persist_snapshot(
     }
 
 
+def _snapshot_totals(
+    state: LedgerState,
+    exposure: dict[str, dict[str, float | int | str | None]],
+) -> tuple[float, float]:
+    validate_ledger_state(state)
+    market_value = sum(float(item["market_value"]) for item in exposure.values())
+    unrealized_pnl = sum(float(item["unrealized_pnl"]) for item in exposure.values())
+    if not all(math.isfinite(value) for value in (market_value, unrealized_pnl)):
+        raise ValueError("non-finite ledger snapshot")
+    return market_value, unrealized_pnl
+
+
 def _exposure_for_positions(
     connection: sqlite3.Connection,
     rows: Sequence[sqlite3.Row | dict],
@@ -516,12 +537,15 @@ def _exposure_for_positions(
         ).fetchone()
         price = float(price_row[0]) if price_row is not None else None
         market_value = quantity * price if price is not None else 0.0
+        unrealized_pnl = market_value - cost_basis if price is not None else 0.0
+        if not all(math.isfinite(value) for value in (cost_basis, market_value, unrealized_pnl)):
+            raise ValueError("non-finite ledger exposure")
         exposure[code] = {
             "quantity": quantity,
             "cost_basis": cost_basis,
             "market_price": price,
             "market_value": market_value,
-            "unrealized_pnl": market_value - cost_basis if price is not None else 0.0,
+            "unrealized_pnl": unrealized_pnl,
             "pricing_status": "passed" if price is not None else "missing_price",
         }
     return exposure
