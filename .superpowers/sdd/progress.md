@@ -18,3 +18,5 @@ Task 14: complete (commits 4ca7e04..7f04281, review clean after operational DB a
 Task 15: complete (commits 7f04281..10bd8f0, review clean after MX authorization provenance, sensitive ID filtering, and independently computed calendar authority fixes; minor: weekday-only calendar precision risk remains for holidays/makeup sessions)
 
 Task 16: complete (commits c0d6317..665d036, review clean after coordinator operating contract, review linkage, report visibility, consistency, CLI, profile, chart, and bounded API fixes; live browser screenshot QA skipped per user instruction)
+
+Task 17: complete (commits 35886e1..5be058d, review clean after durable ledger store, bounded imports/API bodies, canonical replay, portfolio snapshots, durable advice-trade projection, CSV decoder/header/capacity fixes, and bounded review context; browser screenshot QA skipped per user instruction)
