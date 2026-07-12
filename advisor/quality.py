@@ -99,6 +99,21 @@ def evaluate_run_quality(
     return result
 
 
+def persist_quality_results(
+    connection: sqlite3.Connection,
+    request: QualityRequest,
+    results: tuple[QualityResult, ...],
+) -> None:
+    """Persist an already evaluated or coordinator-adjusted set of checks."""
+    if not isinstance(request, QualityRequest) or not _valid_run_id(request.run_id):
+        raise ValueError("invalid quality request")
+    if not isinstance(results, tuple) or not results or not all(
+        isinstance(result, QualityResult) for result in results
+    ):
+        raise ValueError("quality results are missing or invalid")
+    _persist_checks(connection, request, results)
+
+
 def _validate_request(request: object) -> tuple[bool, str]:
     if not isinstance(request, QualityRequest):
         return False, "quality request is missing or invalid"
