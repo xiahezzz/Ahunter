@@ -204,6 +204,107 @@ git diff --check
 
 No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
 
+## Final CSV Import Contract Fix
+
+Implementation commit: `1dc8834`
+
+Required commit subject: `fix: enforce ledger csv import contract`
+
+### Summary
+
+- Enforced the public `import_ledger_csv(db_path, csv_path, *, account_id=...)` contract by making `account_id` required and keyword-only.
+- Removed suffix-based reversed-order compatibility so the first positional path is always the database and the second is always the CSV data file.
+- Updated direct CSV import tests and API parity tests to use the required order explicitly.
+
+### RED Evidence
+
+Missing required `account_id` and suffix-based path swapping initially failed as expected:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_import_ledger_csv_requires_account_id_keyword tests/advisor/test_ledger.py::test_import_ledger_csv_does_not_swap_paths_based_on_suffix -q
+FF                                                                       [100%]
+Failed: DID NOT RAISE TypeError
+FileNotFoundError: [Errno 2] No such file or directory: '.../advisor.csv'
+2 failed in 0.31s
+```
+
+### GREEN Evidence
+
+Focused contract tests after removing compatibility:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py::test_import_ledger_csv_requires_account_id_keyword tests/advisor/test_ledger.py::test_import_ledger_csv_does_not_swap_paths_based_on_suffix -q
+..                                                                       [100%]
+2 passed in 0.27s
+```
+
+Ledger import suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py -q
+............................                                             [100%]
+28 passed in 0.44s
+```
+
+### Verification
+
+Required focused matrix:
+
+```text
+.venv311/bin/python -m pytest tests/advisor/test_ledger.py tests/advisor/test_web_api.py tests/advisor/test_coordinator.py tests/advisor/test_quality_gate.py -q
+........................................................................ [ 38%]
+........................................................................ [ 76%]
+.............................................                            [100%]
+189 passed in 5.61s
+```
+
+Complete advisor suite:
+
+```text
+.venv311/bin/python -m pytest tests/advisor -q
+........................................................................ [ 16%]
+........................................................................ [ 32%]
+........................................................................ [ 48%]
+........................................................................ [ 64%]
+........................................................................ [ 80%]
+........................................................................ [ 96%]
+.................                                                        [100%]
+449 passed in 7.88s
+```
+
+Offline collector self-test:
+
+```text
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+tests 133
+pass 133
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 506.465125
+```
+
+Static verification before the code commit:
+
+```text
+git diff --check
+<no output; exit 0>
+```
+
+No live smoke test, browser screenshot QA, MX page operation, collector start, RID change, broker action, or order action was performed.
+
+### Changed Files
+
+- `advisor/ledger/importer.py`
+- `tests/advisor/test_ledger.py`
+- `tests/advisor/test_web_api.py`
+- `.superpowers/sdd/task-17-report.md`
+
+### Concerns
+
+Pre-existing untracked `.venv311` and `__pycache__` paths remain untouched and are not included in the final contract-fix commits.
+
 ## Final Interface/Boundary Fixes
 
 ### RED Evidence
