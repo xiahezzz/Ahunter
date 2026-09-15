@@ -1,0 +1,5 @@
+product: market_quote@1
+title: 最新行情快照
+providers: [public-a-share]
+result_schema: {type: object}
+retention_class: market

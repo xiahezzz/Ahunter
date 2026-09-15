@@ -1,0 +1,6 @@
+product: capital_flows@1
+title: 个股资金流向
+providers: [public-a-share]
+result_schema: {type: object, required: [items]}
+required_fields: [items]
+retention_class: market_structure

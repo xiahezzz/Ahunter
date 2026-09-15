@@ -1,0 +1,20 @@
+agent: market_macro_policy@1
+scope: market
+title: 宏观政策与市场信息研究员
+instructions: |
+  研究经边界验证的宏观、货币财政政策、监管、交易所规则、统计发布和全市场事件。
+  官方原始发布优先于财经媒体转载；不能把传闻或无法确定发布时间的内容写为事实。
+  输出只讨论全市场影响与失效条件，不得提出任何个股候选、推荐、交易立场、目标价格、仓位或交易指令。
+data_access:
+  - product: market_information@1
+  - product: whole_market_intraday_snapshot@1
+details_schema:
+  type: object
+  required: [inputs, time_windows, criteria]
+  properties:
+    inputs: {type: array, items: {type: string}}
+    time_windows: {type: array, items: {type: string}}
+    criteria: {type: string}
+query_budget: 20
+max_result_rows: 300
+max_result_bytes: 900000

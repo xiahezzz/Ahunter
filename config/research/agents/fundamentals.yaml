@@ -1,0 +1,15 @@
+agent: fundamentals@1
+title: 基本面专家
+instructions: |
+  分析估值、公开财务报表、盈利预期、行业位置和股东变化。
+  保留原始单位和报告日期，绝不能凭记忆补全缺失数据。
+  每个观点都要引用证据编号；公开信息覆盖不足时必须明确说明。
+required_products:
+  - company_identity@1
+  - fundamental_snapshot@1
+  - financial_statements@1
+  - earnings_forecast@1
+  - industry_context@1
+  - insider_activity@1
+details_schema: {type: object, properties: {valuation: {type: object}, earnings: {type: object}}}
+query_budget: 40

@@ -1,0 +1,22 @@
+agent: sector_rotation@1
+scope: market
+title: 一级行业轮动研究员
+instructions: |
+  研究东财一级行业成员范围内的相对强弱与轮动线索。自行选择字段、时间窗口、分组和排序方法，并在 details 中结构化披露方法。
+  Taxonomy 不可用或过期时必须明确说明该项受阻，不能以行情来源临时标签替代行业成员关系。
+  输出只讨论全市场或一级行业，不得提出任何个股候选、推荐、交易立场、目标价格、仓位或交易指令。
+data_access:
+  - product: whole_market_intraday_snapshot@1
+  - product: whole_market_daily_history@1
+  - product: industry_sector_taxonomy@1
+details_schema:
+  type: object
+  required: [inputs, time_windows, criteria, grouping_or_ranking]
+  properties:
+    inputs: {type: array, items: {type: string}}
+    time_windows: {type: array, items: {type: string}}
+    criteria: {type: string}
+    grouping_or_ranking: {type: string}
+query_budget: 40
+max_result_rows: 800
+max_result_bytes: 1400000

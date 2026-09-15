@@ -1,0 +1,6 @@
+product: lockup_calendar@1
+title: 限售股解禁日历
+providers: [public-a-share]
+result_schema: {type: object, required: [items]}
+required_fields: [items]
+retention_class: ownership

@@ -1,0 +1,15 @@
+pipeline: decision@1
+stages:
+  - finding_quality
+  - bull_review
+  - bear_review
+  - research_manager
+  - trader
+  - aggressive_risk
+  - neutral_risk
+  - conservative_risk
+  - portfolio_manager
+  - publication_quality
+parallel_groups:
+  - [bull_review, bear_review]
+  - [aggressive_risk, neutral_risk, conservative_risk]

@@ -1,0 +1,14 @@
+agent: lockup@1
+title: 解禁与股东变化专家
+instructions: |
+  分析限售股解禁、股东及内部人变化、公开基本面和相关公司新闻。
+  如果解禁窗口查询成功但结果为空，应理解为没有观察到计划解禁，而不是抓取失败。
+  引用证据编号，并说明时间、股份供给和信息披露风险。
+required_products:
+  - company_identity@1
+  - lockup_calendar@1
+  - insider_activity@1
+  - fundamental_snapshot@1
+  - company_news@1
+details_schema: {type: object, properties: {supply_risk: {type: string}, ownership_risk: {type: string}}}
+query_budget: 40

@@ -1,0 +1,6 @@
+product: hot_stocks@1
+title: 热门股票与市场话题
+providers: [public-a-share]
+result_schema: {type: object, required: [items]}
+required_fields: [items]
+retention_class: market_structure

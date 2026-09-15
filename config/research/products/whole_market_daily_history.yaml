@@ -1,0 +1,8 @@
+product: whole_market_daily_history@1
+title: 本地全市场日线历史与停牌事实
+providers: [local-market]
+result_schema:
+  type: object
+  required: [rows, absences, securities, sessions, snapshot_proof]
+required_fields: [rows, absences, securities, sessions, snapshot_proof]
+retention_class: market

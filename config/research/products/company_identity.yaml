@@ -1,0 +1,6 @@
+product: company_identity@1
+title: 股票基本信息
+providers: [public-a-share]
+result_schema: {type: object, required: [code]}
+required_fields: [code]
+retention_class: standard

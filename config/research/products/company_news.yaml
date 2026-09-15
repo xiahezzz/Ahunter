@@ -1,0 +1,6 @@
+product: company_news@1
+title: 公司新闻与公告
+providers: [public-a-share]
+result_schema: {type: object, required: [items]}
+required_fields: [items]
+retention_class: information

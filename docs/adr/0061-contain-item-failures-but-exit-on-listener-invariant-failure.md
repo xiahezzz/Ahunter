@@ -1,0 +1,3 @@
+# Contain item failures but exit on Listener invariant failure
+
+The MX Listener Service remains alive while Chrome or the authorized page is unavailable, retries transient CDP failures with bounded backoff, and contains invalid RID configuration, individual frame-decode failures, and individual media failures so other authorized events can still be processed. It exits for failures that make service-level correctness unverifiable—an unavailable event store, lost exclusive lease, or failed heartbeat persistence—so LaunchAgent may restart it with throttling instead of leaving an apparently live process that cannot guarantee single-instance durable collection.

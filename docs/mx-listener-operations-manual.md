@@ -1,306 +1,125 @@
-# MX Listener Operations Manual
+# MX Listener 运维手册
 
-This manual is the routine operating procedure for the authorized, passive MX listener on this Mac. Run commands from Terminal in the order shown. No source-code knowledge is required.
+MX Listener 是本机常驻的被动资讯监听服务。它只通过 Chrome DevTools 的网络事件读取用户已经打开、登录并授权的 MX 页面；Listener 本身不会打开 Chrome、导航页面、刷新、点击、输入、注入代码或请求凭据。WebUI 另有一个由用户显式点击的“启动专用 Chrome”动作，也可按用户请求执行 `ahunter mx chrome start` 调用同一接口，它只打开固定的隔离 Chrome，不打开任何网址，也不参与 Listener 自动恢复。日常操作使用本地 WebUI 或 `advisor-services`，不再以前台 `run-collector` 进程作为日常入口。
 
-## 1. Safety rules and fixed paths
+## 安全边界
 
-| Item | Fixed value |
-| --- | --- |
-| Project root | `/Users/mac/Documents/Ahunter/a_hunter` |
-| Node binary | `/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node` |
-| Dedicated Chrome profile | `$HOME/.chrome-mx-debug-profile` |
-| Chrome DevTools (CDP) port | `9333` |
-| Event database | `data/state/events.sqlite` |
-| Downloaded media | `data/media/` |
-| RID configuration | `config/allowed-rids.yaml` |
-| MX page | `https://mx.2026.naaifu.cn/` |
+- 只有用户可以提供和授权 RID；不得从流量、历史记录或页面内容推断、添加 RID。
+- `allowed_rids: []` 是有效的停用状态：不会接收新内容或下载新图片，但不会删除既有历史。
+- 不记录或展示凭据、Cookie、会话令牌、原始 Socket 帧、浏览器调试标识、来源 URL 或本地媒体路径。
+- 不要用 `sudo` 运行服务、测试、备份或浏览器。不要手工删除事件库、媒体、旧 PID 文件或 LaunchAgent。
+- 只有用户显式启动专用浏览器、自行登录并打开 MX 页面后，服务才可能进入监听状态；等待不是故障，也不需要页面自动化来“修复”。
 
-New downloads are grouped by the parent event's Beijing calendar date as
-`data/media/YYYY-MM-DD/<content-hash>.<extension>`. Older rows may still point
-to legacy hash-prefix directories. During this incremental transition, use
-`media.local_path` as the authoritative location; do not move legacy files by
-hand.
+项目根目录为 `/Users/mac/Documents/Ahunter/a_hunter`，离线检查使用 `/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node`。以下命令均从项目根目录执行。
 
-- Do not use `sudo` to start Chrome, run tests, start the collector, inspect data, or make backups. It can create root-owned files that the normal user cannot update.
-- Keep the dedicated Chrome application and the logged-in MX page open for the entire collection session. Do not use that dedicated window for unrelated browsing.
-- A command that stays in the foreground can be stopped with `Ctrl-C`. Use `Ctrl-C` for the collector's normal shutdown; do not force-stop it.
-- The listener only records authorized inbound data. Only put a RID in the configuration when the user has explicitly authorized it.
+## 日常查看、启动和停止
 
-## 2. First-time setup
-
-### 2.1 Open the project
-
-All later commands assume this working directory:
+本地 WebUI 的“MX 监听”页面和 CLI 使用同一服务集。读取状态不会启动服务、接触浏览器、改 RID 或改历史。
 
 ```bash
-cd /Users/mac/Documents/Ahunter/a_hunter
+./.venv-runtime/bin/advisor-services status
 ```
 
-### 2.2 Configure the authorized RID
+需要浏览器且用户已请求启动时，在 WebUI 点击“启动专用 Chrome”或显式执行 `rtk ahunter mx chrome start`。该按钮使用项目固定的 Chrome、loopback 调试配置和隔离 profile；重复点击时若专用实例已就绪则不会再启动。它不接收网址，不会替用户登录或打开 MX 页面。Chrome 窗口出现后，由用户自行登录并打开已授权的 MX 页面。
 
-`config/allowed-rids.yaml` must contain an array of positive integers. This is the valid one-line form:
-
-```yaml
-allowed_rids: [123]
-```
-
-Here, `123` only demonstrates the required YAML form. The user must supply the actual positive integer RID; do not infer one from traffic or copy this example unless that value is explicitly authorized. `allowed_rids: []` is valid and deliberately records nothing.
-
-The running collector watches this file. It reloads a valid configuration when an editor performs an atomic replacement (write a new file and rename it over the old one). An invalid or unreadable replacement fails closed to an empty allowlist, so it records nothing until a valid configuration is installed.
-
-### 2.3 Start dedicated Chrome and log in
-
-Start a separate Chrome instance with the fixed profile and CDP port:
+若本机已完成服务安装，可在 WebUI 点击“启动 MX Listener”或执行：
 
 ```bash
-open -na "Google Chrome" --args \
-  --remote-debugging-port=9333 \
-  --user-data-dir="$HOME/.chrome-mx-debug-profile"
+./.venv-runtime/bin/advisor-services start mx-listener
 ```
 
-In that dedicated Chrome window, open exactly `https://mx.2026.naaifu.cn/` and log in. Leave both Chrome and the MX tab open.
-
-### 2.4 Check Chrome DevTools
-
-These commands bypass shell proxy settings for the local endpoint:
+停止可在 WebUI 点击“停止 MX Listener”或执行：
 
 ```bash
-curl --noproxy '*' -sS http://127.0.0.1:9333/json/version
-curl --noproxy '*' -sS http://127.0.0.1:9333/json/list
+./.venv-runtime/bin/advisor-services stop mx-listener
 ```
 
-Success evidence:
+`start`/`stop` 对同一状态幂等。停止会卸载 Listener 并等待其租约释放；不会关闭 Chrome、修改 RID 或删除资讯。Market Daily 是独立服务，不受这些命令影响。
 
-- `/json/version` returns JSON containing `webSocketDebuggerUrl`.
-- `/json/list` returns a page target whose `url` is the exact MX URL `https://mx.2026.naaifu.cn/` and which has a `webSocketDebuggerUrl`.
+### 三维状态
 
-Do not copy or share debugger URLs; they are only success evidence in the local terminal.
+- 存活性：`live` 表示当前实例持有有效租约；`offline` 表示未观察到有效租约。
+- 就绪性：`waiting_for_chrome` 等待用户自行准备 Chrome，`waiting_for_authorization` 等待用户自行登录并打开 MX 页面，`connecting` 正在被动重连，`listening` 正在被动监听，`stopping` 正在停止。
+- 健康度：`healthy` 正常；`degraded` 表示可恢复的配置、维护或睡眠抑制问题；`failed` 表示本地状态不可安全使用，需要排查。
 
-### 2.5 Run the offline self-test
+只有进入 `listening` 时服务才持有防休眠 assertion；离开该状态会释放它。没有新消息本身不会被标为故障。
+
+## 首次安装与首次启动
+
+首次安装会渲染并写入用户的 LaunchAgent，因此必须先得到用户明确许可。安装前先创建运行环境并运行离线自检：
 
 ```bash
-/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
+/opt/local/bin/python3.11 -m advisor.runtime_env
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  NO_PROXY='*' no_proxy='*' \
+  /bin/zsh -f -c '/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs'
 ```
 
-Proceed only when the summary reports exactly `114` passing tests and no failures.
+首次上线还需要迁移 Listener 控制面与安全文本 FTS。先运行只读核验；它只输出业务表计数、关联异常计数和有限 Schema 状态，不输出 RID、正文、URL、路径或行指纹：
 
-### 2.6 Quarantine legacy output once
+```bash
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node \
+  scripts/migrate-listener-schema.mjs \
+  --check \
+  --database data/state/events.sqlite
+```
 
-Before the first-ever collector start, run this one-time preservation step:
+只有在用户已明确许可真实迁移、Listener 没有有效租约，并且以下旧 Collector 进程检查没有结果时，才能执行写入：
+
+```bash
+pgrep -fl '[r]un-collector.mjs|[r]un-mx-listener-service.mjs'
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node \
+  scripts/migrate-listener-schema.mjs \
+  --apply \
+  --database data/state/events.sqlite
+/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node \
+  scripts/migrate-listener-schema.mjs \
+  --check \
+  --database data/state/events.sqlite
+```
+
+`--apply` 在一个写事务内重新采集基线并验证全部既有业务行的私有指纹；任何业务表计数、内容、事件—媒体关联或内容哈希发生变化都会回滚。它也会拒绝有效 Listener 租约。完成后的只读核验必须显示完整性正常、关联异常均为零、控制面与搜索就绪且无需迁移。遗留 `collector-guardian.pid` 仅作记录，不删除，也不作为进程或租约权威。
+
+仅在首次真实启动前，且确认要保留遗留解码输出时，运行一次：
 
 ```bash
 /Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/quarantine-legacy-output.mjs
 ```
 
-A safe result reports either `No legacy output to quarantine` or the quarantine destination. This command preserves any legacy output by moving it aside; it does not decode or import that output. Do not repeat it as part of daily startup.
-
-## 3. Daily startup checklist
-
-Repeat these steps after a restart or whenever beginning a collection session:
-
-1. Open Terminal and enter the project root:
-
-   ```bash
-   cd /Users/mac/Documents/Ahunter/a_hunter
-   ```
-
-2. Start dedicated Chrome if it is not already open:
-
-   ```bash
-   open -na "Google Chrome" --args \
-     --remote-debugging-port=9333 \
-     --user-data-dir="$HOME/.chrome-mx-debug-profile"
-   ```
-
-3. Open `https://mx.2026.naaifu.cn/` in that dedicated profile, confirm that it is logged in, and leave the page open.
-
-4. Verify CDP and the MX page:
-
-   ```bash
-   curl --noproxy '*' -sS http://127.0.0.1:9333/json/version
-   curl --noproxy '*' -sS http://127.0.0.1:9333/json/list
-   ```
-
-   Confirm `webSocketDebuggerUrl` in `/json/version` and the exact MX URL in `/json/list`.
-
-5. Run the self-test:
-
-   ```bash
-   /Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs
-   ```
-
-   Confirm exactly `114` passing tests.
-
-6. In a terminal that can remain open, start the collector:
-
-   ```bash
-   caffeinate -i \
-     /Users/mac/.local/share/chrome-devtools-mcp/node/bin/node \
-     scripts/run-collector.mjs \
-     --cdp http://127.0.0.1:9333
-   ```
-
-Success means the process remains in the foreground without repeatedly printing errors. A quiet collector terminal is normal: accepted messages are stored rather than printed. Leave this terminal, dedicated Chrome, and the MX page open. `caffeinate -i` prevents idle system sleep while the command runs, but keep the laptop lid open and connect power for long sessions.
-
-## 4. View recorded information
-
-Open a second Terminal window, enter the project root, and use the following read-only commands. The database uses SQLite WAL mode, so these queries are safe while the collector is running.
-
-### Total accepted events
+得到许可后，安装并加载：
 
 ```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT count(*) AS event_count FROM events;"
+./.venv-runtime/bin/advisor-services install mx-listener
+./.venv-runtime/bin/advisor-services load mx-listener
+./.venv-runtime/bin/advisor-services status
 ```
 
-### Most recent decoded text
+安装或加载并不启动、登录或操作 Chrome。用户可在 WebUI 显式点击“启动专用 Chrome”或请求执行 `ahunter mx chrome start`，然后自行登录并停留在已授权的 MX 页面；随后从 WebUI 或 `advisor-services start mx-listener` 请求启动 Listener。两个动作彼此独立，先后顺序不影响最终自动连接。不要把浏览器调试信息复制到终端记录、工单或聊天中。
 
-```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT rid,
-        datetime(received_at / 1000, 'unixepoch', 'localtime') AS received_time,
-        decoded_text
- FROM events
- ORDER BY received_at DESC
- LIMIT 20;"
-```
+## RID 编辑与历史资讯
 
-### Ingestion counters
+在 WebUI 的“MX 监听”页面编辑 RID：输入用户明确授权的正整数、添加或移除后点击保存。页面以当前配置版本提交；若出现冲突，刷新并人工比较后再提交。`advisor-services status` 只显示数量；统一 CLI 的 `ahunter mx rids get` 返回已授权 RID 和版本，`ahunter mx rids replace --version VERSION --rid RID` 使用该版本替换完整列表（多个 RID 重复传入 `--rid`）。发生版本冲突时先重新读取、比较，不得自动覆盖。
 
-```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT kind, sum(count) AS total
- FROM ingest_counters
- GROUP BY kind
- ORDER BY kind;"
-```
+RID 的保存是原子替换，Listener 会在下一次配置轮询时热加载。移除 RID 只改变今后的接收授权；历史事件仍可在“MX 资讯”中按“当前授权”或“已撤销”筛选、检索、分页和查看。页面只显示规范化文本和受控图片路由，不会把原始 payload、来源地址或存储路径发送到浏览器。
 
-### Recently downloaded media
+## Research 的 Agent Data Access
 
-```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT rid,
-        datetime(downloaded_at / 1000, 'unixepoch', 'localtime') AS downloaded_time,
-        content_type,
-        local_path
- FROM media
- ORDER BY downloaded_at DESC
- LIMIT 20;"
-```
+在 WebUI 的“研究配置”页面按以下顺序操作：
 
-### Media-job status
+1. 在“Data Product”查看已发布产品及其历史；这里没有 Provider 连接参数，也不会启动研究。
+2. 在“Agent Data Access”选择一个固定 Agent 版本，逐项选择 Data Product。对 `mx_events@2` 必须逐 RID 选择，不能选择“全部 RID”。
+3. 点击发布会创建新的不可变 `agent@版本`，仅改变该 Agent 的数据访问；不会改 Team，也不会启用每日研究。
+4. 如需让 Team 使用新 Agent，转到“研究团队”显式基于该 Team 创建新版本，再单独决定是否启用该版本的每日研究。
 
-```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT status, count(*) AS total
- FROM media_jobs
- GROUP BY status
- ORDER BY status;"
-```
+若某个已固定的 RID 被撤销，只有仍依赖它的 Agent/Team 会被阻断；其他 Team 继续可用。恢复方式是用户重新授权该 RID，或发布去掉该 RID 的新 Agent 版本并显式发布新的 Team 版本。历史 Agent 与 Team 不会被重写。
 
-### Database and media disk usage
+## 历史免责声明迁移核验
 
-```bash
-du -sh data/state/events.sqlite data/media 2>/dev/null
-```
+仅当用户已明确安排旧版内容迁移、并且 Listener 已停止时，才需要做这项只读核验。它只统计精确可移除位置的免责声明，不读取或输出消息正文；两个结果都必须为 `0` 才能认为迁移完成。
 
-## 5. Stop, restart, process checks, and backup
-
-### Normal shutdown
-
-In the collector terminal, press `Ctrl-C` once. The collector stops accepting new frames, gives queued event and media work up to 30 seconds to drain, and then closes the database. Wait for the command to return to the shell prompt before closing Terminal, closing Chrome, restarting, or backing up.
-
-### Non-destructive process checks
-
-Check whether something is listening on the fixed Chrome port:
-
-```bash
-lsof -nP -iTCP:9333 -sTCP:LISTEN
-```
-
-Check whether the collector process is running:
-
-```bash
-pgrep -fl 'scripts/run-collector.mjs'
-```
-
-No output means that the corresponding listener or collector process was not found.
-
-### Restart
-
-Stop the collector with `Ctrl-C`, wait for the shell prompt, resolve the reason for restarting, rerun the self-test, verify `/json/version` and `/json/list`, and then use the start-collector command in the daily checklist. Keep using the same dedicated Chrome profile and port.
-
-### Back up the database
-
-First stop the collector with `Ctrl-C` and wait for it to exit. A simple file-copy backup must not be made while the collector is running. Then run:
-
-```bash
-mkdir -p "$HOME/Documents/Ahunter-backups"
-cp -p data/state/events.sqlite \
-  "$HOME/Documents/Ahunter-backups/events-$(date +%Y%m%d-%H%M%S).sqlite"
-```
-
-This creates a timestamped database copy without changing the live database. Downloaded files are stored separately under `data/media/`; include that directory in the machine's normal backup if those files must also be retained.
-
-## 6. One-time disclaimer-content migration
-
-Run this procedure only after the updated collector and migration script have been installed. The migration rewrites normalized event text and JSON while preserving event, media, and media-job counts and associations.
-
-### Stop the collector and confirm that it is stopped
-
-In the collector terminal, press `Ctrl-C` once. Wait until the command has exited and the shell prompt has returned. Do not run the migration while the collector is running.
-
-From the project root, verify that no collector process remains:
-
-```bash
-pgrep -fl 'scripts/run-collector.mjs'
-```
-
-Proceed only if this command produces no output. If it prints a process, return to that collector terminal, stop it with `Ctrl-C`, wait for the shell prompt, and repeat the check. Do not force-stop the collector.
-
-### Record the pre-migration aggregate baseline
-
-With the collector stopped, run this read-only aggregate query and save its four numeric results with the migration record:
-
-```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT
-   (SELECT count(*) FROM events) AS events,
-   (SELECT count(*) FROM media) AS media,
-   (SELECT count(*) FROM media_jobs) AS media_jobs,
-   (SELECT count(*)
-      FROM media AS m
-      LEFT JOIN events AS e ON e.event_id = m.event_id
-     WHERE e.event_id IS NULL)
-   +
-   (SELECT count(*)
-      FROM media_jobs AS j
-      LEFT JOIN events AS e ON e.event_id = j.event_id
-     WHERE e.event_id IS NULL) AS orphans;"
-```
-
-`orphans` must be `0`. Do not run the migration if it is nonzero. The `events`, `media`, and `media_jobs` counts are the exact pre-migration baseline to compare with the migration report.
-
-### Run the migration
-
-With the collector stopped, run:
-
-```bash
-/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node \
-  scripts/migrate-disclaimer-content.mjs
-```
-
-The migration report contains aggregate counts only. Success requires `eventsBefore` to equal `eventsAfter`, `mediaBefore` to equal `mediaAfter`, `mediaJobsBefore` to equal `mediaJobsAfter`, and `orphansAfter: 0`. Do not restart the collector if any of these checks fails.
-
-Run the same migration command a second time. A successful repeated run reports `updated: 0`, showing that there was nothing left to change.
-
-### Verify the exact disclaimer is absent
-
-Run this read-only aggregate query:
-
-```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT
+```sql
+SELECT
   coalesce((
     SELECT count(*)
     FROM events AS e
@@ -315,96 +134,32 @@ sqlite3 -header -column data/state/events.sqlite \
     JOIN json_each(e.parsed_content_json, '$.texts') AS text
     WHERE text.type = 'text'
       AND trim(text.atom, char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) = '免责声明：信息来源于官方媒体/网络新闻等，仅信息分享，不作为投资建议！'
-  ), 0) AS extracted_text_matches;"
+  ), 0) AS extracted_text_matches;
 ```
 
-Both `parsed_removable_matches` and `extracted_text_matches` must be numeric zero. This query counts only exact trimmed values in removable locations: the `parsed` root, `parsed` array elements, `msg` properties, and entries in `texts`. It intentionally preserves longer strings that quote the disclaimer and exact values in non-message properties such as `attribution`.
+## 日志、备份与手工恢复
 
-### Verify event-image associations
-
-Run this read-only local query:
+仅在本机查看最近日志：
 
 ```bash
-sqlite3 -header -column data/state/events.sqlite \
-"SELECT e.event_id, e.rid,
-        datetime(e.received_at / 1000, 'unixepoch', 'localtime') AS received_time,
-        e.decoded_text, m.content_type, m.local_path
- FROM events AS e
- LEFT JOIN media AS m ON m.event_id = e.event_id AND m.rid = e.rid
- ORDER BY e.received_at DESC, m.local_path;"
+tail -n 200 logs/mx-listener.out.log
+tail -n 200 logs/mx-listener.err.log
+./.venv-runtime/bin/advisor-services status
 ```
 
-Review the results locally to confirm that downloaded media remains associated with its event and RID and has a nonempty `local_path`. An empty `decoded_text` together with a nonempty `local_path` is valid for an image-only event; it is not evidence of a failed migration.
-
-Restart the collector only after the migration report, repeated-run check, exact-disclaimer query, and event-image association review all succeed.
-
-## 7. Troubleshooting by symptom
-
-### `Collector connection failed (Error)` repeats
-
-1. Run `lsof -nP -iTCP:9333 -sTCP:LISTEN` and confirm Chrome is listening.
-2. Run `curl --noproxy '*' -sS http://127.0.0.1:9333/json/version` and confirm `webSocketDebuggerUrl` appears. `--noproxy '*'` prevents a dead proxy from intercepting loopback traffic.
-3. Confirm the collector command uses exactly `--cdp http://127.0.0.1:9333`.
-4. If there is no listener, start dedicated Chrome using the daily checklist. When the checks succeed, stop the error loop with `Ctrl-C` and restart the collector.
-
-### `authorization_required`
-
-CDP is reachable, but it exposes no inspectable page target on the MX origin `https://mx.2026.naaifu.cn`. Run:
+备份前先停止 Listener 并确认状态不再显示有效租约。然后复制数据库；媒体目录交给正常的本机备份策略，不要移动文件或改写数据库中的关联。
 
 ```bash
-curl --noproxy '*' -sS http://127.0.0.1:9333/json/list
+./.venv-runtime/bin/advisor-services stop mx-listener
+mkdir -p "$HOME/Documents/Ahunter-backups"
+cp -p data/state/events.sqlite "$HOME/Documents/Ahunter-backups/events-$(date +%Y%m%d-%H%M%S).sqlite"
 ```
 
-Confirm that the list contains the exact root URL `https://mx.2026.naaifu.cn/`. In the dedicated Chrome profile, open that recommended page and log in, then leave the page open. Restart the collector after the target appears in `/json/list`.
+Mac 重启、登录失效或连接中断后的手工恢复步骤是：
 
-### The collector stays quiet
+1. 用 `advisor-services status` 读取三维状态；如果服务仍在运行，先用 WebUI 或 CLI 停止。
+2. 用上面的无代理新 shell 运行离线自检；失败时保持停止状态并先修复。
+3. 由用户在 WebUI 显式启动专用 Chrome，或按用户请求执行 `ahunter mx chrome start`；用户自行恢复登录状态和 MX 页面；不要让 Listener、脚本或启动器代替用户操作页面。
+4. 从 WebUI 或 CLI 启动 Listener，并观察状态从等待转为 `listening`；如果仍在等待，保留服务运行即可。
 
-Quiet operation is normal because accepted events are written to SQLite rather than printed. Run the total-event and ingestion-counter queries in section 4. If the values do not change when authorized inbound activity is expected, verify that `config/allowed-rids.yaml` contains the user-authorized RID and that the MX page remains open and logged in in the dedicated profile.
-
-### No data with `allowed_rids: []`
-
-An empty allowlist intentionally records nothing. Add only a positive integer RID explicitly supplied and authorized by the user, using the valid YAML form in section 2. Never infer a RID from observed traffic.
-
-### Permission denied or root-owned files after `sudo`
-
-This is exceptional recovery for files created by prior `sudo` use, not a routine startup step. First stop the collector with `Ctrl-C`, wait for it to exit, and recursively list root-owned entries under both storage paths when present:
-
-```bash
-find data/state data/media -user root -ls 2>/dev/null
-```
-
-No output means no root-owned entry was found. The error redirect keeps an optional, not-yet-created `data/media` directory from producing an error message.
-
-Do not restart until the database files under `data/state` and any downloaded files under `data/media` are writable by the normal account. After confirming that the affected files should belong to the current user and the Mac's normal `staff` group, run:
-
-```bash
-sudo chown -R "$USER":staff data/state
-if [ -e data/media ]; then sudo chown -R "$USER":staff data/media; fi
-```
-
-Then repeat the recursive `find` command. Resume all routine operation as the normal user without `sudo` only when it reports no root-owned entries. If the expected owner or group is uncertain, stop and ask the Mac administrator instead of guessing.
-
-### Collection disconnects when the display turns off
-
-Keep the laptop lid open, connect power, and start the collector with the documented `caffeinate -i` command. Turning the display off is acceptable; closing the lid can suspend the Mac and disconnect collection.
-
-### Chrome port conflict
-
-If port 9333 is already used by an unrelated process, inspect it with `lsof -nP -iTCP:9333 -sTCP:LISTEN`. Select one unused port. Use that same value in `--remote-debugging-port`, both `/json/version` and `/json/list` curl URLs, and the collector's `--cdp` URL for the entire session. Do not mix port values. Return to 9333 when the conflict is resolved so the fixed daily commands apply again.
-
-## 8. Compact command index
-
-The lifecycle sections above are authoritative; this index only points back to those same commands.
-
-| Operation | Command or section |
-| --- | --- |
-| One-time legacy quarantine | `/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/quarantine-legacy-output.mjs` — section 2.6 |
-| Start Chrome | `open -na "Google Chrome" --args --remote-debugging-port=9333 --user-data-dir="$HOME/.chrome-mx-debug-profile"` — section 3 |
-| Check CDP | `curl --noproxy '*' -sS http://127.0.0.1:9333/json/version` and `/json/list` — section 3 |
-| Self-test | `/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node scripts/self-test.mjs` — section 3 |
-| Start collector | `caffeinate -i ... scripts/run-collector.mjs --cdp http://127.0.0.1:9333` — section 3 |
-| View events | Total-event and recent-decoded-text queries — section 4 |
-| View counters | Ingestion-counter query — section 4 |
-| View media | Downloaded-media and media-job queries — section 4 |
-| Stop | Press `Ctrl-C` once and allow the 30-second drain window — section 5 |
-| Migrate disclaimer content | Stop-check, migration, repeated-run, and verification procedure — section 6 |
+若 `failed`、RID 配置不可读或租约长期不释放，保持服务停止，保存有限的状态和日志信息后再排查。不要删除旧 runtime 标记、浏览器 profile、事件、媒体、Agent/Team Manifest 或报告来“重置”。

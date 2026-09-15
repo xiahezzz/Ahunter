@@ -1,0 +1,5 @@
+product: earnings_forecast@1
+title: 盈利预测
+providers: [public-a-share]
+result_schema: {type: object}
+retention_class: fundamentals

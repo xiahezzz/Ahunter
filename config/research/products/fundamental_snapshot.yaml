@@ -1,0 +1,5 @@
+product: fundamental_snapshot@1
+title: 估值与基本面概览
+providers: [public-a-share]
+result_schema: {type: object}
+retention_class: fundamentals

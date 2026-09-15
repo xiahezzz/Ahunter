@@ -1,0 +1,5 @@
+product: financial_statements@1
+title: 财务报表
+providers: [public-a-share]
+result_schema: {type: object}
+retention_class: fundamentals

@@ -1,0 +1,7 @@
+product: mx_events@1
+title: 已通过质量检查的本地 MX 资讯
+providers: [public-a-share]
+result_schema: {type: object, required: [items]}
+required_fields: [items]
+minimum_coverage: 1.0
+retention_class: information

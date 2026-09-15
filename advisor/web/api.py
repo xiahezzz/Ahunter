@@ -1,8 +1,9 @@
-"""Read-local-state FastAPI endpoints for the advisor dashboard."""
+"""Local dashboard endpoints with bounded, durable operator actions."""
 
 import base64
 import hashlib
 import hmac
+from ipaddress import ip_address
 import json
 import math
 import os
@@ -13,12 +14,16 @@ import stat
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from advisor import paths as advisor_paths
+from advisor.config import load_advisor_config, resolve_research_artifact_dir, resolve_research_catalog
+from advisor.db.repository import connect as connect_database
 from advisor.db.migrate import migrate_database
 from advisor.ledger.importer import (
     LedgerCapacityError,
@@ -31,11 +36,63 @@ from advisor.ledger.model import (
     validate_ledger_transaction,
 )
 from advisor.ledger.store import LedgerStore
+from advisor.market_daily.control import MarketDailyControlPlane, MarketRunError
+from advisor.mx.chrome_launcher import (
+    ChromeLaunchError,
+    ChromeLauncher,
+    DedicatedChromeLauncher,
+)
+from advisor.mx.information import (
+    MxInformationCursorConflict,
+    MxInformationNotFound,
+    MxInformationStore,
+    MxInformationUnavailable,
+    MxInformationValidationError,
+)
+from advisor.mx.rid_authorization import (
+    RidAuthorizationConflict,
+    RidAuthorizationStore,
+    RidAuthorizationUnavailable,
+    RidAuthorizationValidationError,
+)
+from advisor.research.catalog import ManifestCatalog, load_catalog_from_directory
+from advisor.research.execution_settings import ExecutionSettingsService, ExecutionSettingsConflict
+from advisor.research.artifacts import ArtifactStore
+from advisor.research.contracts import ResearchScope, ResearchSubject, VersionRef
+from advisor.research.repository import ResearchRecord, ResearchRepository, ResearchRequest
+from advisor.research.agent_access_publication import (
+    AgentAccessPublicationConflict,
+    AgentAccessPublicationNotFound,
+    AgentAccessPublicationService,
+    AgentAccessPublicationStorageError,
+    AgentAccessPublicationValidationError,
+)
+from advisor.research.agent_instructions_publication import (
+    AgentInstructionsPublicationConflict,
+    AgentInstructionsPublicationNotFound,
+    AgentInstructionsPublicationService,
+    AgentInstructionsPublicationStorageError,
+    AgentInstructionsPublicationValidationError,
+)
+from advisor.research.daily_teams import (
+    DailyTeamSetNotFound,
+    DailyTeamSetService,
+    DailyTeamSetStorageError,
+    DailyTeamSetValidationError,
+)
+from advisor.research.team_publication import (
+    TeamPublicationConflict,
+    TeamPublicationNotFound,
+    TeamPublicationService,
+    TeamPublicationStorageError,
+    TeamPublicationValidationError,
+)
 from advisor.reporting.contracts import (
     StaleArchiveCursorError,
     read_active_verified_archive,
     read_verified_archive,
 )
+from advisor.services.manager import ServiceSetManager, statuses_as_dict
 
 
 _COMPONENTS = ("collector", "market_updater", "advisor_scheduler", "frontend", "api")
@@ -43,6 +100,7 @@ _HEALTH_STATUSES = frozenset({"ok", "healthy", "running", "degraded", "failed", 
 _MAX_HEALTH_BYTES = 64 * 1024
 _CODE_RE = re.compile(r"(?:[0368]\d{5}|(?:SH|SZ|BJ)\d{6})\Z")
 _DASHBOARD_CODE_RE = re.compile(r"[0368]\d{5}\Z")
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ASSET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _CHART_TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -65,6 +123,8 @@ _MAX_CURRENT_REPORT_LINKS = 20
 _MAX_REPORT_ARCHIVE_ROWS = 500
 _MAX_CURRENT_PROFILE_LINKS = 100
 _MAX_CURRENT_CHART_LINKS = 100
+_MAX_MARKET_DAILY_RUNS = 100
+_MAX_MARKET_DAILY_FAILURES = 100
 _CURRENT_REPORT_LOOKBACK_DAYS = 30
 _MAX_PROFILE_JSON_BYTES = 64 * 1024
 _MAX_PROFILE_JSON_DEPTH = 8
@@ -74,15 +134,121 @@ _MAX_DB_NAME_LENGTH = 256
 _MAX_DB_INDUSTRY_LENGTH = 256
 _MAX_DB_TIMESTAMP_LENGTH = 64
 _MAX_SQLITE_INTEGER = 2**63 - 1
+_MAX_RESEARCH_TEAM_REQUEST_BYTES = 64 * 1024
+_RESEARCH_TEAM_PAYLOAD_KEYS = frozenset({"team_id", "scope", "title", "agent_ids"})
+_MAX_RESEARCH_REQUEST_BYTES = 64 * 1024
+_RESEARCH_REQUEST_PAYLOAD_KEYS = frozenset({"team_ref", "scope", "code", "submission_identity"})
+_RESEARCH_RERUN_PAYLOAD_KEYS = frozenset({"submission_identity"})
+_MAX_AGENT_ACCESS_REQUEST_BYTES = 64 * 1024
+_AGENT_ACCESS_PAYLOAD_KEYS = frozenset({"data_access", "rid_version"})
+_MAX_AGENT_INSTRUCTIONS_REQUEST_BYTES = 256 * 1024
+_AGENT_INSTRUCTIONS_PAYLOAD_KEYS = frozenset({"instructions"})
+_MAX_MX_RID_REQUEST_BYTES = 64 * 1024
+_MX_RID_PAYLOAD_KEYS = frozenset({"rids", "version"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
-def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> FastAPI:
+def create_app(
+    state_dir: Path | None = None,
+    db_path: Path | None = None,
+    *,
+    research_root: Path | None = None,
+    research_config_path: Path | None = None,
+    allowed_rids_path: Path | None = None,
+    mx_events_db_path: Path | None = None,
+    mx_media_root: Path | None = None,
+    service_manager_factory: Callable[..., ServiceSetManager] | None = None,
+    chrome_launcher_factory: Callable[[], ChromeLauncher] | None = None,
+) -> FastAPI:
     """Create the local-only advisor API without creating state on read paths."""
     resolved_state_dir = Path(state_dir) if state_dir is not None else advisor_paths.advisor_data_dir()
     resolved_db_path = Path(db_path) if db_path is not None else resolved_state_dir / "advisor.sqlite"
+    resolved_research_root = (research_root or advisor_paths.repo_root()).resolve()
+    resolved_research_config_path = (
+        Path(research_config_path) if research_config_path is not None else resolved_research_root / "config" / "advisor.yaml"
+    ).resolve()
+    # Do not resolve the final authoritative config path here: the store must
+    # be able to reject a symlink rather than silently following it.
+    resolved_allowed_rids_path = (
+        Path(allowed_rids_path).expanduser()
+        if allowed_rids_path is not None
+        else resolved_research_root / "config" / "allowed-rids.yaml"
+    )
+    resolved_mx_events_db_path = (
+        Path(mx_events_db_path).expanduser()
+        if mx_events_db_path is not None
+        else resolved_research_root / "data" / "state" / "events.sqlite"
+    )
+    resolved_mx_media_root = (
+        Path(mx_media_root).expanduser().resolve()
+        if mx_media_root is not None
+        else resolved_research_root
+    )
     report_cursor_secret = secrets.token_bytes(32)
+    mx_information = MxInformationStore(
+        resolved_mx_events_db_path,
+        resolved_allowed_rids_path,
+        repository_root=resolved_mx_media_root,
+        token_secret=secrets.token_bytes(32),
+    )
+    chrome_launcher = (
+        chrome_launcher_factory()
+        if chrome_launcher_factory is not None
+        else DedicatedChromeLauncher()
+    )
     app = FastAPI(title="A Hunter Advisor")
+
+    def research_services() -> tuple[ManifestCatalog, TeamPublicationService, DailyTeamSetService]:
+        config = load_advisor_config(resolved_research_config_path)
+        catalog_dir = resolve_research_catalog(config, resolved_research_root)
+        return (
+            load_catalog_from_directory(catalog_dir),
+            TeamPublicationService(catalog_dir),
+            DailyTeamSetService(config_path=resolved_research_config_path, root=resolved_research_root),
+        )
+
+    def agent_services() -> tuple[
+        ManifestCatalog,
+        AgentAccessPublicationService,
+        AgentInstructionsPublicationService,
+    ]:
+        config = load_advisor_config(resolved_research_config_path)
+        catalog_dir = resolve_research_catalog(config, resolved_research_root)
+        return (
+            load_catalog_from_directory(catalog_dir),
+            AgentAccessPublicationService(catalog_dir, allowed_rids_path=resolved_allowed_rids_path),
+            AgentInstructionsPublicationService(catalog_dir),
+        )
+
+    def service_manager() -> ServiceSetManager:
+        options = {
+            "root": resolved_research_root,
+            "database_path": resolved_db_path,
+            "events_database_path": resolved_mx_events_db_path,
+            "allowed_rids_path": resolved_allowed_rids_path,
+        }
+        return service_manager_factory(**options) if service_manager_factory is not None else ServiceSetManager(**options)
+
+    def control_repository(*, writable: bool) -> ResearchRepository:
+        if writable:
+            return ResearchRepository.open(resolved_db_path)
+        if not resolved_db_path.is_file() or resolved_db_path.is_symlink():
+            raise OSError("research control database is unavailable")
+        return ResearchRepository(connect_database(resolved_db_path))
+
+    def research_artifact_store(*, writable: bool = False) -> ArtifactStore:
+        config = load_advisor_config(resolved_research_config_path)
+        root = resolve_research_artifact_dir(config, resolved_research_root)
+        if not writable and (not root.is_dir() or root.is_symlink()):
+            raise OSError("research artifact store is unavailable")
+        return ArtifactStore(root)
+
+    from advisor.research.lagent_api import register_lagent_routes
+    register_lagent_routes(app, repository_factory=control_repository, catalog_factory=lambda: research_services()[0],
+                           artifact_store_factory=research_artifact_store, root=resolved_research_root)
+    from advisor.research.experiments.api import register_experiment_routes
+    register_experiment_routes(app, repository_factory=control_repository, catalog_factory=lambda: research_services()[0],
+                               artifact_store_factory=research_artifact_store)
 
     @app.get("/api/health")
     def health() -> dict:
@@ -91,6 +257,231 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
     @app.get("/api/current-state")
     def current_state() -> dict:
         return _current_state(resolved_state_dir, resolved_db_path, report_cursor_secret)
+
+    @app.get("/api/services")
+    def services() -> dict:
+        connection = _read_connection(resolved_db_path)
+        if connection is None:
+            raise HTTPException(status_code=503, detail="服务状态数据库不可用")
+        connection.close()
+        manager = service_manager()
+        return statuses_as_dict(manager.statuses())
+
+    @app.get("/api/mx/listener/status")
+    def mx_listener_status() -> dict:
+        try:
+            status = service_manager().mx_listener_status(datetime.now(_SHANGHAI))
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=503, detail="MX Listener 状态暂不可读取") from None
+        return _mx_listener_status_payload(status)
+
+    @app.post("/api/mx/listener/start")
+    async def start_mx_listener(request: Request) -> dict:
+        try:
+            await _empty_local_json_request(request)
+            manager = service_manager()
+            changed = manager.start_mx_listener()
+            status = manager.mx_listener_status(datetime.now(_SHANGHAI))
+        except _MxListenerRequestError:
+            raise HTTPException(status_code=400, detail="MX Listener 操作请求无效") from None
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=503, detail="MX Listener 暂不可启动") from None
+        return {
+            "changed": changed,
+            "service": _mx_listener_status_payload(status),
+            "message": "已请求启动 MX Listener；不会打开、登录或操作 Chrome 页面",
+        }
+
+    @app.post("/api/mx/listener/stop")
+    async def stop_mx_listener(request: Request) -> dict:
+        try:
+            await _empty_local_json_request(request)
+            manager = service_manager()
+            changed = manager.stop_mx_listener()
+            status = manager.mx_listener_status(datetime.now(_SHANGHAI))
+        except _MxListenerRequestError:
+            raise HTTPException(status_code=400, detail="MX Listener 操作请求无效") from None
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=503, detail="MX Listener 暂不可停止") from None
+        return {
+            "changed": changed,
+            "service": _mx_listener_status_payload(status),
+            "message": "已请求停止 MX Listener；Chrome、RID 和已保存资讯均未改变",
+        }
+
+    @app.post("/api/mx/chrome/start")
+    async def start_mx_chrome(request: Request) -> dict:
+        try:
+            await _empty_local_json_request(request, _MxChromeRequestError)
+            result = await run_in_threadpool(chrome_launcher.start)
+        except _MxChromeRequestError:
+            raise HTTPException(status_code=400, detail="专用 Chrome 启动请求无效") from None
+        except (ChromeLaunchError, OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=503, detail="专用 Chrome 暂不可启动") from None
+        if not result.changed:
+            message = "专用 Chrome 已在运行；请在其中自行登录并打开 MX 页面"
+        elif result.ready:
+            message = "专用 Chrome 已启动；请在其中自行登录并打开 MX 页面"
+        else:
+            message = "已请求启动专用 Chrome；请稍候在其中自行登录并打开 MX 页面"
+        return {"changed": result.changed, "ready": result.ready, "message": message}
+
+    @app.get("/api/mx/rids")
+    def mx_rids() -> dict:
+        try:
+            return RidAuthorizationStore(resolved_allowed_rids_path).read().as_dict()
+        except (RidAuthorizationUnavailable, RidAuthorizationValidationError):
+            raise HTTPException(status_code=503, detail="RID 授权配置暂不可读取") from None
+
+    @app.put("/api/mx/rids")
+    async def replace_mx_rids(request: Request) -> dict:
+        try:
+            payload = await _mx_rid_request_payload(request)
+            updated = RidAuthorizationStore(resolved_allowed_rids_path).replace(
+                payload["rids"], expected_version=payload["version"]
+            )
+        except _MxRidRequestError:
+            raise HTTPException(status_code=400, detail="RID 授权输入无效") from None
+        except RidAuthorizationConflict:
+            raise HTTPException(status_code=409, detail="RID 配置已更新，请刷新后再提交") from None
+        except RidAuthorizationValidationError:
+            raise HTTPException(status_code=400, detail="RID 授权输入无效") from None
+        except RidAuthorizationUnavailable:
+            raise HTTPException(status_code=503, detail="RID 授权配置暂不可更新") from None
+        return {
+            **updated.as_dict(),
+            "message": "RID 授权已更新，Listener 会在下一次配置轮询时热加载",
+        }
+
+    @app.get("/api/mx/events")
+    def mx_events(
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = None,
+        rid: list[str] = Query(default=[]),
+        authorization: str | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
+        has_media: str | None = None,
+        q: str | None = None,
+    ) -> dict:
+        try:
+            return mx_information.list_events(
+                limit=limit,
+                cursor=cursor,
+                rids=_mx_rid_filters(rid),
+                authorization=authorization,
+                start_at=_mx_timestamp_filter(start_at),
+                end_at=_mx_timestamp_filter(end_at),
+                has_media=_mx_media_filter(has_media),
+                query=q,
+            )
+        except (MxInformationCursorConflict, MxInformationNotFound):
+            raise HTTPException(status_code=409, detail="MX 资讯游标与当前筛选条件不一致") from None
+        except MxInformationValidationError:
+            raise HTTPException(status_code=400, detail="MX 资讯筛选条件无效") from None
+        except MxInformationUnavailable:
+            raise HTTPException(status_code=503, detail="MX 资讯暂不可读取") from None
+
+    @app.get("/api/mx/events/{event_id}")
+    def mx_event(event_id: str) -> dict:
+        try:
+            detail = mx_information.event_detail(event_id)
+        except (MxInformationNotFound, MxInformationValidationError):
+            raise HTTPException(status_code=404, detail="MX 资讯不存在") from None
+        except MxInformationUnavailable:
+            raise HTTPException(status_code=503, detail="MX 资讯暂不可读取") from None
+        for block in detail["blocks"]:
+            if block.get("type") == "media":
+                block["href"] = f"/api/mx/events/{event_id}/media/{block['media_id']}"
+        return detail
+
+    @app.get("/api/mx/events/{event_id}/media/{media_id}")
+    def mx_event_media(event_id: str, media_id: str):
+        try:
+            descriptor = mx_information.open_media(event_id, media_id)
+        except (MxInformationNotFound, MxInformationValidationError):
+            raise HTTPException(status_code=404, detail="MX 图片不存在") from None
+        except MxInformationUnavailable:
+            raise HTTPException(status_code=503, detail="MX 图片暂不可读取") from None
+        return StreamingResponse(
+            descriptor.stream(),
+            media_type=descriptor.content_type,
+            headers={"Content-Length": str(descriptor.size), "Cache-Control": "private, no-store"},
+        )
+
+    @app.get("/api/market-daily/status")
+    def market_daily_status() -> dict:
+        connection = _read_connection(resolved_db_path)
+        if connection is None:
+            raise HTTPException(status_code=503, detail="Market Daily 状态数据库不可用")
+        try:
+            return _market_daily_status_payload(connection, datetime.now(_SHANGHAI))
+        except sqlite3.Error:
+            raise HTTPException(status_code=503, detail="Market Daily 状态不可读取") from None
+        finally:
+            connection.close()
+
+    @app.post("/api/market-daily/cold-start", status_code=202)
+    def submit_market_daily_cold_start() -> dict:
+        """Queue, but never execute, the one idempotent five-year cold start."""
+        try:
+            request = MarketDailyControlPlane(resolved_db_path).submit_cold_start_intent(
+                datetime.now(_SHANGHAI)
+            )
+        except (MarketRunError, OSError, sqlite3.Error):
+            raise HTTPException(status_code=503, detail="Market Daily 冷启动请求不可提交") from None
+        return {
+            "request_id": request.request_id,
+            "request_status": request.status,
+            "message": "冷启动请求已在本地队列中；Market Daily 服务会在 21:00 后执行",
+        }
+
+    @app.get("/api/market-daily/runs")
+    def market_daily_runs(limit: int = Query(default=30, ge=1, le=_MAX_MARKET_DAILY_RUNS)) -> dict:
+        connection = _read_connection(resolved_db_path)
+        if connection is None:
+            raise HTTPException(status_code=503, detail="Market Daily 状态数据库不可用")
+        try:
+            return {"runs": _market_daily_run_list(connection, limit)}
+        except sqlite3.Error:
+            raise HTTPException(status_code=503, detail="Market Daily 运行记录不可读取") from None
+        finally:
+            connection.close()
+
+    @app.get("/api/market-daily/runs/{run_id}")
+    def market_daily_run(run_id: str) -> dict:
+        if not _RUN_ID_RE.fullmatch(run_id):
+            raise HTTPException(status_code=404, detail="Market Daily 运行不存在")
+        connection = _read_connection(resolved_db_path)
+        if connection is None:
+            raise HTTPException(status_code=503, detail="Market Daily 状态数据库不可用")
+        try:
+            payload = _market_daily_run_detail(connection, run_id)
+        except sqlite3.Error:
+            raise HTTPException(status_code=503, detail="Market Daily 运行记录不可读取") from None
+        finally:
+            connection.close()
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Market Daily 运行不存在")
+        return payload
+
+    @app.get("/api/market-daily/runs/{run_id}/failures")
+    def market_daily_failures(
+        run_id: str,
+        limit: int = Query(default=50, ge=1, le=_MAX_MARKET_DAILY_FAILURES),
+        offset: int = Query(default=0, ge=0, le=10_000),
+    ) -> dict:
+        if not _RUN_ID_RE.fullmatch(run_id):
+            raise HTTPException(status_code=404, detail="Market Daily 运行不存在")
+        connection = _read_connection(resolved_db_path)
+        if connection is None:
+            raise HTTPException(status_code=503, detail="Market Daily 状态数据库不可用")
+        try:
+            return _market_daily_failures(connection, run_id, limit, offset)
+        except sqlite3.Error:
+            raise HTTPException(status_code=503, detail="Market Daily 失败项不可读取") from None
+        finally:
+            connection.close()
 
     @app.get("/api/reports")
     def reports(
@@ -156,6 +547,382 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
         except (OSError, ValueError, RuntimeError):
             raise HTTPException(status_code=404, detail="report not found") from None
         return archive
+
+    @app.get("/api/research/cycles")
+    def research_cycles(limit: int = Query(default=50, ge=1, le=100)) -> dict:
+        return {"cycles": _list_research_cycles(advisor_paths.reports_dir(), limit=limit)}
+
+    @app.get("/api/research/cycles/{report_date}/{cycle_id}")
+    def research_cycle(report_date: str, cycle_id: str) -> dict:
+        try:
+            return _read_research_cycle(advisor_paths.reports_dir(), report_date, cycle_id)
+        except (OSError, ValueError, json.JSONDecodeError):
+            raise HTTPException(status_code=404, detail="research cycle not found") from None
+
+    @app.get("/api/research/execution-settings")
+    def research_execution_settings() -> dict:
+        try:
+            return ExecutionSettingsService(root=resolved_research_root, config_path=resolved_research_config_path).read()
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究模型配置暂不可读取") from None
+
+    @app.put("/api/research/execution-settings")
+    async def update_research_execution_settings(request: Request) -> dict:
+        try:
+            _require_local_json_request(request, ValueError)
+            payload = await _bounded_json_object(request, 2048, ValueError)
+            if set(payload) != {"expected_policy_ref", "model", "reasoning_effort"} or any(not isinstance(v, str) for v in payload.values()):
+                raise ValueError("invalid model settings")
+            return ExecutionSettingsService(root=resolved_research_root, config_path=resolved_research_config_path).update(**payload)
+        except ExecutionSettingsConflict:
+            raise HTTPException(status_code=409, detail="模型配置已更新，请刷新后重试") from None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="请选择有效的模型、推理强度并刷新配置后重试") from None
+        except (OSError, DailyTeamSetStorageError):
+            raise HTTPException(status_code=503, detail="研究模型配置暂不可保存") from None
+
+    @app.get("/api/research/agents")
+    def research_agents() -> dict:
+        try:
+            catalog, _publication, _daily_teams = research_services()
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究团队目录暂不可读取") from None
+        return {"agents": _research_agent_list(catalog)}
+
+    @app.get("/api/research/data-catalog")
+    def research_data_catalog() -> dict:
+        try:
+            catalog, _access_publication, _instructions_publication = agent_services()
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究数据目录暂不可读取") from None
+        return {"products": _research_data_catalog(catalog)}
+
+    @app.get("/api/research/agent-access")
+    def research_agent_access() -> dict:
+        try:
+            catalog, _access_publication, _instructions_publication = agent_services()
+            authorization = RidAuthorizationStore(resolved_allowed_rids_path).read()
+        except (RidAuthorizationUnavailable, RidAuthorizationValidationError):
+            raise HTTPException(status_code=503, detail="RID 授权配置暂不可读取") from None
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究数据目录暂不可读取") from None
+        return {
+            "rid_version": authorization.version,
+            "agents": _research_agent_access_list(catalog, authorization.rids),
+        }
+
+    @app.post("/api/research/agents/{agent_ref}/access-revisions")
+    async def publish_agent_access_revision(agent_ref: str, request: Request):
+        try:
+            payload = await _agent_access_request_payload(request)
+            catalog, publication, _instructions_publication = agent_services()
+            authorization = RidAuthorizationStore(resolved_allowed_rids_path).read()
+            published = publication.publish(
+                agent_ref,
+                payload["data_access"],
+                expected_rid_version=payload["rid_version"],
+            )
+        except _AgentAccessRequestError:
+            raise HTTPException(status_code=400, detail="Agent 数据访问输入无效") from None
+        except AgentAccessPublicationNotFound:
+            raise HTTPException(status_code=404, detail="指定的 Agent 版本不存在") from None
+        except AgentAccessPublicationConflict:
+            raise HTTPException(status_code=409, detail="Agent 或 RID 配置已更新，请刷新后再提交") from None
+        except AgentAccessPublicationValidationError:
+            raise HTTPException(status_code=400, detail="Agent 数据访问输入无效") from None
+        except (AgentAccessPublicationStorageError, RidAuthorizationUnavailable, RidAuthorizationValidationError):
+            raise HTTPException(status_code=503, detail="Agent 数据访问发布暂不可用") from None
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究数据目录暂不可读取") from None
+        reloaded, _access_service, _instructions_service = agent_services()
+        response = {
+            "created": published.created,
+            "agent": _research_agent_access_item(reloaded, published.agent, authorization.rids),
+            "impact": {
+                "fixed_team_refs": list(published.impact.fixed_team_refs),
+                "revoked_rids": list(published.impact.revoked_rids),
+            },
+            "message": "已发布新的 Agent 数据访问版本；Team 和每日启用未改变",
+        }
+        return JSONResponse(response, status_code=201 if published.created else 200)
+
+    @app.post("/api/research/agents/{agent_ref}/instruction-revisions")
+    async def publish_agent_instructions_revision(agent_ref: str, request: Request):
+        try:
+            instructions = await _agent_instructions_request_payload(request)
+            _catalog, _access_publication, publication = agent_services()
+            authorization = RidAuthorizationStore(resolved_allowed_rids_path).read()
+            published = publication.publish(agent_ref, instructions)
+        except _AgentInstructionsRequestError:
+            raise HTTPException(status_code=400, detail="Agent Instructions 输入无效") from None
+        except AgentInstructionsPublicationNotFound:
+            raise HTTPException(status_code=404, detail="指定的 Agent 版本不存在") from None
+        except AgentInstructionsPublicationConflict:
+            raise HTTPException(status_code=409, detail="Agent 已更新，请刷新后再提交") from None
+        except AgentInstructionsPublicationValidationError:
+            raise HTTPException(status_code=400, detail="Agent Instructions 输入无效") from None
+        except (
+            AgentInstructionsPublicationStorageError,
+            RidAuthorizationUnavailable,
+            RidAuthorizationValidationError,
+        ):
+            raise HTTPException(status_code=503, detail="Agent Instructions 发布暂不可用") from None
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究数据目录暂不可读取") from None
+        reloaded, _access_service, _instructions_service = agent_services()
+        response = {
+            "created": published.created,
+            "agent": _research_agent_access_item(reloaded, published.agent, authorization.rids),
+            "impact": {"fixed_team_refs": list(published.impact.fixed_team_refs)},
+            "message": "已发布新的 Agent Instructions 版本；Team 和每日启用未改变",
+        }
+        return JSONResponse(response, status_code=201 if published.created else 200)
+
+    @app.get("/api/research/teams")
+    def research_teams() -> dict:
+        try:
+            catalog, _publication, daily_teams = research_services()
+            enabled = daily_teams.read().team_refs
+        except (DailyTeamSetValidationError, OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究团队目录暂不可读取") from None
+        return {"teams": _research_team_list(catalog, enabled)}
+
+    @app.post("/api/research/teams")
+    async def publish_research_team(request: Request):
+        try:
+            payload = await _research_team_request_payload(request)
+            _catalog, publication, _daily_teams = research_services()
+            published = publication.publish(
+                payload["team_id"],
+                payload["title"],
+                payload["agent_ids"],
+                scope=payload["scope"],
+            )
+        except _ResearchTeamRequestError:
+            raise HTTPException(status_code=400, detail="研究团队输入无效") from None
+        except TeamPublicationNotFound:
+            raise HTTPException(status_code=404, detail="未找到指定的研究 Agent") from None
+        except TeamPublicationConflict:
+            raise HTTPException(status_code=409, detail="该成员组合已用于其他研究团队") from None
+        except TeamPublicationValidationError:
+            raise HTTPException(status_code=400, detail="研究团队输入无效") from None
+        except TeamPublicationStorageError:
+            raise HTTPException(status_code=503, detail="研究团队发布暂不可用") from None
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究团队目录暂不可读取") from None
+        response = {
+            "created": published.created,
+            "team": _research_team_item(published.team),
+        }
+        return JSONResponse(response, status_code=201 if published.created else 200)
+
+    @app.post("/api/research/requests")
+    async def submit_research_request(request: Request):
+        repository: ResearchRepository | None = None
+        try:
+            payload = await _research_request_payload(request)
+            catalog, _publication, _daily_teams = research_services()
+            team = catalog.team(payload["team_ref"])
+            subject = _request_subject(payload["scope"], payload["code"])
+            catalog.validate_subject_for_team(team.team, subject)
+            repository = control_repository(writable=True)
+            with repository.transaction():
+                submitted = repository.submit_request(
+                    team_ref=team.team,
+                    subject=subject,
+                    origin="web",
+                    submission_identity=payload["submission_identity"],
+                )
+            return JSONResponse({"request": _research_request_item(submitted)}, status_code=202)
+        except _ResearchRequestPayloadError:
+            raise HTTPException(status_code=400, detail="研究请求输入无效") from None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="研究请求与 Team 范围不匹配") from None
+        except (OSError, sqlite3.Error):
+            raise HTTPException(status_code=503, detail="研究请求控制面暂不可用") from None
+        finally:
+            if repository is not None:
+                repository.close()
+
+    @app.get("/api/research/requests/current")
+    def current_research_requests() -> dict:
+        repository: ResearchRepository | None = None
+        try:
+            repository = control_repository(writable=False)
+            lease = repository.service_lease_status()
+            requests = repository.current_requests()
+            active_test = repository.connection.execute("SELECT work_id FROM research_work_queue WHERE kind='experiment' AND state='running' LIMIT 1").fetchone()
+            return {
+                "service": {
+                    "state": "idle" if lease["online"] and active_test is None and not any(item.status == "running" for item in requests) else ("running" if lease["online"] else "offline"),
+                    "heartbeat_at": lease["heartbeat_at"],
+                    "active_request_id": next((item.request_id for item in requests if item.status == "running"), None),
+                    "active_test_id": active_test[0] if active_test else None,
+                    "queued_count": repository.connection.execute("SELECT COUNT(*) FROM research_work_queue WHERE state='queued'").fetchone()[0],
+                    "reason_code": None,
+                },
+                "requests": [_research_request_item(item) for item in requests],
+            }
+        except (OSError, sqlite3.Error, ValueError):
+            raise HTTPException(status_code=503, detail="研究请求控制面暂不可读取") from None
+        finally:
+            if repository is not None:
+                repository.close()
+
+    @app.get("/api/research/requests/{request_id}")
+    def research_request_status(request_id: str) -> dict:
+        """Return one durable Request, including its terminal no-report state."""
+        repository: ResearchRepository | None = None
+        try:
+            repository = control_repository(writable=False)
+            return {"request": _research_request_item(repository.get_request(request_id))}
+        except ValueError:
+            raise HTTPException(status_code=404, detail="研究请求不存在") from None
+        except (OSError, sqlite3.Error):
+            raise HTTPException(status_code=503, detail="研究请求状态暂不可读取") from None
+        finally:
+            if repository is not None:
+                repository.close()
+
+    @app.post("/api/research/requests/{request_id}/cancel")
+    async def cancel_research_request(request_id: str, request: Request):
+        repository: ResearchRepository | None = None
+        try:
+            await _empty_local_json_request(request, _ResearchRequestPayloadError)
+            repository = control_repository(writable=True)
+            with repository.transaction():
+                cancelled = repository.request_cancel(request_id)
+            return {"request": _research_request_item(cancelled)}
+        except _ResearchRequestPayloadError:
+            raise HTTPException(status_code=400, detail="取消研究请求输入无效") from None
+        except ValueError as error:
+            detail = "研究请求不存在或已结束" if "unknown" in str(error) or "terminal" in str(error) else "研究请求当前不可取消"
+            raise HTTPException(status_code=409, detail=detail) from None
+        except (OSError, sqlite3.Error):
+            raise HTTPException(status_code=503, detail="研究请求控制面暂不可用") from None
+        finally:
+            if repository is not None:
+                repository.close()
+
+    @app.post("/api/research/requests/{request_id}/rerun")
+    async def rerun_research_request(request_id: str, request: Request):
+        repository: ResearchRepository | None = None
+        try:
+            payload = await _research_rerun_payload(request)
+            repository = control_repository(writable=True)
+            with repository.transaction():
+                rerun = repository.rerun_request(request_id, submission_identity=payload["submission_identity"])
+            return JSONResponse({"request": _research_request_item(rerun)}, status_code=202)
+        except _ResearchRequestPayloadError:
+            raise HTTPException(status_code=400, detail="再次研究输入无效") from None
+        except ValueError as error:
+            detail = "只有已结束的研究记录可以再次研究" if "terminal" in str(error) else "研究请求不存在"
+            raise HTTPException(status_code=409, detail=detail) from None
+        except (OSError, sqlite3.Error):
+            raise HTTPException(status_code=503, detail="研究请求控制面暂不可用") from None
+        finally:
+            if repository is not None:
+                repository.close()
+
+    @app.get("/api/research/records")
+    def research_records(
+        team_id: str | None = None,
+        team_ref: str | None = None,
+        status: list[str] | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        repository: ResearchRepository | None = None
+        try:
+            repository = control_repository(writable=False)
+            records = repository.list_records(
+                team_id=team_id,
+                team_ref=team_ref,
+                statuses=tuple(status) if status is not None else ("passed", "partial"),
+                limit=limit,
+                offset=offset,
+            )
+            store: ArtifactStore | None = None
+            if any(item.status in {"passed", "partial"} for item in records):
+                try:
+                    store = research_artifact_store()
+                except OSError:
+                    # A Record remains listable even when a historical report
+                    # artifact is unavailable; expose only that bounded state.
+                    store = None
+            return {
+                "records": [
+                    _research_record_item(item, quality_summary=_research_quality_summary(item, store))
+                    for item in records
+                ],
+                "limit": limit,
+                "offset": offset,
+            }
+        except ValueError:
+            raise HTTPException(status_code=400, detail="研究记录筛选条件无效") from None
+        except (OSError, sqlite3.Error):
+            raise HTTPException(status_code=503, detail="研究记录暂不可读取") from None
+        finally:
+            if repository is not None:
+                repository.close()
+
+    @app.get("/api/research/records/{record_id}")
+    def research_record_detail(record_id: str) -> dict:
+        repository: ResearchRepository | None = None
+        try:
+            repository = control_repository(writable=False)
+            record = repository.get_record(record_id)
+            payload = _research_record_item(record)
+            if record.status in {"passed", "partial"}:
+                store = research_artifact_store()
+                if not record.report_json_hash or not record.report_markdown_hash:
+                    raise ValueError("report references missing")
+                report_json = store.read_json(record.report_json_hash)
+                markdown = store.read_bytes(record.report_markdown_hash).decode("utf-8")
+                if not isinstance(report_json, dict) or len(markdown) > 2_000_000 or not _safe_research_report(report_json, markdown):
+                    raise ValueError("report content invalid")
+                payload["quality_summary"] = _quality_summary_from_report(report_json)
+                payload["report"] = {"json": report_json, "markdown": markdown}
+            return payload
+        except ValueError as error:
+            if "unknown" in str(error):
+                raise HTTPException(status_code=404, detail="研究记录不存在") from None
+            raise HTTPException(status_code=409, detail="研究报告不可用或未通过完整性校验") from None
+        except (OSError, sqlite3.Error, UnicodeDecodeError):
+            raise HTTPException(status_code=503, detail="研究记录暂不可读取") from None
+        finally:
+            if repository is not None:
+                repository.close()
+
+    @app.put("/api/research/daily-teams/{team_ref}")
+    def enable_daily_research_team(team_ref: str) -> dict:
+        try:
+            _catalog, _publication, daily_teams = research_services()
+            result = daily_teams.enable(team_ref)
+        except DailyTeamSetNotFound:
+            raise HTTPException(status_code=404, detail="指定的研究团队版本不存在") from None
+        except DailyTeamSetValidationError:
+            raise HTTPException(status_code=400, detail="研究团队版本无效") from None
+        except DailyTeamSetStorageError:
+            raise HTTPException(status_code=503, detail="每日 Team 配置暂不可更新") from None
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究团队目录暂不可读取") from None
+        return {"daily_teams": list(result.team_refs), "message": "已启用每日 Team"}
+
+    @app.delete("/api/research/daily-teams/{team_ref}")
+    def disable_daily_research_team(team_ref: str) -> dict:
+        try:
+            _catalog, _publication, daily_teams = research_services()
+            result = daily_teams.disable(team_ref)
+        except DailyTeamSetNotFound:
+            raise HTTPException(status_code=404, detail="指定的研究团队版本不存在") from None
+        except DailyTeamSetValidationError:
+            raise HTTPException(status_code=400, detail="研究团队版本无效") from None
+        except DailyTeamSetStorageError:
+            raise HTTPException(status_code=503, detail="每日 Team 配置暂不可更新") from None
+        except (OSError, ValueError):
+            raise HTTPException(status_code=503, detail="研究团队目录暂不可读取") from None
+        return {"daily_teams": list(result.team_refs), "message": "已取消每日启用"}
 
     @app.get("/api/profiles")
     def profiles(limit: int = Query(default=50, ge=1, le=100)) -> dict:
@@ -247,6 +1014,567 @@ def create_app(state_dir: Path | None = None, db_path: Path | None = None) -> Fa
     return app
 
 
+class _ResearchTeamRequestError(ValueError):
+    pass
+
+
+class _ResearchRequestPayloadError(ValueError):
+    pass
+
+
+class _AgentAccessRequestError(ValueError):
+    pass
+
+
+class _AgentInstructionsRequestError(ValueError):
+    pass
+
+
+class _MxListenerRequestError(ValueError):
+    pass
+
+
+class _MxChromeRequestError(ValueError):
+    pass
+
+
+class _MxRidRequestError(ValueError):
+    pass
+
+
+def _mx_rid_filters(values: list[str]) -> tuple[int, ...]:
+    parsed: list[int] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise MxInformationValidationError("invalid RID filter")
+        for item in value.split(","):
+            if not re.fullmatch(r"[1-9][0-9]{0,15}", item):
+                raise MxInformationValidationError("invalid RID filter")
+            number = int(item)
+            if number > 2**53 - 1:
+                raise MxInformationValidationError("invalid RID filter")
+            parsed.append(number)
+    if len(parsed) > 100 or len(set(parsed)) != len(parsed):
+        raise MxInformationValidationError("invalid RID filter")
+    return tuple(sorted(parsed))
+
+
+def _mx_timestamp_filter(value: str | None) -> int | None:
+    if value is None:
+        return None
+    if re.fullmatch(r"[0-9]{1,16}", value):
+        parsed = int(value)
+        if parsed > 2**63 - 1:
+            raise MxInformationValidationError("invalid time filter")
+        return parsed
+    try:
+        parsed_time = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise MxInformationValidationError("invalid time filter") from error
+    if parsed_time.tzinfo is None or parsed_time.utcoffset() is None:
+        raise MxInformationValidationError("invalid time filter")
+    return int(parsed_time.timestamp() * 1000)
+
+
+def _mx_media_filter(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise MxInformationValidationError("invalid media filter")
+
+
+async def _mx_rid_request_payload(request: Request) -> dict[str, object]:
+    _require_local_json_request(request)
+    payload = await _bounded_json_object(request, _MAX_MX_RID_REQUEST_BYTES, _MxRidRequestError)
+    if set(payload) != _MX_RID_PAYLOAD_KEYS:
+        raise _MxRidRequestError("invalid payload shape")
+    rids = payload["rids"]
+    if not isinstance(rids, list) or len(rids) > 1_000 or any(type(value) is not int for value in rids):
+        raise _MxRidRequestError("invalid RID values")
+    if not isinstance(payload["version"], str) or len(payload["version"]) != 64:
+        raise _MxRidRequestError("invalid version")
+    return payload
+
+
+async def _empty_local_json_request(
+    request: Request,
+    error_type: type[ValueError] = _MxListenerRequestError,
+) -> None:
+    _require_local_json_request(request, error_type)
+    payload = await _bounded_json_object(request, 1_024, error_type)
+    if payload:
+        raise error_type("unexpected request fields")
+
+
+def _require_local_json_request(
+    request: Request,
+    error_type: type[ValueError] = _MxRidRequestError,
+) -> None:
+    if not _is_loopback_request(request):
+        raise error_type("non-local request")
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise error_type("invalid content type")
+    origin = request.headers.get("origin")
+    if origin is not None and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+        raise error_type("cross origin request")
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site not in {None, "same-origin", "none"}:
+        raise error_type("cross origin request")
+
+
+def _is_loopback_request(request: Request) -> bool:
+    """Require both a loopback Host and a loopback transport peer.
+
+    The explicit TestClient identity is accepted only with its synthetic host
+    (or a loopback host), so production requests cannot opt into the exception
+    through caller-controlled HTTP headers.
+    """
+
+    hostname = (request.url.hostname or "").lower()
+    host_is_loopback = hostname == "localhost"
+    if not host_is_loopback:
+        try:
+            host_is_loopback = ip_address(hostname).is_loopback
+        except ValueError:
+            host_is_loopback = False
+    client_host = request.client.host if request.client is not None else ""
+    if client_host == "testclient":
+        return hostname == "testserver" or host_is_loopback
+    try:
+        peer = ip_address(client_host.split("%", 1)[0])
+    except ValueError:
+        return False
+    peer_is_loopback = peer.is_loopback
+    if not peer_is_loopback and peer.version == 6 and peer.ipv4_mapped is not None:
+        peer_is_loopback = peer.ipv4_mapped.is_loopback
+    return host_is_loopback and peer_is_loopback
+
+
+async def _bounded_json_object(
+    request: Request,
+    maximum_bytes: int,
+    error_type: type[ValueError],
+) -> dict[str, object]:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) < 0 or int(content_length) > maximum_bytes:
+                raise error_type("request body too large")
+        except ValueError as error:
+            raise error_type("invalid request body") from error
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > maximum_bytes:
+            raise error_type("request body too large")
+        body.extend(chunk)
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise error_type("invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise error_type("invalid payload")
+    return payload
+
+
+async def _research_team_request_payload(request: Request) -> dict[str, object]:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > _MAX_RESEARCH_TEAM_REQUEST_BYTES:
+                raise _ResearchTeamRequestError("request body too large")
+        except ValueError as error:
+            raise _ResearchTeamRequestError("invalid request body") from error
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _MAX_RESEARCH_TEAM_REQUEST_BYTES:
+            raise _ResearchTeamRequestError("request body too large")
+        body.extend(chunk)
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _ResearchTeamRequestError("invalid JSON") from error
+    if not isinstance(payload, dict) or set(payload) != _RESEARCH_TEAM_PAYLOAD_KEYS:
+        raise _ResearchTeamRequestError("invalid payload shape")
+    if (
+        not isinstance(payload["team_id"], str)
+        or not isinstance(payload["title"], str)
+        or not isinstance(payload["scope"], str)
+    ):
+        raise _ResearchTeamRequestError("invalid Team fields")
+    try:
+        ResearchScope(payload["scope"])
+    except ValueError as error:
+        raise _ResearchTeamRequestError("invalid Team scope") from error
+    agent_ids = payload["agent_ids"]
+    if not isinstance(agent_ids, list) or any(not isinstance(item, str) for item in agent_ids):
+        raise _ResearchTeamRequestError("invalid Agent IDs")
+    return payload
+
+
+async def _research_request_payload(request: Request) -> dict[str, object]:
+    _require_local_json_request(request, _ResearchRequestPayloadError)
+    payload = await _bounded_json_object(request, _MAX_RESEARCH_REQUEST_BYTES, _ResearchRequestPayloadError)
+    if set(payload) != _RESEARCH_REQUEST_PAYLOAD_KEYS:
+        raise _ResearchRequestPayloadError("invalid payload shape")
+    team_ref, scope, code, identity = (
+        payload["team_ref"], payload["scope"], payload["code"], payload["submission_identity"]
+    )
+    if not isinstance(team_ref, str) or not isinstance(scope, str) or not isinstance(identity, str) or not identity.strip() or len(identity) > 256:
+        raise _ResearchRequestPayloadError("invalid request fields")
+    try:
+        if str(VersionRef.parse(team_ref)) != team_ref:
+            raise ValueError("not canonical")
+        ResearchScope(scope)
+    except (TypeError, ValueError) as error:
+        raise _ResearchRequestPayloadError("invalid request scope") from error
+    if code is not None and (not isinstance(code, str) or len(code) != 6):
+        raise _ResearchRequestPayloadError("invalid subject code")
+    return payload
+
+
+async def _research_rerun_payload(request: Request) -> dict[str, str]:
+    _require_local_json_request(request, _ResearchRequestPayloadError)
+    payload = await _bounded_json_object(request, _MAX_RESEARCH_REQUEST_BYTES, _ResearchRequestPayloadError)
+    if set(payload) != _RESEARCH_RERUN_PAYLOAD_KEYS:
+        raise _ResearchRequestPayloadError("invalid rerun payload")
+    identity = payload["submission_identity"]
+    if not isinstance(identity, str) or not identity.strip() or len(identity) > 256:
+        raise _ResearchRequestPayloadError("invalid rerun identity")
+    return {"submission_identity": identity}
+
+
+def _request_subject(scope_value: object, code: object) -> ResearchSubject:
+    try:
+        scope = ResearchScope(scope_value)
+    except (TypeError, ValueError) as error:
+        raise _ResearchRequestPayloadError("invalid scope") from error
+    try:
+        return ResearchSubject(scope=scope, code=code)
+    except ValueError as error:
+        raise _ResearchRequestPayloadError("invalid subject") from error
+
+
+async def _agent_access_request_payload(request: Request) -> dict[str, object]:
+    _require_local_json_request(request, _AgentAccessRequestError)
+    payload = await _bounded_json_object(request, _MAX_AGENT_ACCESS_REQUEST_BYTES, _AgentAccessRequestError)
+    if set(payload) != _AGENT_ACCESS_PAYLOAD_KEYS:
+        raise _AgentAccessRequestError("invalid payload shape")
+    version = payload["rid_version"]
+    if (
+        not isinstance(version, str)
+        or len(version) != 64
+        or any(character not in "0123456789abcdef" for character in version)
+    ):
+        raise _AgentAccessRequestError("invalid RID version")
+    access = payload["data_access"]
+    if not isinstance(access, list) or not 1 <= len(access) <= 50:
+        raise _AgentAccessRequestError("invalid data access")
+    normalized: list[dict[str, object]] = []
+    for item in access:
+        if not isinstance(item, dict) or set(item) not in ({"product"}, {"product", "feed_scope"}):
+            raise _AgentAccessRequestError("invalid data access item")
+        product = item.get("product")
+        if not isinstance(product, str) or len(product) > 72:
+            raise _AgentAccessRequestError("invalid product reference")
+        try:
+            if str(VersionRef.parse(product)) != product:
+                raise ValueError("not canonical")
+        except (TypeError, ValueError) as error:
+            raise _AgentAccessRequestError("invalid product reference") from error
+        normalized_item: dict[str, object] = {"product": product}
+        if "feed_scope" in item:
+            scope = item["feed_scope"]
+            if not isinstance(scope, dict) or set(scope) != {"rids"}:
+                raise _AgentAccessRequestError("invalid Feed scope")
+            rids = scope.get("rids")
+            if (
+                not isinstance(rids, list)
+                or not 1 <= len(rids) <= 100
+                or any(type(rid) is not int or not 0 < rid <= 2**53 - 1 for rid in rids)
+                or len(set(rids)) != len(rids)
+            ):
+                raise _AgentAccessRequestError("invalid Feed scope")
+            normalized_item["feed_scope"] = {"rids": sorted(rids)}
+        normalized.append(normalized_item)
+    if len({item["product"] for item in normalized}) != len(normalized):
+        raise _AgentAccessRequestError("duplicate product access")
+    return {"data_access": normalized, "rid_version": version}
+
+
+async def _agent_instructions_request_payload(request: Request) -> str:
+    _require_local_json_request(request, _AgentInstructionsRequestError)
+    payload = await _bounded_json_object(
+        request,
+        _MAX_AGENT_INSTRUCTIONS_REQUEST_BYTES,
+        _AgentInstructionsRequestError,
+    )
+    if set(payload) != _AGENT_INSTRUCTIONS_PAYLOAD_KEYS:
+        raise _AgentInstructionsRequestError("invalid payload shape")
+    instructions = payload["instructions"]
+    if not isinstance(instructions, str) or not instructions.strip() or len(instructions) > 20_000:
+        raise _AgentInstructionsRequestError("invalid Agent Instructions")
+    return instructions
+
+
+def _research_agent_list(catalog: ManifestCatalog) -> list[dict[str, object]]:
+    latest: dict[str, object] = {}
+    for agent in catalog.agents.values():
+        current = latest.get(agent.agent.id)
+        if current is None or agent.agent.version > current.agent.version:  # type: ignore[union-attr]
+            latest[agent.agent.id] = agent
+    return [
+        {
+            "agent_id": agent_id,
+            "agent_ref": str(agent.agent),
+            "scope": agent.scope.value,
+            "title": agent.title,
+            "summary": _agent_summary(agent.instructions),
+        }
+        for agent_id, agent in sorted(latest.items())
+    ]
+
+
+_PROVIDER_NAMES = {
+    "local-market": "本地日线行情库",
+    "local-mx": "本地 MX 资讯库",
+    "public-a-share": "公开 A 股数据源",
+}
+
+
+def _research_data_catalog(catalog: ManifestCatalog) -> list[dict[str, object]]:
+    grouped: dict[str, list[object]] = defaultdict(list)
+    for product in catalog.products.values():
+        grouped[product.product.id].append(product)
+    result: list[dict[str, object]] = []
+    for product_id, versions in sorted(grouped.items()):
+        ordered = sorted(versions, key=lambda item: item.product.version)  # type: ignore[union-attr]
+        items = [_research_product_item(item) for item in ordered]
+        result.append({
+            "product_id": product_id,
+            "latest": items[-1],
+            "history": items,
+        })
+    return result
+
+
+def _research_product_item(product) -> dict[str, object]:
+    return {
+        "product_ref": str(product.product),
+        "title": product.title,
+        "dependencies": [str(item) for item in product.dependencies],
+        "providers": [
+            {"provider_id": provider, "display_name": _PROVIDER_NAMES.get(provider, provider)}
+            for provider in product.providers
+        ],
+        "supports_feed_scope": bool(product.feed_scope),
+        "feed_scope_contract": product.feed_scope,
+    }
+
+
+def _research_agent_access_list(
+    catalog: ManifestCatalog,
+    authorized_rids: tuple[int, ...],
+) -> list[dict[str, object]]:
+    grouped: dict[str, list[object]] = defaultdict(list)
+    for agent in catalog.agents.values():
+        grouped[agent.agent.id].append(agent)
+    result: list[dict[str, object]] = []
+    for agent_id, versions in sorted(grouped.items()):
+        ordered = sorted(versions, key=lambda item: item.agent.version)  # type: ignore[union-attr]
+        items = [_research_agent_access_item(catalog, item, authorized_rids) for item in ordered]
+        result.append({"agent_id": agent_id, "latest": items[-1], "history": items})
+    return result
+
+
+def _research_agent_access_item(
+    catalog: ManifestCatalog,
+    agent,
+    authorized_rids: tuple[int, ...],
+) -> dict[str, object]:
+    allowed = set(authorized_rids)
+    access_items: list[dict[str, object]] = []
+    assigned: set[int] = set()
+    revoked: list[int] = []
+    for access in agent.product_accesses:
+        item: dict[str, object] = {"product_ref": str(access.product)}
+        if access.feed_scope is not None:
+            rid_items = []
+            for rid in access.feed_scope.rids:
+                state = "current" if rid in allowed else "revoked"
+                rid_items.append({"rid": rid, "authorization": state})
+                assigned.add(rid)
+                if state == "revoked":
+                    revoked.append(rid)
+            item["feed_scope"] = {"rids": rid_items}
+        access_items.append(item)
+    team_refs = sorted(
+        str(team.team)
+        for team in catalog.teams.values()
+        if any(member == agent.agent for member in team.agents)
+    )
+    return {
+        "agent_ref": str(agent.agent),
+        "scope": agent.scope.value,
+        "title": agent.title,
+        "summary": _agent_summary(agent.instructions),
+        "instructions": agent.instructions,
+        "data_access": access_items,
+        "used_by_team_refs": team_refs,
+        "unassigned_rids": sorted(allowed - assigned),
+        "blocked_reasons": [f"RID {rid} 的授权已撤销" for rid in sorted(set(revoked))],
+        "read_only": {
+            "query_budget": agent.query_budget,
+            "max_result_rows": agent.max_result_rows,
+            "implementation": agent.implementation,
+        },
+    }
+
+
+def _research_team_list(catalog: ManifestCatalog, enabled_refs: tuple[str, ...]) -> list[dict[str, object]]:
+    enabled_by_id = {VersionRef.parse(reference).id: reference for reference in enabled_refs}
+    grouped: dict[str, list[object]] = defaultdict(list)
+    for team in catalog.teams.values():
+        grouped[team.team.id].append(team)
+    items: list[dict[str, object]] = []
+    for team_id, versions in sorted(grouped.items()):
+        ordered = sorted(versions, key=lambda item: item.team.version)  # type: ignore[union-attr]
+        latest = ordered[-1]
+        items.append(
+            {
+                "team_id": team_id,
+                "latest": _research_team_item(latest),
+                "history": [_research_team_item(item) for item in ordered],
+                "daily_enabled_ref": enabled_by_id.get(team_id),
+            }
+        )
+    return items
+
+
+def _research_team_item(team) -> dict[str, object]:
+    return {
+        "team_ref": str(team.team),
+        "scope": team.scope.value,
+        "title": team.title,
+        "agents": [str(agent) for agent in team.agents],
+    }
+
+
+def _research_subject_item(subject: ResearchSubject) -> dict[str, object]:
+    return {"scope": subject.scope.value, "code": subject.code, "name": subject.name}
+
+
+def _research_request_item(request: ResearchRequest) -> dict[str, object]:
+    return {
+        "mode": request.mode,
+        "request_id": request.request_id,
+        "team_ref": str(request.team),
+        "scope": request.scope.value,
+        "subject": _research_subject_item(request.subject),
+        "origin": request.origin,
+        "requested_at": request.requested_at.isoformat(),
+        "accepted_at": request.accepted_at.isoformat(),
+        "boundary_at": request.boundary.as_of.isoformat() if request.boundary is not None else None,
+        "status": request.status,
+        "phase": request.phase,
+        "agents_completed": request.agents_completed,
+        "agents_total": request.agents_total,
+        "decision_stage": request.decision_stage,
+        "reason_code": request.reason_code,
+        "published_at": request.published_at.isoformat() if request.published_at is not None else None,
+        "rerun_of": request.rerun_of,
+        "last_updated_at": request.last_updated_at.isoformat(),
+        "can_cancel": request.status in {"queued", "running"},
+        "can_rerun": request.status in {"passed", "partial", "blocked", "failed", "cancelled"},
+    }
+
+
+def _research_record_item(
+    record: ResearchRecord,
+    *,
+    quality_summary: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "mode": record.mode,
+        "record_id": record.record_id,
+        "request_id": record.request_id,
+        "team_ref": str(record.team),
+        "scope": record.scope.value,
+        "subject": _research_subject_item(record.subject),
+        "origin": record.origin,
+        "requested_at": record.requested_at.isoformat(),
+        "accepted_at": record.accepted_at.isoformat(),
+        "boundary_at": record.boundary.as_of.isoformat() if record.boundary is not None else None,
+        "status": record.status,
+        "phase": record.phase,
+        "reason_code": record.reason_code,
+        "published_at": record.published_at.isoformat() if record.published_at is not None else None,
+        "rerun_of": record.rerun_of,
+        "has_report": record.status in {"passed", "partial"},
+        "quality_summary": quality_summary or _research_quality_summary(record, None),
+    }
+
+
+def _research_quality_summary(record: ResearchRecord, store: ArtifactStore | None) -> dict[str, object]:
+    """A list-safe quality projection; it never exposes report content."""
+    if record.status not in {"passed", "partial"}:
+        return {"status": "not_applicable", "limitations_count": 0, "blocked_insights": 0}
+    if store is None or not record.report_json_hash:
+        return {"status": "unavailable", "limitations_count": 0, "blocked_insights": 0}
+    try:
+        report = store.read_json(record.report_json_hash)
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"status": "unavailable", "limitations_count": 0, "blocked_insights": 0}
+    if not isinstance(report, dict) or not _safe_research_report(report, ""):
+        return {"status": "unavailable", "limitations_count": 0, "blocked_insights": 0}
+    return _quality_summary_from_report(report)
+
+
+def _quality_summary_from_report(report: dict[str, object]) -> dict[str, object]:
+    quality = report.get("evidence_quality")
+    if not isinstance(quality, dict) or quality.get("status") not in {"passed", "warning", "blocked"}:
+        return {"status": "unavailable", "limitations_count": 0, "blocked_insights": 0}
+    limitations = quality.get("limitations")
+    limitations_count = len(limitations) if isinstance(limitations, list) and len(limitations) <= 50 else 0
+    insights = report.get("insights")
+    blocked_insights = sum(
+        1 for item in insights
+        if isinstance(item, dict) and item.get("status") == "blocked"
+    ) if isinstance(insights, list) and len(insights) <= 20 else 0
+    return {
+        "status": quality["status"],
+        "limitations_count": limitations_count,
+        "blocked_insights": blocked_insights,
+    }
+
+
+def _safe_research_report(payload: object, markdown: str, *, depth: int = 0) -> bool:
+    from advisor.research.reporting.safety import is_public_report
+    return is_public_report(payload, markdown, depth=depth)
+
+
+def _mx_listener_status_payload(status) -> dict[str, object]:
+    """Return only the three-dimensional Listener status contract.
+
+    Logs and all runtime connection identifiers remain available to the local
+    service manager, but are intentionally not copied onto this web surface.
+    """
+    return {
+        "service_id": status.service_id,
+        "status": status.status,
+        "details": status.details,
+        **status.extra,
+    }
+
+
+def _agent_summary(instructions: str) -> str:
+    first_line = next((line.strip() for line in instructions.splitlines() if line.strip()), "")
+    return first_line[:240]
+
+
 def _health_payload(state_dir: Path) -> dict:
     components = {component: "unknown" for component in _COMPONENTS}
     components["api"] = "ok"
@@ -258,6 +1586,57 @@ def _health_payload(state_dir: Path) -> dict:
         if isinstance(value, str) and value in _HEALTH_STATUSES:
             components[component] = value
     return {"status": "ok", "service": "advisor-api", **components}
+
+
+def _list_research_cycles(reports_root: Path, *, limit: int) -> list[dict]:
+    items: list[dict] = []
+    try:
+        date_dirs = sorted((item for item in reports_root.iterdir() if item.is_dir() and not item.is_symlink()), reverse=True)
+    except OSError:
+        return []
+    for date_dir in date_dirs:
+        for cycle_dir in sorted((item for item in date_dir.iterdir() if item.is_dir() and not item.is_symlink()), reverse=True):
+            if len(items) >= limit:
+                return items
+            try:
+                payload = _read_research_cycle(reports_root, date_dir.name, cycle_dir.name)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            items.append({
+                "report_date": date_dir.name,
+                "cycle_id": cycle_dir.name,
+                "status": payload.get("status"),
+                "subject": payload.get("subject"),
+                "href": f"/api/research/cycles/{date_dir.name}/{cycle_dir.name}",
+            })
+    return items
+
+
+def _read_research_cycle(reports_root: Path, report_date: str, cycle_id: str) -> dict:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", report_date) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", cycle_id):
+        raise ValueError("invalid Research Cycle path")
+    root = (reports_root / report_date / cycle_id).resolve()
+    report_base = reports_root.resolve()
+    if not root.is_relative_to(report_base) or root.is_symlink() or not root.is_dir():
+        raise ValueError("Research Cycle directory is unavailable")
+    cycle_path = root / "cycle.json"
+    index_path = root / "index.md"
+    marker_path = root / "complete.json"
+    if any(path.is_symlink() or not path.is_file() for path in (cycle_path, index_path, marker_path)):
+        raise ValueError("Research Cycle publication is incomplete")
+    payload = json.loads(cycle_path.read_text(encoding="utf-8"))
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(marker, dict):
+        raise ValueError("Research Cycle publication is invalid")
+    expected_files = marker.get("files")
+    if isinstance(expected_files, dict):
+        for relative, expected_hash in expected_files.items():
+            target = (root / relative).resolve()
+            if not target.is_relative_to(root) or target.is_symlink() or not target.is_file():
+                raise ValueError("Research Cycle artifact is unavailable")
+            if hashlib.sha256(target.read_bytes()).hexdigest() != expected_hash:
+                raise ValueError("Research Cycle artifact hash mismatch")
+    return payload
 
 
 def _load_health_snapshot(path: Path) -> dict:
@@ -360,6 +1739,178 @@ def _current_state(state_dir: Path, db_path: Path, report_cursor_secret: bytes) 
         "chart_list": chart_list,
         "health": health,
     }
+
+
+def _market_daily_status_payload(connection: sqlite3.Connection, now: datetime) -> dict:
+    latest = connection.execute(
+        """
+        SELECT run_id, run_type, status, target_session, total_items, completed_items,
+               failed_items, created_at, started_at, finished_at
+        FROM market_daily_runs ORDER BY created_at DESC, run_id DESC LIMIT 1
+        """
+    ).fetchone()
+    pending_cold = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM market_daily_requests WHERE request_type = 'cold_start' AND status IN ('pending', 'claimed')"
+        ).fetchone()[0]
+    )
+    lease = connection.execute(
+        "SELECT expires_at FROM market_daily_service_leases WHERE lease_name = 'market-daily'"
+    ).fetchone()
+    lease_expires_at = _safe_market_timestamp(lease[0]) if lease else None
+    lease_active = bool(lease_expires_at and datetime.fromisoformat(lease_expires_at) > now)
+    session = connection.execute("SELECT MAX(trade_date) FROM trading_sessions").fetchone()[0]
+    latest_update = connection.execute(
+        "SELECT MAX(fetched_at) FROM market_daily WHERE quality_status = 'passed'"
+    ).fetchone()[0]
+    if latest is None:
+        state = "waiting_for_cold_start" if pending_cold else "idle"
+        run_payload: dict[str, object] = {
+            "run_id": None,
+            "mode": None,
+            "target_session": None,
+            "total_items": 0,
+            "completed_items": 0,
+            "failed_items": 0,
+            "progress": 0.0,
+            "run_status": None,
+        }
+    else:
+        total = max(0, int(latest[4]))
+        completed = max(0, int(latest[5]))
+        failed = max(0, int(latest[6]))
+        state = latest[2] if latest[2] in {"pending", "running", "partial", "complete", "failed", "cancelled"} else "failed"
+        run_payload = {
+            "run_id": latest[0],
+            "mode": latest[1],
+            "target_session": latest[3],
+            "total_items": total,
+            "completed_items": completed,
+            "failed_items": failed,
+            "progress": round(min(1.0, (completed + failed) / total), 6) if total else 0.0,
+            "run_status": latest[2],
+        }
+    next_due = now.astimezone(_SHANGHAI).replace(hour=21, minute=0, second=0, microsecond=0)
+    if now >= next_due:
+        next_due += timedelta(days=1)
+    return {
+        "state": state,
+        "service_status": "running" if lease_active else "offline",
+        "lease_active": lease_active,
+        "lease_expires_at": lease_expires_at,
+        "latest_observed_session": session if _valid_dashboard_date(session) else None,
+        "last_successful_update": _safe_market_timestamp(latest_update),
+        "next_scheduled_at": next_due.isoformat(),
+        **run_payload,
+    }
+
+
+def _market_daily_run_list(connection: sqlite3.Connection, limit: int) -> list[dict]:
+    rows = connection.execute(
+        """
+        SELECT run_id, run_type, status, target_session, start_date, end_date,
+               total_items, completed_items, failed_items, created_at, started_at, finished_at
+        FROM market_daily_runs ORDER BY created_at DESC, run_id DESC LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [_market_daily_run_row(row) for row in rows]
+
+
+def _market_daily_run_detail(connection: sqlite3.Connection, run_id: str) -> dict | None:
+    row = connection.execute(
+        """
+        SELECT run_id, run_type, status, target_session, start_date, end_date,
+               total_items, completed_items, failed_items, created_at, started_at, finished_at
+        FROM market_daily_runs WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    counts = connection.execute(
+        """
+        SELECT status, COUNT(*) AS count FROM market_daily_run_items
+        WHERE run_id = ? GROUP BY status ORDER BY status
+        """,
+        (run_id,),
+    ).fetchall()
+    return {
+        **_market_daily_run_row(row),
+        "item_status_counts": {item["status"]: int(item["count"]) for item in counts},
+        "failures_href": f"/api/market-daily/runs/{run_id}/failures",
+    }
+
+
+def _market_daily_run_row(row: sqlite3.Row) -> dict:
+    total = max(0, int(row["total_items"]))
+    completed = max(0, int(row["completed_items"]))
+    failed = max(0, int(row["failed_items"]))
+    return {
+        "run_id": row["run_id"],
+        "mode": row["run_type"],
+        "status": row["status"],
+        "target_session": row["target_session"],
+        "start_date": row["start_date"],
+        "end_date": row["end_date"],
+        "total_items": total,
+        "completed_items": completed,
+        "failed_items": failed,
+        "progress": round(min(1.0, (completed + failed) / total), 6) if total else 0.0,
+        "created_at": _safe_market_timestamp(row["created_at"]),
+        "started_at": _safe_market_timestamp(row["started_at"]),
+        "finished_at": _safe_market_timestamp(row["finished_at"]),
+    }
+
+
+def _market_daily_failures(
+    connection: sqlite3.Connection, run_id: str, limit: int, offset: int
+) -> dict:
+    exists = connection.execute(
+        "SELECT 1 FROM market_daily_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if exists is None:
+        return {"items": [], "total": 0, "offset": offset, "next_offset": None}
+    total = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM market_daily_run_items
+            WHERE run_id = ? AND status IN ('source_missing', 'conflicted')
+            """,
+            (run_id,),
+        ).fetchone()[0]
+    )
+    rows = connection.execute(
+        """
+        SELECT code, status, attempts, selected_source, last_error, updated_at
+        FROM market_daily_run_items
+        WHERE run_id = ? AND status IN ('source_missing', 'conflicted')
+        ORDER BY code LIMIT ? OFFSET ?
+        """,
+        (run_id, limit, offset),
+    ).fetchall()
+    items = [
+        {
+            "code": row["code"],
+            "status": row["status"],
+            "attempts": int(row["attempts"]),
+            "selected_source": row["selected_source"],
+            "error": (row["last_error"] or "")[:320] or None,
+            "updated_at": _safe_market_timestamp(row["updated_at"]),
+        }
+        for row in rows
+    ]
+    next_offset = offset + len(items) if offset + len(items) < total else None
+    return {"items": items, "total": total, "offset": offset, "next_offset": next_offset}
+
+
+def _safe_market_timestamp(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return _parse_shanghai_datetime(value).isoformat()
+    except ValueError:
+        return None
 
 
 def _read_connection(db_path: Path) -> sqlite3.Connection | None:

@@ -11,6 +11,7 @@ PYTHON_PLACEHOLDER = "{{PYTHON}}"
 NODE24_BIN = "/Users/mac/.local/share/chrome-devtools-mcp/node/bin"
 NODE24 = f"{NODE24_BIN}/node"
 NPM_CLI = "/Users/mac/.local/share/chrome-devtools-mcp/node/lib/node_modules/npm/bin/npm-cli.js"
+RUNTIME_PYTHON_RELATIVE = Path(".venv-runtime/bin/python")
 
 REQUIRED_KEYS = {
     "Label",
@@ -25,6 +26,7 @@ LAUNCHD_TEMPLATE_NAMES = (
     "com.ahunter.advisor-frontend.plist.template",
     "com.ahunter.advisor-premarket.plist.template",
     "com.ahunter.advisor-review.plist.template",
+    "com.ahunter.research.plist.template",
 )
 
 
@@ -47,6 +49,12 @@ def validate_launchd_template(path: Path) -> bool:
         return _valid_report_payload(payload, args, "advisor.scheduler.premarket", 8, 30)
     if label == "com.ahunter.advisor-review":
         return _valid_report_payload(payload, args, "advisor.scheduler.review", 22, 30)
+    if label == "com.ahunter.market-daily":
+        return _valid_market_daily_payload(payload, args)
+    if label == "com.ahunter.mx-listener":
+        return _valid_mx_listener_payload(payload, args)
+    if label == "com.ahunter.research":
+        return _valid_research_payload(payload, args)
     return False
 
 
@@ -114,6 +122,54 @@ def _valid_report_payload(payload: dict, args: list[str], module: str, hour: int
     )
 
 
+def _valid_market_daily_payload(payload: dict, args: list[str]) -> bool:
+    return (
+        payload.get("KeepAlive") is True
+        and "StartCalendarInterval" not in payload
+        and payload.get("WorkingDirectory") == REPO_ROOT_PLACEHOLDER
+        and payload.get("StandardOutPath") == f"{REPO_ROOT_PLACEHOLDER}/logs/market-daily.out.log"
+        and payload.get("StandardErrorPath") == f"{REPO_ROOT_PLACEHOLDER}/logs/market-daily.err.log"
+        and args == [PYTHON_PLACEHOLDER, "-m", "advisor.market_daily.cli", "service", "run"]
+    )
+
+
+def _valid_mx_listener_payload(payload: dict, args: list[str]) -> bool:
+    environment = payload.get("EnvironmentVariables", {})
+    if not isinstance(environment, dict) or any(
+        not isinstance(key, str) or any(term in key.lower() for term in ("token", "secret", "cookie", "password", "debug", "cdp"))
+        for key in environment
+    ):
+        return False
+    return (
+        payload.get("KeepAlive") is True
+        and payload.get("RunAtLoad") is True
+        and payload.get("ThrottleInterval") == 10
+        and "StartCalendarInterval" not in payload
+        and payload.get("WorkingDirectory") == REPO_ROOT_PLACEHOLDER
+        and payload.get("StandardOutPath") == f"{REPO_ROOT_PLACEHOLDER}/logs/mx-listener.out.log"
+        and payload.get("StandardErrorPath") == f"{REPO_ROOT_PLACEHOLDER}/logs/mx-listener.err.log"
+        and args == [
+            NODE24,
+            f"{REPO_ROOT_PLACEHOLDER}/scripts/run-mx-listener-service.mjs",
+            "--cdp",
+            "http://127.0.0.1:9333",
+        ]
+    )
+
+
+def _valid_research_payload(payload: dict, args: list[str]) -> bool:
+    return (
+        payload.get("KeepAlive") is True
+        and payload.get("RunAtLoad") is True
+        and payload.get("ThrottleInterval") == 10
+        and "StartCalendarInterval" not in payload
+        and payload.get("WorkingDirectory") == REPO_ROOT_PLACEHOLDER
+        and payload.get("StandardOutPath") == f"{REPO_ROOT_PLACEHOLDER}/logs/research.out.log"
+        and payload.get("StandardErrorPath") == f"{REPO_ROOT_PLACEHOLDER}/logs/research.err.log"
+        and args == [PYTHON_PLACEHOLDER, "-m", "advisor.research.cli", "service", "run"]
+    )
+
+
 def _contains_shell_interpolation(value: object) -> bool:
     return isinstance(value, str) and "$" in value
 
@@ -133,16 +189,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate or render A Hunter advisor launchd templates.")
     parser.add_argument("template", type=Path)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--python", type=Path, default=Path(".venv311/bin/python"))
+    parser.add_argument("--python", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if not validate_launchd_template(args.template):
         raise SystemExit(1)
     if args.output is not None:
+        resolved_repo_root = args.repo_root.resolve()
+        python_path = (
+            resolved_repo_root / RUNTIME_PYTHON_RELATIVE
+            if args.python is None
+            else _absolute_without_symlink_resolution(args.python)
+        )
         rendered = render_launchd_template(
             args.template,
-            repo_root=args.repo_root.resolve(),
-            python=_absolute_without_symlink_resolution(args.python),
+            repo_root=resolved_repo_root,
+            python=python_path,
         )
         _ensure_render_directories(rendered, args.output)
         args.output.write_text(rendered, encoding="utf-8")
@@ -181,7 +243,7 @@ def install_launch_agents(
     rendered_outputs = []
     resolved_repo_root = repo_root.resolve()
     python_path = (
-        resolved_repo_root / ".venv311/bin/python"
+        resolved_repo_root / RUNTIME_PYTHON_RELATIVE
         if python is None
         else _absolute_without_symlink_resolution(python)
     )

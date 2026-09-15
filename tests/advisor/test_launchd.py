@@ -35,6 +35,8 @@ def test_launchd_templates_are_valid():
         "com.ahunter.advisor-premarket.plist.template",
         "com.ahunter.advisor-review.plist.template",
         "com.ahunter.advisor-frontend.plist.template",
+        "com.ahunter.mx-listener.plist.template",
+        "com.ahunter.research.plist.template",
     ]:
         assert validate_launchd_template(LAUNCHD_DIR / name)
 
@@ -186,6 +188,30 @@ def test_launchd_render_preserves_explicit_python_path(tmp_path):
     assert payload["ProgramArguments"][0] == str(explicit_python)
 
 
+def test_launchd_render_defaults_runtime_python_under_repo_root_outside_repo_cwd(tmp_path, monkeypatch):
+    output = tmp_path / "Library" / "LaunchAgents" / "advisor.plist"
+    repo_root = tmp_path / "repo"
+    _copy_launchd_templates(repo_root)
+    template = repo_root / "config" / "launchd" / "com.ahunter.advisor-api.plist.template"
+    outside_cwd = tmp_path / "outside"
+    outside_cwd.mkdir()
+    monkeypatch.chdir(outside_cwd)
+
+    exit_code = main(
+        [
+            str(template),
+            "--repo-root",
+            str(repo_root),
+            "--output",
+            str(output),
+        ]
+    )
+
+    payload = plistlib.loads(output.read_bytes())
+    assert exit_code == 0
+    assert payload["ProgramArguments"][0] == str(repo_root.resolve() / ".venv-runtime/bin/python")
+
+
 def test_launchd_manage_install_writes_all_plists_and_preserves_python_path(tmp_path, capsys):
     launch_agents_dir = tmp_path / "Library" / "LaunchAgents"
     repo_root = tmp_path / "repo"
@@ -216,6 +242,7 @@ def test_launchd_manage_install_writes_all_plists_and_preserves_python_path(tmp_
         "com.ahunter.advisor-frontend.plist",
         "com.ahunter.advisor-premarket.plist",
         "com.ahunter.advisor-review.plist",
+        "com.ahunter.research.plist",
     ]
     assert logs_dir.is_dir()
     for plist_path in installed:
@@ -281,6 +308,7 @@ def test_launchd_manage_install_uses_repo_root_templates_outside_repo_cwd(tmp_pa
         "com.ahunter.advisor-frontend.plist",
         "com.ahunter.advisor-premarket.plist",
         "com.ahunter.advisor-review.plist",
+        "com.ahunter.research.plist",
     ]
     for plist_path in installed:
         payload = plistlib.loads(plist_path.read_bytes())
@@ -315,7 +343,7 @@ def test_launchd_manage_install_defaults_python_under_repo_root_outside_repo_cwd
         if payload["Label"] == "com.ahunter.advisor-frontend":
             assert payload["ProgramArguments"][0] == "/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node"
         else:
-            assert payload["ProgramArguments"][0] == str(project_root.resolve() / ".venv311/bin/python")
+            assert payload["ProgramArguments"][0] == str(project_root.resolve() / ".venv-runtime/bin/python")
 
 
 def test_launchd_manage_install_does_not_load_without_load_flag(tmp_path, monkeypatch):
@@ -368,6 +396,7 @@ def test_launchd_manage_install_load_dispatches_installed_plists(tmp_path, monke
         launch_agents_dir / "com.ahunter.advisor-frontend.plist",
         launch_agents_dir / "com.ahunter.advisor-premarket.plist",
         launch_agents_dir / "com.ahunter.advisor-review.plist",
+        launch_agents_dir / "com.ahunter.research.plist",
     ]
     assert exit_code == 0
     assert load_calls == [expected]
@@ -386,168 +415,3 @@ def test_launchd_load_bootstraps_each_plist_with_injected_runner(tmp_path, monke
         ["launchctl", "bootstrap", "gui/501", str(plists[0])],
         ["launchctl", "bootstrap", "gui/501", str(plists[1])],
     ]
-
-
-def test_review_scheduler_archives_sanitized_failure_when_morning_archive_linkage_fails(
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    config_dir = tmp_path / "config"
-    config_dir.mkdir()
-    output_dir = tmp_path / "reports"
-    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: output_dir)
-    config_path = config_dir / "advisor.yaml"
-    config_path.write_text(
-        """
-market:
-  primary: A股
-schedule:
-  premarket_time: "08:30"
-  review_time: "22:30"
-storage:
-  database: data/advisor/operational.sqlite
-data_sources:
-  allow_tushare: false
-  free_sources: []
-""".lstrip(),
-        encoding="utf-8",
-    )
-    allowed_rids = config_dir / "allowed-rids.yaml"
-    allowed_rids.write_text("allowed_rids: []\n", encoding="utf-8")
-    as_of = datetime(2026, 7, 12, 22, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
-    snapshot = CollectorSnapshot(
-        events=(),
-        quality=QualityResult("collector_state", "blocking", True, "collector ready"),
-        as_of=as_of,
-        allowed_rids=(),
-    )
-    monkeypatch.setattr(
-        scheduler_review,
-        "read_collector_snapshot",
-        lambda *_args, **_kwargs: snapshot,
-    )
-    monkeypatch.setattr(
-        scheduler_review,
-        "_expanded_candidate_codes",
-        lambda *_args, **_kwargs: ("600519",),
-    )
-    monkeypatch.setattr(
-        scheduler_review.ConfiguredProviderRegistry,
-        "from_yaml",
-        lambda *_args, **_kwargs: SimpleNamespace(historical_provider=object()),
-    )
-    monkeypatch.setattr(
-        scheduler_review,
-        "update_market_database",
-        lambda *_args, **_kwargs: None,
-    )
-
-    def fail_missing_archive(**_kwargs):
-        raise ValueError("premarket archive not found token=secret raw-evidence")
-
-    exit_code = scheduler_review.main(
-        [
-            "--config",
-            str(config_path),
-            "--allowed-rids",
-            str(allowed_rids),
-            "--events-db",
-            str(tmp_path / "events.sqlite"),
-            "--output-dir",
-            str(output_dir),
-            "--date",
-            "2026-07-12",
-            "--run-id",
-            "review-runtime",
-        ],
-        coordinator=fail_missing_archive,
-    )
-
-    payload = json.loads(capsys.readouterr().out)
-    archive_payload = json.loads(Path(payload["json_path"]).read_text(encoding="utf-8"))
-    combined = json.dumps(payload) + json.dumps(archive_payload)
-    assert exit_code == 1
-    assert payload["status"] == "failed"
-    assert payload["error"] == "ValueError"
-    assert archive_payload["report_type"] == "failure"
-    assert archive_payload["attempted_run_type"] == "review"
-    assert "premarket archive not found" not in combined
-    assert "token=secret" not in combined
-    assert "raw-evidence" not in combined
-
-
-def test_premarket_scheduler_archives_sanitized_failure_when_calendar_unsupported(
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    config_dir = tmp_path / "config"
-    config_dir.mkdir()
-    output_dir = tmp_path / "reports"
-    monkeypatch.setattr(advisor_paths, "reports_dir", lambda: output_dir)
-    config_path = config_dir / "advisor.yaml"
-    config_path.write_text(
-        """
-market:
-  primary: A股
-schedule:
-  premarket_time: "08:30"
-  review_time: "22:30"
-storage:
-  database: data/advisor/operational.sqlite
-data_sources:
-  allow_tushare: false
-  free_sources: []
-""".lstrip(),
-        encoding="utf-8",
-    )
-    allowed_rids = config_dir / "allowed-rids.yaml"
-    allowed_rids.write_text("allowed_rids: []\n", encoding="utf-8")
-    as_of = datetime(2027, 1, 4, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
-    snapshot = CollectorSnapshot(
-        events=(),
-        quality=QualityResult("collector_state", "blocking", True, "collector ready"),
-        as_of=as_of,
-        allowed_rids=(),
-    )
-    monkeypatch.setattr(
-        scheduler_premarket,
-        "read_collector_snapshot",
-        lambda *_args, **_kwargs: snapshot,
-    )
-    monkeypatch.setattr(
-        scheduler_premarket,
-        "_expanded_candidate_codes",
-        lambda *_args, **_kwargs: ("600519",),
-    )
-
-    exit_code = scheduler_premarket.main(
-        [
-            "--config",
-            str(config_path),
-            "--allowed-rids",
-            str(allowed_rids),
-            "--events-db",
-            str(tmp_path / "events.sqlite"),
-            "--output-dir",
-            str(output_dir),
-            "--as-of",
-            as_of.isoformat(),
-            "--date",
-            "2027-01-04",
-            "--run-id",
-            "premarket-runtime",
-        ],
-        coordinator=lambda **_kwargs: None,
-    )
-
-    payload = json.loads(capsys.readouterr().out)
-    archive_payload = json.loads(Path(payload["json_path"]).read_text(encoding="utf-8"))
-    combined = json.dumps(payload) + json.dumps(archive_payload)
-    assert exit_code == 1
-    assert payload["status"] == "failed"
-    assert payload["error"] == "UnsupportedTradingCalendarError"
-    assert archive_payload["report_type"] == "failure"
-    assert archive_payload["attempted_run_type"] == "premarket"
-    assert "unsupported A-share trading calendar range" not in combined

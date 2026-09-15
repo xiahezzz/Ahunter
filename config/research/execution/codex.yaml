@@ -1,0 +1,7 @@
+policy: codex@1
+model: gpt-5.4
+reasoning_effort: medium
+timeout_seconds: 900
+max_agent_concurrency: 3
+max_stage_concurrency: 3
+max_retries: 1

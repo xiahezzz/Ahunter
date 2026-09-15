@@ -1,0 +1,5 @@
+product: insider_activity@1
+title: 股东与公司内部人持股变动
+providers: [public-a-share]
+result_schema: {type: object}
+retention_class: ownership

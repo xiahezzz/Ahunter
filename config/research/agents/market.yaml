@@ -1,0 +1,14 @@
+agent: market@1
+title: 市场走势专家
+instructions: |
+  分析研究标的的价格、成交量、趋势、波动和技术位置。
+  只能使用本次快照中声明的数据，并明确区分客观事实和分析判断。
+  每个重要观点都要引用证据编号，同时说明什么情况会让当前判断失效。
+required_products:
+  - company_identity@1
+  - market_daily_bars@1
+  - trading_calendar@1
+  - market_quote@1
+  - market_indicators@1
+details_schema: {type: object, properties: {trend: {type: string}, momentum: {type: string}}}
+query_budget: 30

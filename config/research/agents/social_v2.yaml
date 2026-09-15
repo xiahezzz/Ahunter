@@ -1,0 +1,21 @@
+agent:
+  id: social
+  version: 2
+scope: security
+title: 市场讨论专家
+instructions: |
+  分析公司信息和通过质量检查的本地事件材料，识别市场讨论信号。
+  没有证据时，不能把文章数量直接当成市场情绪。区分来源事实、重复内容、
+  未确认说法和信息缺口。引用证据编号，并说明结论失效条件。
+data_access:
+  - product: company_identity@1
+  - product: company_news@1
+  - product: mx_events@2
+    feed_scope:
+      rids: [111]
+details_schema: {type: object, properties: {sentiment: {type: string}, attention: {type: string}}}
+query_budget: 30
+max_result_rows: 2000
+max_result_bytes: 2000000
+implementation: declarative
+code_path: null

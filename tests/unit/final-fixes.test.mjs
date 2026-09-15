@@ -299,7 +299,6 @@ test("live smoke is Network-only and docs use repository-root commands", async (
   assert.match(docs, /npm --prefix scripts\/mx-websocket run decode/);
   for (const phrase of ["24 hours", "media jobs", "30-second", "authorization_required", "live reload"]) assert.match(docs, new RegExp(phrase, "i"));
   const runner = await readFile(new URL("../../scripts/run-collector.mjs", import.meta.url), "utf8");
-  assert.match(runner, /await drainMediaJobs/);
-  assert.match(runner, /setInterval\([^\n]*drainPersistedMedia/);
-  assert.match(runner, /try\s*{\s*stopMaintenance = startRetentionMaintenance/s);
+  assert.match(runner, /runMxListenerService/);
+  assert.doesNotMatch(runner, /runCollectorLoop/);
 });

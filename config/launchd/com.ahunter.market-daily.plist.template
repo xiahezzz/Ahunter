@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ahunter.market-daily</string>
+  <key>WorkingDirectory</key>
+  <string>{{REPO_ROOT}}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON}}</string>
+    <string>-m</string>
+    <string>advisor.market_daily.cli</string>
+    <string>service</string>
+    <string>run</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{REPO_ROOT}}/logs/market-daily.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{REPO_ROOT}}/logs/market-daily.err.log</string>
+</dict>
+</plist>

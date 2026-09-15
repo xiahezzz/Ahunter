@@ -24,6 +24,10 @@ export async function runCollectorLoop({
   maxQueuedFrames = 100,
   drainTimeoutMs = 30_000,
   workController = new AbortController(),
+  keepWaitingForAuthorization = false,
+  onState = () => {},
+  onFrame = () => {},
+  onFrameError = () => {},
 }) {
   const pending = new Set();
   const queued = [];
@@ -53,7 +57,10 @@ export async function runCollectorLoop({
   const startFrame = (frame) => {
     const task = Promise.resolve()
       .then(() => collector.acceptFrame(frame, { signal: workController.signal }))
-      .catch((error) => log(`Frame ingestion failed (${errorName(error)})`))
+      .catch((error) => {
+        try { onFrameError(error); } catch { /* owner decides whether to stop */ }
+        log(`Frame ingestion failed (${errorName(error)})`);
+      })
       .finally(() => {
         pending.delete(task);
         const next = queued.shift();
@@ -65,6 +72,7 @@ export async function runCollectorLoop({
 
   const enqueueFrame = (frame) => {
     if (signal.aborted) return;
+    try { onFrame(frame); } catch { log("Frame activity update failed"); }
     if (pending.size < maxConcurrentFrames) startFrame(frame);
     else if (queued.length < maxQueuedFrames) queued.push(frame);
     else collector.recordOverflow?.("frame_queue_overflow");
@@ -87,6 +95,7 @@ export async function runCollectorLoop({
     while (!signal.aborted) {
       let unregister;
       try {
+        onState("connecting");
         const targetUrl = await findTarget(cdpBase, { signal });
         if (signal.aborted) break;
 
@@ -96,6 +105,7 @@ export async function runCollectorLoop({
         unregister = client.onEvent(route);
         await client.send("Network.enable");
         attempt = 0;
+        onState("listening");
         if (!signal.aborted) {
           let stopWaiting;
           const stopped = new Promise((resolve) => {
@@ -111,10 +121,11 @@ export async function runCollectorLoop({
         }
       } catch (error) {
         if (error instanceof AuthorizationRequiredError || error?.code === "authorization_required") {
+          onState("waiting_for_authorization");
           log("authorization_required");
-          return;
-        }
-        if (!signal.aborted) {
+          if (!keepWaitingForAuthorization) return;
+        } else if (!signal.aborted) {
+          onState("waiting_for_chrome");
           log(`Collector connection failed (${errorName(error)})`);
         }
       } finally {

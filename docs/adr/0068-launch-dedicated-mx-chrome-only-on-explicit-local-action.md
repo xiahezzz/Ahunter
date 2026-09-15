@@ -1,0 +1,5 @@
+# Launch dedicated MX Chrome only on explicit local action
+
+The Dedicated MX Chrome Launcher is a separate local control seam from the MX Listener Service. It may run only after an explicit same-origin WebUI action or a user-requested `ahunter mx chrome start` command through the same loopback API. It starts one fixed Chrome executable with a fixed loopback debugging endpoint and isolated profile; neither entry accepts a URL or caller-supplied launch settings. It never navigates, reloads, logs in, clicks, types, injects, reads page content, or participates in Listener automatic recovery. The API returns only bounded aggregate launch/readiness state, keeping profile paths, process details, and Chrome debugging identifiers out of WebUI and CLI responses while trading automatic browser recovery for an intentional operator step.
+
+The CLI entry was explicitly authorized on 2026-09-08 as part of exposing all Web API operations to agents. Listener lifecycle commands, launchd jobs, and automatic CLI recovery must not call it implicitly.

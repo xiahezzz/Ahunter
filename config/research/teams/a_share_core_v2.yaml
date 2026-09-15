@@ -1,0 +1,13 @@
+team:
+  id: a_share_core
+  version: 2
+scope: security
+title: A股核心研究团队
+agents:
+  - fundamentals@1
+  - hot_money@1
+  - lockup@1
+  - market@1
+  - news@1
+  - policy@1
+  - social@2

@@ -1,0 +1,7 @@
+product: trading_calendar@1
+title: A 股交易日历
+dependencies: [market_daily_bars@1]
+derived: true
+result_schema: {type: object, required: [sessions]}
+required_fields: [sessions]
+retention_class: market

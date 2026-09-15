@@ -9,28 +9,34 @@ import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Literal
+from zoneinfo import ZoneInfo
 
-from advisor.agents.astock_adapter import ANALYST_ROLES
-from advisor.calendar import UnsupportedTradingCalendarError, latest_expected_session
-from advisor.db.repository import (
-    CALENDAR_PROOF_PRODUCER,
-    CALENDAR_PROOF_VERSION,
-    TRUSTED_CALENDAR_SOURCES,
-    calendar_proof_content_hash,
-)
+from advisor.calendar import ObservedTradingSessionsUnavailableError, latest_expected_session
 from advisor.evidence.mx_adapter import CollectorSnapshot
 from advisor.ledger.model import LedgerTransaction, apply_transactions
+from advisor.market_daily.contracts import ObservedTradingSession, SessionObservationReceipt
 
 
 _MAX_LEDGER_ROWS = 10_000
 _MAX_SOURCE_ROWS = 1_000
-_MAX_STALENESS_DAYS = 7
+_MAX_SESSION_ROWS = 3_000
 _VALID_RUN_TYPES = frozenset({"premarket", "review"})
 _CODE_RE = re.compile(r"[03468]\d{5}\Z")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-_CALENDAR_PROOF_KEY_RE = re.compile(
-    r"advisor-calendar-proof:v1:[0-9a-f]{64}\Z"
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_SESSION_READY_AT = dt.time(21, 0)
+
+# The legacy operational quality tables are retained for existing local data
+# reads, but their contract now names only A Hunter's seven Research Agents.
+ANALYST_ROLES = (
+    "market",
+    "social",
+    "news",
+    "fundamentals",
+    "policy",
+    "hot_money",
+    "lockup",
 )
 
 
@@ -155,151 +161,129 @@ def _collector_check(snapshot: CollectorSnapshot | None) -> QualityResult:
 
 
 def _trading_calendar_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
-    expected, error = _expected_session_with_proof_audit(connection, request)
+    expected, error = _expected_observed_session(connection, request)
     if error is not None or expected is None:
-        return _blocked_check("trading_calendar", error or "latest expected trading session is unavailable")
+        return _blocked_check("trading_calendar", error or "最新已观测交易日不可用")
     missing = [
         code
         for code in request.candidate_codes
-        if connection.execute(
-            """
-            SELECT 1 FROM market_daily
-            WHERE code = ? AND trade_date = ? AND quality_status = 'passed'
-            LIMIT 1
-            """,
-            (code, expected.isoformat()),
-        ).fetchone()
-        is None
+        if not _has_security_coverage(connection, code, expected)
     ]
     if missing:
         return _blocked_check(
             "trading_calendar",
-            f"latest expected trading session {expected.isoformat()} is not covered by candidate rows",
+            f"最新已观测交易日 {expected.isoformat()} 缺少候选证券覆盖",
         )
     return QualityResult(
         "trading_calendar", "blocking", True,
-        f"latest expected trading session {expected.isoformat()} is covered",
+        f"最新已观测交易日 {expected.isoformat()} 已覆盖",
     )
 
 
-def _expected_session_with_proof_audit(
+def _expected_observed_session(
     connection: sqlite3.Connection, request: QualityRequest
 ) -> tuple[dt.date | None, str | None]:
-    try:
-        expected = latest_expected_session(request.as_of)
-    except UnsupportedTradingCalendarError:
-        return None, "trading calendar coverage is unsupported for this run"
-    rows = connection.execute(
+    """Read the local dual-source session facts without inferring any closure."""
+    session_rows = connection.execute(
         """
-        SELECT proof_id, contract_version, producer, calendar_source, as_of,
-               latest_expected_session, scope, coverage_codes_json, content_hash
-        FROM trading_calendar_proofs
-        ORDER BY as_of DESC, proof_id DESC
+        SELECT trade_date, primary_source, fallback_source, primary_observed_at,
+               fallback_observed_at, fetched_at, content_hash
+        FROM trading_sessions
+        WHERE trade_date <= ?
+        ORDER BY trade_date
         LIMIT ?
         """,
-        (_MAX_SOURCE_ROWS + 1,),
+        (request.as_of.date().isoformat(), _MAX_SESSION_ROWS + 1),
     ).fetchall()
-    if len(rows) > _MAX_SOURCE_ROWS:
-        return None, "trading calendar proof scan limit exceeded"
-    claims_by_code: dict[str, set[dt.date]] = defaultdict(set)
-    saw_historical_proof = False
-    for (
-        proof_id, contract_version, producer, calendar_source, proof_as_of_raw,
-        claimed_session_raw, scope, raw_coverage, content_hash,
-    ) in rows:
-        try:
-            if (
-                not isinstance(proof_id, str)
-                or not _CALENDAR_PROOF_KEY_RE.fullmatch(proof_id)
-                or contract_version != CALENDAR_PROOF_VERSION
-                or producer != CALENDAR_PROOF_PRODUCER
-                or not isinstance(calendar_source, str)
-                or calendar_source not in TRUSTED_CALENDAR_SOURCES
-            ):
-                raise ValueError("invalid calendar proof contract")
-            coverage = json.loads(raw_coverage)
-            if not isinstance(coverage, list):
-                raise ValueError("invalid calendar coverage")
-            expected_hash = calendar_proof_content_hash(
-                calendar_source=calendar_source,
-                as_of=proof_as_of_raw,
-                latest_expected_session=claimed_session_raw,
-                scope=scope,
-                coverage_codes=tuple(coverage),
+    if len(session_rows) > _MAX_SESSION_ROWS:
+        return None, "已观测交易日扫描超出上限"
+    try:
+        sessions: list[dt.date] = []
+        for row in session_rows:
+            fact = ObservedTradingSession(
+                trade_date=dt.date.fromisoformat(row[0]),
+                primary_source=row[1],
+                fallback_source=row[2],
+                primary_observed_at=dt.datetime.fromisoformat(row[3]),
+                fallback_observed_at=dt.datetime.fromisoformat(row[4]),
+                fetched_at=dt.datetime.fromisoformat(row[5]),
             )
-            if content_hash != expected_hash or proof_id != f"advisor-calendar-proof:v1:{expected_hash}":
-                raise ValueError("invalid calendar proof integrity")
-            proof_as_of = dt.datetime.fromisoformat(proof_as_of_raw)
-            if proof_as_of.tzinfo is None or proof_as_of.utcoffset() is None:
-                raise ValueError("invalid calendar as_of")
-            if proof_as_of > request.as_of:
-                return None, "trading calendar proof is future-dated for this run"
-            proof_date = proof_as_of.astimezone(request.as_of.tzinfo).date()
-            if proof_date < request.as_of.date():
-                saw_historical_proof = True
-                continue
-            if proof_date != request.as_of.date():
-                return None, "trading calendar proof is stale or not current for this run"
-            if scope == "candidate_codes":
-                if (
-                    not isinstance(coverage, list)
-                    or not coverage
-                    or len(coverage) > 200
-                    or len(set(coverage)) != len(coverage)
-                    or any(not isinstance(code, str) or not _CODE_RE.fullmatch(code) for code in coverage)
-                ):
-                    raise ValueError("invalid calendar coverage")
-                applicable_codes = set(request.candidate_codes).intersection(coverage)
-            elif scope == "a_share" and coverage == []:
-                applicable_codes = set(request.candidate_codes)
-            else:
-                raise ValueError("invalid calendar coverage")
-            if not applicable_codes:
-                continue
-            claimed = dt.date.fromisoformat(claimed_session_raw)
-            if claimed > request.as_of.date():
-                return None, "latest expected trading session is future-dated"
-            for code in applicable_codes:
-                claims_by_code[code].add(claimed)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None, "trading calendar proof is invalid"
+            if fact.content_hash != row[6]:
+                raise ValueError("交易日事实哈希不匹配")
+            sessions.append(fact.trade_date)
+        expected = latest_expected_session(request.as_of, tuple(sessions))
+    except (KeyError, TypeError, ValueError, ObservedTradingSessionsUnavailableError):
+        return None, "本地已观测交易日不可用或无效"
 
-    if any(code not in claims_by_code for code in request.candidate_codes):
-        if saw_historical_proof and not claims_by_code:
-            return None, "trading calendar proof is stale or not current for this run"
-        return None, "trading calendar latest expected session is unavailable"
-    if any(len(claims) != 1 for claims in claims_by_code.values()):
-        return None, "conflicting trading calendar proof"
-    claimed_sessions = {next(iter(claims)) for claims in claims_by_code.values()}
-    if len(claimed_sessions) != 1:
-        return None, "conflicting trading calendar proof"
-    claimed = next(iter(claimed_sessions))
-    if claimed != expected:
-        return None, (
-            f"trading calendar proof session {claimed.isoformat()} conflicts with "
-            f"independently expected session {expected.isoformat()}"
+    receipt_row = connection.execute(
+        """
+        SELECT observed_at, primary_source, fallback_source, latest_session,
+               session_set_hash, content_hash
+        FROM trading_session_observations
+        WHERE julianday(observed_at) IS NOT NULL AND julianday(observed_at) <= julianday(?)
+        ORDER BY julianday(observed_at) DESC, rowid DESC
+        LIMIT 1
+        """,
+        (request.as_of.isoformat(),),
+    ).fetchone()
+    if receipt_row is None:
+        return None, "缺少双源交易日观测记录"
+    try:
+        receipt = SessionObservationReceipt(
+            observed_at=dt.datetime.fromisoformat(receipt_row[0]),
+            primary_source=receipt_row[1],
+            fallback_source=receipt_row[2],
+            latest_session=(
+                dt.date.fromisoformat(receipt_row[3])
+                if receipt_row[3] else None
+            ),
+            session_set_hash=receipt_row[4],
         )
+        if receipt.content_hash != receipt_row[5]:
+            raise ValueError("交易日观测记录哈希不匹配")
+        local_as_of = request.as_of.astimezone(_SHANGHAI)
+        local_observed_at = receipt.observed_at.astimezone(_SHANGHAI)
+        required_observation_date = (
+            local_as_of.date()
+            if local_as_of.time() >= _SESSION_READY_AT
+            else local_as_of.date() - dt.timedelta(days=1)
+        )
+        if local_observed_at.time() < _SESSION_READY_AT or local_observed_at.date() < required_observation_date:
+            return None, "双源交易日观测心跳已过期"
+        if receipt.latest_session != expected:
+            return None, "双源交易日观测与本地交易日事实不一致"
+    except (TypeError, ValueError, OverflowError):
+        return None, "双源交易日观测记录无效"
     return expected, None
 
 
 def _market_staleness_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
-    date = request.as_of.date()
-    stale: list[str] = []
-    for code in request.candidate_codes:
-        row = connection.execute(
-            "SELECT MAX(trade_date) FROM market_daily WHERE code = ? AND trade_date <= ? AND quality_status = 'passed'",
-            (code, date.isoformat()),
-        ).fetchone()
-        try:
-            latest = dt.date.fromisoformat(row[0]) if row and row[0] else None
-        except (TypeError, ValueError):
-            latest = None
-        if latest is None or (date - latest).days > _MAX_STALENESS_DAYS:
-            stale.append(code)
+    expected, error = _expected_observed_session(connection, request)
+    if error is not None or expected is None:
+        return _blocked_check("market_staleness", error or "最新已观测交易日不可用")
+    stale = [code for code in request.candidate_codes if not _has_security_coverage(connection, code, expected)]
     return QualityResult(
         "market_staleness", "blocking", not stale,
-        "candidate market data is current" if not stale else f"market data stale or missing for {len(stale)} candidates",
+        "候选证券行情数据已更新" if not stale else f"{len(stale)} 只候选证券未覆盖最新已观测交易日",
     )
+
+
+def _has_security_coverage(connection: sqlite3.Connection, code: str, session: dt.date) -> bool:
+    row = connection.execute(
+        """
+        SELECT
+          EXISTS(
+            SELECT 1 FROM market_daily
+            WHERE code = ? AND trade_date = ? AND quality_status = 'passed'
+          )
+          OR EXISTS(
+            SELECT 1 FROM market_daily_absences
+            WHERE code = ? AND trade_date = ? AND reason = 'suspended'
+          )
+        """,
+        (code, session.isoformat(), code, session.isoformat()),
+    ).fetchone()
+    return bool(row and row[0])
 
 
 def _coverage_check(connection: sqlite3.Connection, request: QualityRequest) -> QualityResult:
@@ -351,7 +335,11 @@ def _future_data_check(connection: sqlite3.Connection, request: QualityRequest) 
             (as_of,),
         ),
         (
-            "SELECT 1 FROM trading_calendar_proofs WHERE julianday(as_of) IS NULL OR julianday(as_of) > julianday(?) LIMIT 1",
+            "SELECT 1 FROM trading_sessions WHERE julianday(fetched_at) IS NULL OR julianday(fetched_at) > julianday(?) LIMIT 1",
+            (as_of,),
+        ),
+        (
+            "SELECT 1 FROM trading_session_observations WHERE julianday(observed_at) IS NULL OR julianday(observed_at) > julianday(?) LIMIT 1",
             (as_of,),
         ),
     )
@@ -494,7 +482,7 @@ def _optional_source_checks(connection: sqlite3.Connection, request: QualityRequ
         return (_blocked_check("market_source_state", f"{len(required_failures)} required market sources failed"),)
     if not optional_failures:
         return ()
-    expected, calendar_error = _expected_session_with_proof_audit(connection, request)
+    expected, calendar_error = _expected_observed_session(connection, request)
     if calendar_error is not None or expected is None:
         return (_blocked_check("optional_source_coverage", "authoritative calendar coverage is unavailable"),)
     cutoff = _three_year_cutoff(request.as_of.date())

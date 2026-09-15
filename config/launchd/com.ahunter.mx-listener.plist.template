@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ahunter.mx-listener</string>
+  <key>WorkingDirectory</key>
+  <string>{{REPO_ROOT}}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mac/.local/share/chrome-devtools-mcp/node/bin/node</string>
+    <string>{{REPO_ROOT}}/scripts/run-mx-listener-service.mjs</string>
+    <string>--cdp</string>
+    <string>http://127.0.0.1:9333</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>{{REPO_ROOT}}/logs/mx-listener.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{REPO_ROOT}}/logs/mx-listener.err.log</string>
+</dict>
+</plist>

@@ -74,6 +74,23 @@ const currentState = {
   },
 };
 
+const researchAgents = {
+  agents: [
+    { agent_id: "market", agent_ref: "market@1", scope: "security", title: "市场研究", summary: "研究市场数据。" },
+  ],
+};
+
+const researchTeams = {
+  teams: [
+    {
+      team_id: "core",
+      latest: { team_ref: "core@1", scope: "security", title: "核心团队", agents: ["market@1"] },
+      history: [{ team_ref: "core@1", scope: "security", title: "核心团队", agents: ["market@1"] }],
+      daily_enabled_ref: null,
+    },
+  ],
+};
+
 function response(body: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(body), {
     status: 200,
@@ -82,8 +99,34 @@ function response(body: unknown, init: ResponseInit = {}) {
   });
 }
 
+function requestPath(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return input.url;
+}
+
+function resourceLinks(): HTMLAnchorElement[] {
+  return screen.queryAllByRole("link").filter((link) => link.getAttribute("href")?.startsWith("/api/") ?? false) as HTMLAnchorElement[];
+}
+
+function isIndependentServiceRequest(path: string): boolean {
+  return path === "/api/services" || path.startsWith("/api/market-daily/");
+}
+
+function researchTeamResponse(path: string): Response | undefined {
+  if (path === "/api/research/agents") return response(researchAgents);
+  if (path === "/api/research/teams") return response(researchTeams);
+  return undefined;
+}
+
 function mockFetch(...responses: Array<Response | Error>) {
-  return vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+  return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = requestPath(input);
+    const research = researchTeamResponse(path);
+    if (research) return research;
+    if (isIndependentServiceRequest(path)) {
+      return response({ detail: "服务状态未配置" }, { status: 503 });
+    }
     const next = responses.shift();
     if (next instanceof Error) throw next;
     if (!next) throw new Error("Unexpected fetch");
@@ -106,6 +149,8 @@ describe("advisor dashboard", () => {
     expect(screen.getByText("¥89,995.00")).toBeInTheDocument();
     expect(screen.getAllByText("600519").length).toBeGreaterThan(0);
     expect(screen.getByText("等待量价确认")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "MX 监听" })).toHaveAttribute("href", "/mx");
+    expect(screen.getByRole("link", { name: "研究配置" })).toHaveAttribute("href", "/research");
     expect(screen.getByRole("link", { name: /2026-07-12 盘前/ })).toHaveAttribute(
       "href",
       "/api/reports/2026-07-12/premarket?run_id=initial",
@@ -228,7 +273,7 @@ describe("advisor dashboard", () => {
     render(<App />);
 
     expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(resourceLinks()).toHaveLength(0);
   });
 
   it("rejects an unknown report quality status", async () => {
@@ -239,7 +284,7 @@ describe("advisor dashboard", () => {
     render(<App />);
 
     expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(resourceLinks()).toHaveLength(0);
   });
 
   it.each([
@@ -339,7 +384,7 @@ describe("advisor dashboard", () => {
     render(<App />);
 
     expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(resourceLinks()).toHaveLength(0);
   });
 
   it.each([
@@ -386,7 +431,7 @@ describe("advisor dashboard", () => {
     render(<App />);
 
     expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(resourceLinks()).toHaveLength(0);
   });
 
   it("shows request errors and retries without reloading the page", async () => {
@@ -397,7 +442,7 @@ describe("advisor dashboard", () => {
     await userEvent.click(screen.getByRole("button", { name: "重试读取" }));
 
     expect(await screen.findByText("2026-07-12")).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([input]) => requestPath(input)).filter((path) => path === "/api/current-state")).toHaveLength(2);
   });
 
   it("fails closed after refresh failure while retaining a stale snapshot", async () => {
@@ -411,7 +456,7 @@ describe("advisor dashboard", () => {
     expect(screen.queryByText("等待量价确认")).not.toBeInTheDocument();
     expect(screen.queryByText("¥89,995.00")).not.toBeInTheDocument();
     expect(screen.queryByText("4 条")).not.toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(resourceLinks()).toHaveLength(0);
     expect(screen.getByText("请刷新成功后再查看建议、账户指标和资源链接")).toBeInTheDocument();
   });
 
@@ -464,7 +509,13 @@ describe("advisor dashboard", () => {
     let finishRetry: (result: Response) => void = () => undefined;
     const retry = new Promise<Response>((resolve) => { finishRetry = resolve; });
     let requestNumber = 0;
-    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = requestPath(input);
+      const research = researchTeamResponse(path);
+      if (research) return research;
+      if (isIndependentServiceRequest(path)) {
+        return response({ detail: "服务状态未配置" }, { status: 503 });
+      }
       requestNumber += 1;
       if (requestNumber === 1) return response(currentState);
       if (requestNumber === 2) throw new Error("refresh offline");
@@ -488,7 +539,7 @@ describe("advisor dashboard", () => {
     render(<App />);
 
     expect(await screen.findByText("当前状态读取失败")).toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(resourceLinks()).toHaveLength(0);
   });
 
   it("renders an explicit unavailable last successful update", async () => {
@@ -513,8 +564,7 @@ describe("advisor dashboard", () => {
 
     expect(await screen.findByText("流水已保存，状态已刷新")).toBeInTheDocument();
     expect(screen.getByText("¥90,995.00")).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
+    expect(fetchMock).toHaveBeenCalledWith(
       "/api/ledger/transactions",
       expect.objectContaining({ method: "POST", body: expect.stringContaining('"transaction_id":"cash-2"') }),
     );
@@ -566,8 +616,7 @@ describe("advisor dashboard", () => {
 
     expect(await screen.findByText("import conflict")).toBeInTheDocument();
     expect(screen.getByLabelText("JSON 流水列表")).toHaveValue(input);
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
+    expect(fetchMock).toHaveBeenCalledWith(
       "/api/ledger/import",
       expect.objectContaining({ method: "POST", body: input }),
     );
@@ -602,5 +651,235 @@ describe("advisor dashboard", () => {
     expect(await within(form).findByText("JSON 流水已导入，状态已刷新")).toBeInTheDocument();
     expect(screen.getByText("¥90,495.00")).toBeInTheDocument();
     expect(within(form).getByLabelText("JSON 流水列表")).toHaveValue("");
+  });
+
+  it("renders Market Daily progress, failed securities, and the read-only service set", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = requestPath(input);
+      const research = researchTeamResponse(path);
+      if (research) return research;
+      if (path === "/api/current-state") return response(currentState);
+      if (path === "/api/market-daily/status") {
+        return response({
+          state: "partial",
+          service_status: "running",
+          lease_active: true,
+          lease_expires_at: "2026-07-12T21:05:00+08:00",
+          latest_observed_session: "2026-07-11",
+          last_successful_update: "2026-07-11T21:12:00+08:00",
+          next_scheduled_at: "2026-07-12T21:00:00+08:00",
+          run_id: "mdrun-20260711",
+          mode: "cold_start",
+          target_session: "2026-07-11",
+          total_items: 2,
+          completed_items: 1,
+          failed_items: 1,
+          progress: 0.5,
+          run_status: "partial",
+        });
+      }
+      if (path === "/api/market-daily/runs/mdrun-20260711/failures?limit=20") {
+        return response({
+          items: [{
+            code: "600519",
+            status: "source_missing",
+            attempts: 3,
+            selected_source: "tdx",
+            error: "缺少已证实的交易日数据",
+            updated_at: "2026-07-11T21:14:00+08:00",
+          }],
+        });
+      }
+      if (path === "/api/services") {
+        return response({
+          服务: [
+            { 编号: "market-daily", 状态: "运行中", 说明: "常驻服务持有租约", 日志: ["/tmp/market.log"] },
+            { 编号: "mx-listener", 状态: "只读", 说明: "现有监听服务", 日志: ["/tmp/mx.log"], read_only: true },
+          ],
+        });
+      }
+      throw new Error(`Unexpected fetch ${path}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("部分完成")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Market Daily 进度" })).toHaveAttribute("value", "0.5");
+    expect(screen.getByText("1 / 2")).toBeInTheDocument();
+    expect(screen.getByText("待排查证券")).toBeInTheDocument();
+    expect(screen.getByText("来源未证明")).toBeInTheDocument();
+    expect(screen.getByText("Market Daily")).toBeInTheDocument();
+    expect(screen.getByText("MX Listener（只读）")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith("/api/market-daily/status", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(fetchMock).toHaveBeenCalledWith("/api/services", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("submits one five-year cold-start intent from the Market Daily panel", async () => {
+    let marketStatusReads = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = requestPath(input);
+      const research = researchTeamResponse(path);
+      if (research) return research;
+      if (path === "/api/current-state") return response(currentState);
+      if (path === "/api/market-daily/status") {
+        marketStatusReads += 1;
+        return response({
+          state: marketStatusReads === 1 ? "idle" : "waiting_for_cold_start",
+          service_status: "running",
+          lease_active: true,
+          lease_expires_at: "2026-07-12T21:05:00+08:00",
+          latest_observed_session: null,
+          last_successful_update: null,
+          next_scheduled_at: "2026-07-12T21:00:00+08:00",
+          run_id: null,
+          mode: null,
+          target_session: null,
+          total_items: 0,
+          completed_items: 0,
+          failed_items: 0,
+          progress: 0,
+          run_status: null,
+        });
+      }
+      if (path === "/api/market-daily/cold-start") {
+        expect(init).toMatchObject({ method: "POST" });
+        return response({
+          request_id: "mdreq-c2c28608551dc2c7684c7cee",
+          request_status: "pending",
+          message: "冷启动请求已在本地队列中；Market Daily 服务会在 21:00 后执行",
+        }, { status: 202 });
+      }
+      if (path === "/api/services") return response({ 服务: [] });
+      throw new Error(`Unexpected fetch ${path}`);
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "启动五年同步" }));
+
+    expect(await screen.findByText("冷启动请求已在本地队列中；Market Daily 服务会在 21:00 后执行")).toBeInTheDocument();
+    expect(await screen.findByText("冷启动请求已排队，服务将在 21:00 后执行")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "冷启动已排队" })).toBeDisabled();
+    expect(fetchMock).toHaveBeenCalledWith("/api/market-daily/cold-start", { method: "POST" });
+  });
+
+  it("shows a bounded error when the five-year cold-start request is rejected", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = requestPath(input);
+      const research = researchTeamResponse(path);
+      if (research) return research;
+      if (path === "/api/current-state") return response(currentState);
+      if (path === "/api/market-daily/status") return response({
+        state: "idle",
+        service_status: "offline",
+        lease_active: false,
+        lease_expires_at: null,
+        latest_observed_session: null,
+        last_successful_update: null,
+        next_scheduled_at: "2026-07-12T21:00:00+08:00",
+        run_id: null,
+        mode: null,
+        target_session: null,
+        total_items: 0,
+        completed_items: 0,
+        failed_items: 0,
+        progress: 0,
+        run_status: null,
+      });
+      if (path === "/api/market-daily/cold-start") {
+        return response({ detail: "Market Daily 冷启动请求不可提交" }, { status: 503 });
+      }
+      if (path === "/api/services") return response({ 服务: [] });
+      throw new Error(`Unexpected fetch ${path}`);
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "启动五年同步" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Market Daily 冷启动请求不可提交");
+    expect(fetchMock).toHaveBeenCalledWith("/api/market-daily/cold-start", { method: "POST" });
+  });
+
+  it("does not claim the Market Daily status refreshed when it fails after queueing", async () => {
+    let marketStatusReads = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = requestPath(input);
+      const research = researchTeamResponse(path);
+      if (research) return research;
+      if (path === "/api/current-state") return response(currentState);
+      if (path === "/api/market-daily/status") {
+        marketStatusReads += 1;
+        if (marketStatusReads > 1) return response({ detail: "Market Daily 状态不可读取" }, { status: 503 });
+        return response({
+          state: "idle",
+          service_status: "running",
+          lease_active: true,
+          lease_expires_at: "2026-07-12T21:05:00+08:00",
+          latest_observed_session: null,
+          last_successful_update: null,
+          next_scheduled_at: "2026-07-12T21:00:00+08:00",
+          run_id: null,
+          mode: null,
+          target_session: null,
+          total_items: 0,
+          completed_items: 0,
+          failed_items: 0,
+          progress: 0,
+          run_status: null,
+        });
+      }
+      if (path === "/api/market-daily/cold-start") return response({
+        request_id: "mdreq-c2c28608551dc2c7684c7cee",
+        request_status: "pending",
+        message: "冷启动请求已在本地队列中；Market Daily 服务会在 21:00 后执行",
+      }, { status: 202 });
+      if (path === "/api/services") return response({ 服务: [] });
+      throw new Error(`Unexpected fetch ${path}`);
+    });
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "启动五年同步" }));
+
+    expect(await screen.findByText("冷启动请求已在本地队列中；Market Daily 服务会在 21:00 后执行，但状态刷新失败，请刷新确认")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["pending", "等待执行"],
+    ["cancelled", "已取消"],
+  ])("renders the Market Daily %s state in clear Chinese", async (state, label) => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = requestPath(input);
+      const research = researchTeamResponse(path);
+      if (research) return research;
+      if (path === "/api/current-state") return response(currentState);
+      if (path === "/api/market-daily/status") {
+        return response({
+          state,
+          service_status: "offline",
+          lease_active: false,
+          lease_expires_at: null,
+          latest_observed_session: null,
+          last_successful_update: null,
+          next_scheduled_at: "2026-07-12T21:00:00+08:00",
+          run_id: null,
+          mode: null,
+          target_session: null,
+          total_items: 0,
+          completed_items: 0,
+          failed_items: 0,
+          progress: 0,
+          run_status: null,
+        });
+      }
+      if (path === "/api/services") return response({ 服务: [] });
+      throw new Error(`Unexpected fetch ${path}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    expect(screen.queryByText(state)).not.toBeInTheDocument();
   });
 });

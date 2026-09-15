@@ -1,0 +1,7 @@
+team: a_share_market_overview@1
+scope: market
+title: A股全市场概览团队
+agents:
+  - market_breadth@1
+  - sector_rotation@1
+  - market_macro_policy@1

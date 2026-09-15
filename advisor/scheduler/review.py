@@ -1,124 +1,164 @@
+"""Team-scoped close review for already-published Research Conclusions."""
+
 from __future__ import annotations
 
 import argparse
-import json
-from collections.abc import Sequence
 from datetime import date, datetime, time
+import json
 from pathlib import Path
+from typing import Sequence
 from zoneinfo import ZoneInfo
 
-from advisor import coordinator as coordinator_module
-from advisor.calendar import latest_expected_session
-from advisor.config import load_advisor_config, resolve_state_db
-from advisor.data_sources.backfill import update_market_database
-from advisor.data_sources.free_sources import ConfiguredProviderRegistry
-from advisor.db.migrate import migrate_database
-from advisor.evidence.mx_adapter import read_collector_snapshot
-from advisor.quality import QualityResult
-from advisor.reporting.contracts import validate_run_id
-from advisor.reporting.failure import write_failure_report
-from advisor.scheduler.premarket import _expanded_candidate_codes, _parse_codes, _three_year_start
+from advisor.config import load_advisor_config, resolve_research_artifact_dir, resolve_state_db
+from advisor.research.artifacts import ArtifactStore
+from advisor.research.contracts import TeamConclusion, VersionRef
+from advisor.research.reporting.reviews import TeamReviewPublication, TeamReviewReporter
+from advisor.research.repository import ResearchRepository
+from advisor.research.reviews import evaluate_team_review
 
 
-def main(argv: Sequence[str] | None = None, *, coordinator=None) -> int:
-    parser = argparse.ArgumentParser()
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Evaluate published Team Conclusions without calling Codex.")
     parser.add_argument("--as-of", type=datetime.fromisoformat)
     parser.add_argument("--date", "--report-date", dest="report_date")
     parser.add_argument("--codes")
-    parser.add_argument("--events-db", type=Path, default=Path("data/state/events.sqlite"))
-    parser.add_argument("--allowed-rids", type=Path, default=Path("config/allowed-rids.yaml"))
+    parser.add_argument("--team", action="append")
     parser.add_argument("--output-dir", type=Path, default=Path("reports"))
     parser.add_argument("--config", type=Path, default=Path("config/advisor.yaml"))
-    parser.add_argument("--run-id")
-    parser.add_argument("--report-run-id")
-    parser.add_argument("--rerun-reason")
-    parser.add_argument("--supersedes")
-    parser.add_argument("--premarket-run-id", default="initial")
+    parser.add_argument("--db", type=Path)
+    parser.add_argument("--artifact-dir", type=Path)
     args = parser.parse_args(argv)
 
-    default_as_of = datetime.now(ZoneInfo("Asia/Shanghai"))
-    as_of = args.as_of or default_as_of
-    report_date = args.report_date or as_of.date().isoformat()
     try:
-        report_day = date.fromisoformat(report_date)
-    except ValueError:
-        parser.error("--date must be an ISO date")
-    try:
-        if args.as_of is None:
-            as_of = datetime.combine(report_day, time(22, 30), tzinfo=ZoneInfo("Asia/Shanghai"))
-        config_path = args.config.resolve()
-        root = config_path.parent.parent if config_path.parent.name == "config" else config_path.parent
-        config = load_advisor_config(config_path)
-        db_path = resolve_state_db(config, root)
-        migrate_database(db_path)
-
-        snapshot = read_collector_snapshot(args.events_db, args.allowed_rids, as_of=as_of)
-        explicit_codes = _parse_codes(args.codes)
-        candidate_codes = _expanded_candidate_codes(db_path, explicit_codes, snapshot)
-        if candidate_codes:
-            expected_session = latest_expected_session(as_of)
-            registry = ConfiguredProviderRegistry.from_yaml(config_path.with_name("data-sources.yaml"))
-            update_market_database(
-                db_path,
-                registry.historical_provider,
-                candidate_codes,
-                _three_year_start(expected_session),
-                expected_session,
-                as_of=as_of,
-            )
-
-        active_coordinator = coordinator or coordinator_module.run_review
-        result = active_coordinator(
-            collector_snapshot=snapshot,
-            as_of=as_of,
-            report_date=report_date,
-            candidate_codes=candidate_codes,
-            output_dir=args.output_dir,
-            config_path=config_path,
-            run_id=args.run_id,
-            report_run_id=args.report_run_id,
-            rerun_reason=args.rerun_reason,
-            supersedes=args.supersedes,
-            premarket_run_id=args.premarket_run_id,
-        )
-        print(json.dumps({
-            "json_path": str(result.report_paths.json_path),
-            "markdown_path": str(result.report_paths.markdown_path),
-            "run_id": result.run_id,
-            "status": result.status,
-            "warnings": list(result.warnings),
-        }, sort_keys=True))
-        return 0 if result.status in {"passed", "blocked"} else 1
-    except Exception as error:
-        run_id = _failure_run_id(args.run_id, report_day)
-        payload = {"error": type(error).__name__, "run_id": run_id, "status": "failed"}
+        report_day = date.fromisoformat(args.report_date) if args.report_date else datetime.now(_SHANGHAI).date()
+        review_as_of = args.as_of or datetime.combine(report_day, time(22, 30), tzinfo=_SHANGHAI)
+        if review_as_of.tzinfo is None or review_as_of.utcoffset() is None:
+            raise ValueError("--as-of must include a timezone offset")
+        config = load_advisor_config(args.config)
+        root = args.config.resolve().parent.parent
+        db_path = (args.db or resolve_state_db(config, root)).resolve()
+        artifact_dir = (args.artifact_dir or resolve_research_artifact_dir(config, root)).resolve()
+        repository = ResearchRepository.open(db_path)
+        store = ArtifactStore(artifact_dir)
         try:
-            paths = write_failure_report(
-                report_date,
-                "review",
-                [QualityResult("runtime", "blocking", False, type(error).__name__)],
-                args.output_dir,
-                run_id=run_id,
-            )
-            payload.update({
-                "json_path": str(paths.json_path),
-                "markdown_path": str(paths.markdown_path),
-            })
-        except Exception:
-            pass
-        print(json.dumps(payload, sort_keys=True))
+            codes = _parse_codes(args.codes)
+            teams = {str(VersionRef.parse(item)) for item in args.team} if args.team else None
+            publications: list[TeamReviewPublication] = []
+            for cycle_dir in sorted((args.output_dir / report_day.isoformat()).iterdir() if (args.output_dir / report_day.isoformat()).is_dir() else ()):
+                if not cycle_dir.is_dir() or cycle_dir.name == "reviews":
+                    continue
+                cycle_path = cycle_dir / "cycle.json"
+                if not cycle_path.is_file():
+                    continue
+                cycle = json.loads(cycle_path.read_text(encoding="utf-8"))
+                subject = cycle.get("subject", {})
+                code = subject.get("code")
+                if code not in codes if codes else False:
+                    continue
+                snapshot_id = cycle.get("snapshot", {}).get("snapshot_id") if isinstance(cycle.get("snapshot"), dict) else None
+                for team_dir in sorted((cycle_dir / "teams").iterdir() if (cycle_dir / "teams").is_dir() else ()):
+                    if not team_dir.is_dir() or (teams is not None and team_dir.name not in teams):
+                        continue
+                    conclusion_path = team_dir / "conclusion.json"
+                    if not conclusion_path.is_file():
+                        continue
+                    conclusion_payload = json.loads(conclusion_path.read_text(encoding="utf-8"))
+                    conclusion = TeamConclusion.model_validate(conclusion_payload)
+                    if conclusion.subject.code != code:
+                        continue
+                    conclusion_hash = _conclusion_hash(repository, cycle_dir.name, team_dir.name, conclusion_payload)
+                    if conclusion_hash is None:
+                        continue
+                    close, open_close = _closing_values(repository, store, snapshot_id, review_as_of, conclusion.boundary.as_of)
+                    review = evaluate_team_review(
+                        conclusion,
+                        conclusion_hash,
+                        review_as_of=review_as_of,
+                        close=close,
+                        open_close=open_close,
+                        expected_team=team_dir.name,
+                        expected_subject=code,
+                    )
+                    publication = TeamReviewReporter(args.output_dir).publish(review)
+                    _persist_review(repository, store, review, publication)
+                    publications.append(publication)
+        finally:
+            repository.close()
+        print(json.dumps({
+            "status": "passed" if publications else "blocked",
+            "reviews": [str(item.json_path) for item in publications],
+        }, ensure_ascii=False, sort_keys=True))
+        return 0 if publications else 1
+    except Exception as error:
+        print(json.dumps({"status": "failed", "error": type(error).__name__, "message": str(error)[:240]}, ensure_ascii=False, sort_keys=True))
         return 1
 
 
-def _failure_run_id(raw_run_id: str | None, report_day: date) -> str:
-    if raw_run_id is not None:
-        try:
-            validate_run_id(raw_run_id)
-        except ValueError:
-            pass
-        else:
-            return raw_run_id
-    return f"review-runtime-failed-{report_day:%Y%m%d}"
+def _parse_codes(raw: str | None) -> set[str] | None:
+    if raw is None or not raw.strip():
+        return None
+    values = {item.strip() for item in raw.split(",")}
+    if any(len(item) != 6 or not item.isdigit() for item in values):
+        raise ValueError("--codes must contain six-digit A-share codes")
+    return values
+
+
+def _conclusion_hash(repository: ResearchRepository, cycle_id: str, team_ref: str, payload: dict) -> str | None:
+    row = repository.connection.execute(
+        "SELECT conclusion_hash FROM research_team_conclusions WHERE research_run_id = ? AND team_ref = ?",
+        (f"{cycle_id}:{team_ref}", team_ref),
+    ).fetchone()
+    if row and isinstance(row[0], str):
+        return row[0]
+    return None
+
+
+def _closing_values(repository: ResearchRepository, store: ArtifactStore, snapshot_id: str | None, review_as_of: datetime, morning_as_of: datetime):
+    if not snapshot_id:
+        return None, None
+    row = repository.connection.execute(
+        "SELECT artifact_hash FROM research_snapshot_products WHERE snapshot_id = ? AND product_ref = 'market_daily_bars@1'",
+        (snapshot_id,),
+    ).fetchone()
+    if not row:
+        return None, None
+    try:
+        envelope = store.read_json(row[0])
+        bars = envelope.get("payload", {}).get("rows", [])
+        usable = sorted(
+            (item for item in bars if isinstance(item, dict) and isinstance(item.get("trade_date"), str) and isinstance(item.get("close"), (int, float))),
+            key=lambda item: item["trade_date"],
+        )
+        review_day = review_as_of.date().isoformat()
+        morning_day = morning_as_of.date().isoformat()
+        close_rows = [item for item in usable if item["trade_date"] <= review_day]
+        open_rows = [item for item in usable if item["trade_date"] <= morning_day]
+        return (
+            float(close_rows[-1]["close"]) if close_rows else None,
+            float(open_rows[-1]["close"]) if open_rows else None,
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        return None, None
+
+
+def _persist_review(repository: ResearchRepository, store: ArtifactStore, review, publication: TeamReviewPublication) -> None:
+    review_ref = store.put_bytes(publication.json_path.read_bytes(), media_type="application/json")
+    relative_path = str(store._path_for(review_ref.content_hash).relative_to(store.root))
+    repository.record_artifact(review_ref, relative_path=relative_path)
+    repository.record_review(
+        review_id=review.review_id,
+        conclusion_hash=review.conclusion_hash,
+        team_ref=str(review.team),
+        subject_code=review.subject_code,
+        as_of=review.review_as_of.isoformat(),
+        status=review.status.value,
+        outcome=review.outcome,
+        review_hash=review_ref.content_hash,
+    )
+    repository.connection.commit()
 
 
 if __name__ == "__main__":

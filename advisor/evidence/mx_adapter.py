@@ -75,7 +75,10 @@ _SENSITIVE_OPAQUE_TERMS = (
 )
 _MEDIA_CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\Z")
 _URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
-_MEDIA_NAMESPACE = ("data", "events", "media")
+_MEDIA_NAMESPACES = (
+    ("data", "media"),
+    ("data", "events", "media"),
+)
 _REQUIRED_COLUMNS = {
     "events": {
         "event_id", "schema_version", "rid", "source_message_id", "oid",
@@ -555,10 +558,13 @@ def valid_local_media_path(value: str) -> bool:
     ):
         return False
     path = PurePosixPath(value)
+    in_collector_namespace = any(
+        path.parts[:len(namespace)] == namespace and len(path.parts) > len(namespace)
+        for namespace in _MEDIA_NAMESPACES
+    )
     return (
         not path.is_absolute()
-        and path.parts[:3] == _MEDIA_NAMESPACE
-        and len(path.parts) > 3
+        and in_collector_namespace
         and all(part not in {"", ".", ".."} for part in path.parts)
         and str(path) == value
         and redact_sensitive_text(value) == value

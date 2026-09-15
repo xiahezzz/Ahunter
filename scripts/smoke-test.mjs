@@ -8,6 +8,11 @@ const checks = [];
 const DISCOVERY_TIMEOUT_MS = 5_000;
 const OPEN_TIMEOUT_MS = 5_000;
 const COMMAND_TIMEOUT_MS = 5_000;
+function option(name, fallback) {
+  const index = process.argv.indexOf(name);
+  return index < 0 ? fallback : process.argv[index + 1];
+}
+const cdpBase = option("--cdp", "http://127.0.0.1:9333");
 function timeoutSignal(milliseconds, label) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error(`${label} timeout`)), milliseconds);
@@ -32,7 +37,7 @@ await check("cdp-network-listener", async () => {
   const discovery = timeoutSignal(DISCOVERY_TIMEOUT_MS, "CDP target discovery");
   let target;
   try {
-    target = await findMxTarget("http://127.0.0.1:9222", fetch, { signal: discovery.signal });
+    target = await findMxTarget(cdpBase, fetch, { signal: discovery.signal });
   } finally {
     discovery.close();
   }

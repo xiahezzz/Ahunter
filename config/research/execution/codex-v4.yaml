@@ -1,0 +1,14 @@
+policy:
+  id: codex
+  version: 4
+model: gpt-5.5
+reasoning_effort: high
+timeout_seconds: 900
+max_agent_concurrency: 3
+max_stage_concurrency: 3
+max_retries: 1
+codex_path: null
+proxy_environment:
+  https_proxy: http://127.0.0.1:7897
+  http_proxy: http://127.0.0.1:7897
+  all_proxy: socks5://127.0.0.1:7897

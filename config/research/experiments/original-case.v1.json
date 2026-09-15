@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "name": "LAgent 2026-08 原例与预定验证",
+  "tasks": [
+    {"task_id": "august-tuning", "role": "tuning", "research_start_date": "2026-08-02", "period": {"mode": "trading_days", "start": "2026-08-03", "trading_days": 5}, "weight": "1"},
+    {"task_id": "august-selection", "role": "selection_validation", "research_start_date": "2026-08-09", "period": {"mode": "trading_days", "start": "2026-08-10", "trading_days": 5}, "weight": "1"},
+    {"task_id": "august-holdout", "role": "final_holdout", "research_start_date": "2026-08-16", "period": {"mode": "trading_days", "start": "2026-08-17", "trading_days": 5}, "weight": "1"}
+  ],
+  "model": {"model": "gpt-5.5", "reasoning_effort": "high", "token_cap": null},
+  "clock": {
+    "timezone": "Asia/Shanghai", "mode": "fixed_phase_snapshot",
+    "auction_close": "09:25:00", "decision_close": "09:30:00", "postmarket_after": "23:00:00",
+    "initial_research_at": "23:05:00", "auction_as_of": "09:24:00", "auction_submit_at": "09:24:30",
+    "postauction_event_cutoff": "09:25:00", "postauction_as_of": "09:25:05", "postauction_submit_at": "09:29:00",
+    "postmarket_as_of": "23:05:00"
+  },
+  "account": {
+    "initial_cash": "200000", "initial_positions": [], "currency": "CNY", "policy_ref": "cash_equity_v1",
+    "available_credit": "0", "valuation_policy_ref": "raw_close_corporate_actions_v1",
+    "entitlements": ["main", "star", "chinext", "st"], "cash_interest_rate": "0",
+    "external_cashflows": false, "voluntary_subscription": false, "advance_unfilled_sale_proceeds": false
+  },
+  "data": {
+    "adapter": "local_historical_bundle_v1", "bundle_ref": "august-2026-historical@1",
+    "product_refs": [], "historical_time_policy_ref": "available_at_v1",
+    "search": {
+      "enabled": true, "provider": "tavily", "connection_ref": "experiment-tavily",
+      "trust_policy": "provider_time_filter", "date_only_policy": "next_date", "topic": "general", "depth": "basic",
+      "max_results": 10, "timeout_seconds": 30, "retries": 1, "include_raw_content": true,
+      "auto_parameters": false, "include_answer": false
+    }
+  },
+  "execution": {
+    "market_impact": false, "market_rule_ref": "sh-sz-historical@1", "calendar_ref": "sh-sz-2026@1",
+    "fill_model_ref": "fixed_path_conservative_v1", "minute_model_ref": "conservative_minute_v1",
+    "queue_model_ref": "queue_replay_v1", "fees_ref": "sh-sz-statutory-fees@1",
+    "participation_rate": "0.01", "minute_slippage_ticks": 1, "queue_slippage_ticks": 0,
+    "order_latency_ms": 100, "cancel_latency_ms": 100, "receipt_latency_ms": 100,
+    "commission_rate": "0.0003", "minimum_commission": "5", "commission_includes_exchange_fees": true,
+    "fee_rounding": "ROUND_HALF_UP", "fee_quantum": "0.01",
+    "evidence": "minute_plus_auction_and_required_queue_evidence"
+  },
+  "budget": {
+    "mode": "calibrated", "task_cost_limit": "calibration_derived", "environment_reserve": "unresolved", "evaluation_reserve": "unresolved",
+    "cost_currency": "USD", "price_table_ref": "experiment-model-and-compute-usd@1",
+    "calibration_repeats": 3, "calibration_multiplier": "1.25", "rounding_unit": "1", "envelope_safety_factor": "2"
+  },
+  "runtime": {
+    "timeout_seconds": 900, "phase_wall_timeout_seconds": 3600, "retries": 1, "candidate_recoveries": 1,
+    "subagent_concurrency": 4, "cancel_wait_seconds": 10, "lease_seconds": 60, "heartbeat_seconds": 10,
+    "max_steps": null, "total_subagents": null, "total_queries": null, "recursive_delegation": false
+  },
+  "evaluate": {
+    "repeats": 3, "minimum_improvement": "0.001", "positive_repeat_fraction": {"numerator": 2, "denominator": 3},
+    "worst_repeat_regression": "-0.01", "stability_policy_ref": "paired_repeat_threshold_v1",
+    "allow_mixed_durations": false, "score": "mean_terminal_net_return",
+    "reuse_baseline": true, "auto_promote": true, "retain_all_records": true
+  },
+  "trace": {"retention": "permanent", "mandatory_audit": true, "default_page_size": 50, "maximum_page_size": 200},
+  "universe": "SH_SZ_A_EXCLUDE_BJ"
+}

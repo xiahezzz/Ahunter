@@ -1,0 +1,17 @@
+team:
+  id: normal
+  version: 1
+title: 均衡风格
+agents:
+- id: hot_money
+  version: 1
+- id: lockup
+  version: 1
+- id: market
+  version: 1
+- id: news
+  version: 1
+- id: policy
+  version: 1
+- id: social
+  version: 1

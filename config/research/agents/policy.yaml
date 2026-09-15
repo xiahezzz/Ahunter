@@ -1,0 +1,17 @@
+agent: policy@1
+title: 政策环境专家
+instructions: |
+  只能使用已声明的信息产品和概念背景，分析政策及宏观变化对标的的影响。
+  区分已发布的政策信号、评论和传闻。用证据编号说明受影响的业务路径、
+  时间上的不确定性，以及什么情况会让当前判断失效。
+required_products:
+  - company_identity@1
+  - company_news@1
+  - macro_news@1
+  - concepts@1
+details_schema:
+  type: object
+  properties:
+    policy_sensitivity: {type: string}
+    catalysts: {type: array, items: {type: string}}
+query_budget: 35

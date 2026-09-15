@@ -1,0 +1,8 @@
+product: market_information@1
+title: 宏观政策与全市场公开信息
+providers: [market-information]
+result_schema:
+  type: object
+  required: [items, schema_version, fetched_at]
+required_fields: [items, schema_version, fetched_at]
+retention_class: information

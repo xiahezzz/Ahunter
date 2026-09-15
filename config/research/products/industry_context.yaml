@@ -1,0 +1,5 @@
+product: industry_context@1
+title: 行业与概念背景
+providers: [public-a-share]
+result_schema: {type: object}
+retention_class: market_structure

@@ -1,0 +1,6 @@
+product: concepts@1
+title: 所属行业与题材概念
+providers: [public-a-share]
+result_schema: {type: object, required: [items]}
+required_fields: [items]
+retention_class: market_structure

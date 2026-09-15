@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from advisor.config import (
     AdvisorConfig,
@@ -17,7 +18,7 @@ def configured_for(database: str) -> AdvisorConfig:
             "market": {"primary": "A股"},
             "schedule": {"premarket_time": "08:30", "review_time": "22:30"},
             "storage": {"database": database},
-            "data_sources": {"allow_tushare": False, "free_sources": ["sina"]},
+            "data_sources": {"allow_tushare": False, "free_sources": []},
         }
     )
 
@@ -29,13 +30,39 @@ def test_load_default_advisor_config_uses_one_database():
     assert config.schedule.premarket_time == "08:30"
     assert config.schedule.review_time == "22:30"
     assert config.data_sources.allow_tushare is False
-    assert "sina" in config.data_sources.free_sources
+    assert config.data_sources.free_sources == []
     assert config.storage.database == "data/advisor/advisor.sqlite"
-    assert config.trading_agents.repository_path == "/Users/mac/Documents/TradingAgents-astock"
-    assert config.trading_agents.upstream_provider is None
-    assert config.trading_agents.upstream_model is None
     assert not hasattr(config.storage, "market_db")
     assert not hasattr(config.storage, "advisor_db")
+
+
+def test_research_engine_config_selects_catalog_teams_and_policy(tmp_path):
+    payload = configured_for("data/advisor/advisor.sqlite").model_dump()
+    payload["research"].update(default_teams=["a_share_core@2", "normal@2"], execution_policy="codex@3")
+    filename = tmp_path / "advisor.yaml"
+    filename.write_text(yaml.safe_dump(payload))
+    config = load_advisor_config(filename)
+
+    assert config.research.catalog_dir == "config/research"
+    assert config.research.artifact_dir == "data/advisor/research-artifacts"
+    assert config.research.default_teams == ["a_share_core@2", "normal@2"]
+    assert config.research.execution_policy == "codex@3"
+
+
+def test_unknown_runtime_configuration_is_rejected():
+    payload = configured_for("data/advisor/advisor.sqlite").model_dump()
+    payload["legacy_runtime"] = {"path": "/tmp/outside"}
+
+    with pytest.raises(ValueError, match="legacy_runtime"):
+        AdvisorConfig.model_validate(payload)
+
+
+def test_legacy_external_research_configuration_is_rejected():
+    payload = configured_for("data/advisor/advisor.sqlite").model_dump()
+    payload["data_sources"]["trading_agents"] = {"repository": "/outside"}
+
+    with pytest.raises(ValueError, match="trading_agents"):
+        AdvisorConfig.model_validate(payload)
 
 
 def test_storage_uses_one_operational_database(tmp_path: Path):
@@ -98,42 +125,10 @@ storage:
   database: data/advisor/advisor.sqlite
 data_sources:
   allow_tushare: true
-  free_sources: [sina]
+  free_sources: []
 """,
         encoding="utf-8",
     )
 
     with pytest.raises(ValueError, match="Tushare"):
         load_advisor_config(filename)
-
-
-def test_tradingagents_runtime_config_accepts_repository_and_model_override():
-    payload = configured_for("data/advisor/advisor.sqlite").model_dump()
-    payload["trading_agents"] = {
-        "repository_path": "/opt/tradingagents-astock",
-        "upstream_provider": "dashscope",
-        "upstream_model": "qwen-plus",
-    }
-
-    config = AdvisorConfig.model_validate(payload)
-
-    assert config.trading_agents.repository_path == "/opt/tradingagents-astock"
-    assert config.trading_agents.upstream_provider == "dashscope"
-    assert config.trading_agents.upstream_model == "qwen-plus"
-
-
-@pytest.mark.parametrize(
-    "trading_agents",
-    [
-        {"repository_path": ""},
-        {"repository_path": "../TradingAgents-astock"},
-        {"upstream_provider": ""},
-        {"upstream_model": ""},
-    ],
-)
-def test_tradingagents_runtime_config_rejects_ambiguous_values(trading_agents):
-    payload = configured_for("data/advisor/advisor.sqlite").model_dump()
-    payload["trading_agents"] = trading_agents
-
-    with pytest.raises(ValueError):
-        AdvisorConfig.model_validate(payload)

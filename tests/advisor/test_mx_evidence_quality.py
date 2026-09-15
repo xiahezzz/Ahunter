@@ -97,7 +97,7 @@ def create_collector_db():
                 "b" * 64,
                 "c" * 64,
                 "image/jpeg",
-                "data/events/media/accepted.jpg",
+                "data/media/2026-07-12/accepted.jpg",
                 received,
             ),
         )
@@ -157,7 +157,7 @@ def test_only_allowlisted_accepted_rows_become_bounded_evidence(
     assert snapshot.events[0].evidence_id == hashlib.sha256(
         f"a-hunter:evidence:v1\0mx\0evt-authorized-2\0{expected_hash}".encode()
     ).hexdigest()
-    assert snapshot.events[0].media[0].local_path == "data/events/media/accepted.jpg"
+    assert snapshot.events[0].media[0].local_path == "data/media/2026-07-12/accepted.jpg"
 
 
 @pytest.mark.parametrize(

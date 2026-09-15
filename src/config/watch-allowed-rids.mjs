@@ -2,13 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { loadAllowedRids } from "./load-allowed-rids.mjs";
 
-export function watchAllowedRids(filename, { onError = () => {}, watch = true, pollIntervalMs = 1_000 } = {}) {
+export function watchAllowedRids(filename, {
+  onError = () => {},
+  onReload = () => {},
+  watch = true,
+  pollIntervalMs = 1_000,
+} = {}) {
   const state = { current: new Set() };
   let lastError;
   function reload() {
     try {
       state.current = loadAllowedRids(filename);
       lastError = undefined;
+      onReload(state.current);
     } catch {
       state.current = new Set();
       if (lastError !== "config_invalid") onError("config_invalid");

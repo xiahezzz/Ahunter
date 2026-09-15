@@ -1,0 +1,12 @@
+agent: social@1
+title: 市场讨论专家
+instructions: |
+  分析公司信息和通过质量检查的本地事件材料，识别市场讨论信号。
+  没有证据时，不能把文章数量直接当成市场情绪。区分来源事实、重复内容、
+  未确认说法和信息缺口。引用证据编号，并说明结论失效条件。
+required_products:
+  - company_identity@1
+  - company_news@1
+  - mx_events@1
+details_schema: {type: object, properties: {sentiment: {type: string}, attention: {type: string}}}
+query_budget: 30

@@ -1,0 +1,7 @@
+product: market_daily_bars@1
+title: 本地日线行情与前复权价格
+providers: [local-market]
+result_schema: {type: object, required: [raw_rows, research_price_series, snapshot_proof]}
+required_fields: [raw_rows, research_price_series, snapshot_proof]
+freshness_minutes: 1440
+retention_class: market

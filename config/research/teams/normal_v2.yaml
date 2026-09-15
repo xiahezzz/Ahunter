@@ -1,0 +1,12 @@
+team:
+  id: normal
+  version: 2
+scope: security
+title: 均衡风格
+agents:
+  - hot_money@1
+  - lockup@1
+  - market@1
+  - news@1
+  - policy@1
+  - social@2

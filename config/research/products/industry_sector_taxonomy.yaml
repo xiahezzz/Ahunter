@@ -1,0 +1,9 @@
+product: industry_sector_taxonomy@1
+title: 东财一级行业成员分类快照
+providers: [eastmoney-industry-taxonomy]
+result_schema:
+  type: object
+  required: [industries, taxonomy_hash, coverage, age_trading_days]
+required_fields: [industries, taxonomy_hash, coverage, age_trading_days]
+minimum_coverage: 0.0
+retention_class: market

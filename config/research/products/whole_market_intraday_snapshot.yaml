@@ -1,0 +1,10 @@
+product: whole_market_intraday_snapshot@1
+title: 沪深 A 股全市场盘中整包快照
+providers: [sina-whole-market]
+result_schema:
+  type: object
+  required: [expected_universe, observation_window, rows, legal_absences, coverage, page_proof, content_hash]
+required_fields: [expected_universe, observation_window, rows, legal_absences, coverage, page_proof, content_hash]
+minimum_coverage: 0.99
+freshness_minutes: 20
+retention_class: market

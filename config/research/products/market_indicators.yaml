@@ -1,0 +1,6 @@
+product: market_indicators@1
+title: 技术指标
+dependencies: [market_daily_bars@1]
+derived: true
+result_schema: {type: object}
+retention_class: derived

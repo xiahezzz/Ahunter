@@ -21,13 +21,16 @@ dependencies = [
 dev = ["pytest>=8.2,<9", "httpx>=0.27,<1"]
 
 [project.scripts]
-advisor-backfill = "advisor.data_sources.backfill:main"
+ahunter = "advisor.cli.main:main"
+advisor-market-daily = "advisor.market_daily.cli:main"
+advisor-services = "advisor.services.cli:main"
 advisor-ledger-import = "advisor.ledger.importer:main"
+advisor-research = "advisor.research.cli:main"
 advisor-scheduled-premarket = "advisor.scheduler.premarket:main"
-advisor-report-premarket = "advisor.reporting.premarket:main"
-advisor-report-review = "advisor.reporting.review:main"
+advisor-scheduled-review = "advisor.scheduler.review:main"
 advisor-launchd-render = "advisor.scheduler.launchd:main"
 advisor-launchd-manage = "advisor.scheduler.launchd:manage_main"
+advisor-runtime-bootstrap = "advisor.runtime_env:main"
 
 [tool.setuptools.packages.find]
 include = ["advisor*"]

@@ -71,3 +71,69 @@ CREATE TABLE IF NOT EXISTS ingest_counters (
   count INTEGER NOT NULL,
   PRIMARY KEY(bucket_start, kind)
 );
+
+-- The listener control plane is deliberately separate from accepted event
+-- rows.  These additions are idempotent and never rewrite historical events,
+-- media, media jobs, counters, or decode failures.
+CREATE TABLE IF NOT EXISTS listener_service_lease (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  instance_id TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  heartbeat_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  CHECK(length(instance_id) BETWEEN 1 AND 128),
+  CHECK(started_at >= 0),
+  CHECK(heartbeat_at >= started_at),
+  CHECK(expires_at > heartbeat_at)
+);
+
+CREATE TABLE IF NOT EXISTS listener_service_status (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  readiness TEXT NOT NULL CHECK(readiness IN (
+    'starting', 'waiting_for_chrome', 'waiting_for_authorization',
+    'connecting', 'listening', 'stopping'
+  )),
+  health TEXT NOT NULL CHECK(health IN ('healthy', 'degraded', 'failed')),
+  reason_code TEXT,
+  updated_at INTEGER NOT NULL,
+  connected_at INTEGER,
+  last_frame_at INTEGER,
+  last_accepted_event_at INTEGER,
+  CHECK(updated_at >= 0),
+  CHECK(connected_at IS NULL OR connected_at >= 0),
+  CHECK(last_frame_at IS NULL OR last_frame_at >= 0),
+  CHECK(last_accepted_event_at IS NULL OR last_accepted_event_at >= 0)
+);
+
+-- Search intentionally indexes only the normalized user-facing text.  It is
+-- contentless so raw payloads, source URLs and parsed JSON never become FTS
+-- columns or query results.
+CREATE VIRTUAL TABLE IF NOT EXISTS mx_event_search USING fts5(
+  event_id UNINDEXED,
+  decoded_text
+);
+
+CREATE TRIGGER IF NOT EXISTS mx_event_search_after_insert
+AFTER INSERT ON events BEGIN
+  INSERT INTO mx_event_search(rowid, event_id, decoded_text)
+  VALUES (NEW.rowid, NEW.event_id, NEW.decoded_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS mx_event_search_after_update
+AFTER UPDATE OF decoded_text, event_id ON events BEGIN
+  DELETE FROM mx_event_search WHERE rowid = OLD.rowid;
+  INSERT INTO mx_event_search(rowid, event_id, decoded_text)
+  VALUES (NEW.rowid, NEW.event_id, NEW.decoded_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS mx_event_search_after_delete
+AFTER DELETE ON events BEGIN
+  DELETE FROM mx_event_search WHERE rowid = OLD.rowid;
+END;
+
+INSERT INTO mx_event_search(rowid, event_id, decoded_text)
+SELECT events.rowid, events.event_id, events.decoded_text
+FROM events
+WHERE NOT EXISTS (
+  SELECT 1 FROM mx_event_search WHERE mx_event_search.rowid = events.rowid
+);

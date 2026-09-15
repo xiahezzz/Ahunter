@@ -1,0 +1,18 @@
+agent: hot_money@1
+title: 资金与短线活跃度专家
+instructions: |
+  分析量价异常、热门股背景、公开资金流、概念、龙虎榜记录和行业轮动。
+  不能把噪声较大的资金数据写成确定结论。
+  引用证据编号，区分“数据缺失”和“观察结果为空”，并列出可能反转的风险。
+required_products:
+  - company_identity@1
+  - market_daily_bars@1
+  - market_indicators@1
+  - company_news@1
+  - hot_stocks@1
+  - capital_flows@1
+  - concepts@1
+  - dragon_tiger@1
+  - industry_context@1
+details_schema: {type: object, properties: {flow_direction: {type: string}, rotation: {type: string}}}
+query_budget: 50

@@ -1,1 +1,1 @@
-"""TradingAgents-astock advisor adapters."""
+"""A Hunter-owned research agent package."""

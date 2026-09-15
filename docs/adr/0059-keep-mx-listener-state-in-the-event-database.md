@@ -1,0 +1,3 @@
+# Keep MX Listener state in the event database
+
+The MX Listener Service records its runtime state, heartbeat, and renewable exclusive-instance lease in its own event SQLite database, and the shared A Hunter Service Set reads that state without taking ownership of it. Every entry point must acquire the same lease, so a manual process and LaunchAgent cannot operate the event and media stores concurrently; a replacement may take over only after the prior lease expires. This preserves the Listener's separate runtime and failure boundary while avoiding an Advisor-database dependency, an additional HTTP control plane, and a stale sidecar status file.
